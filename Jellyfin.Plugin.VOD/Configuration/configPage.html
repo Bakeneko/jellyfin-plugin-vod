@@ -1,47 +1,94 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
     <meta charset="utf-8">
     <title>VOD</title>
 </head>
-
 <body>
-    <div id="configurationPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button,emby-checkbox">
+    <div id="configurationPage" data-role="page"
+         class="page type-interior pluginConfigurationPage"
+         data-require="emby-input,emby-button">
         <div data-role="content">
             <div class="content-primary">
                 <h1>VOD</h1>
                 <form id="configurationForm">
+
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="ytDlpPath">yt-dlp path</label>
+                        <input id="ytDlpPath" name="YtDlpPath" type="text"
+                               is="emby-input" class="emby-input"
+                               placeholder="/config/yt-dlp" />
+                        <div class="fieldDescription">
+                            Absolute path or PATH-resolvable name of the yt-dlp executable.
+                        </div>
+                    </div>
+
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="jsRuntime">JS runtime</label>
+                        <input id="jsRuntime" name="JsRuntime" type="text"
+                               is="emby-input" class="emby-input"
+                               placeholder="/config/deno" />
+                        <div class="fieldDescription">
+                            Passed to yt-dlp's <code>--js-runtimes</code> as <code>NAME</code> or
+                            <code>NAME:PATH</code>. Required for YouTube (deno, node, bun or quickjs).
+                            Leave empty to use yt-dlp's default.
+                        </div>
+                    </div>
+
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="cookiesPath">Cookies file</label>
+                        <input id="cookiesPath" name="CookiesPath" type="text"
+                               is="emby-input" class="emby-input"
+                               placeholder="/config/cookies.txt" />
+                        <div class="fieldDescription">
+                            Absolute path to a Netscape-format cookie file. Use a throwaway account —
+                            this file grants full account access.
+                        </div>
+                    </div>
+
+                    <div>
+                        <button is="emby-button" type="submit"
+                                class="raised button-submit block emby-button">
+                            <span>Save</span>
+                        </button>
+                    </div>
+
                 </form>
             </div>
         </div>
+
         <script type="text/javascript">
-            var PluginConfig = {
-                pluginUniqueId: '16bb0693-4248-478b-a1e5-a4508326245c',
-            };
+            var PluginConfig = { pluginUniqueId: '16bb0693-4248-478b-a1e5-a4508326245c' };
 
             document.querySelector('#configurationPage')
                 .addEventListener('pageshow', function () {
                     Dashboard.showLoadingMsg();
-                    ApiClient.getPluginConfiguration(PluginConfig.pluginUniqueId).then(function (config) {
-                        Dashboard.hideLoadingMsg();
-                    });
+                    ApiClient.getPluginConfiguration(PluginConfig.pluginUniqueId)
+                        .then(function (config) {
+                            document.querySelector('#ytDlpPath').value = config.YtDlpPath || '';
+                            document.querySelector('#jsRuntime').value = config.JsRuntime || '';
+                            document.querySelector('#cookiesPath').value = config.CookiesPath || '';
+                            Dashboard.hideLoadingMsg();
+                        });
                 });
 
             document.querySelector('#configurationForm')
                 .addEventListener('submit', function (e) {
+                    e.preventDefault();
                     Dashboard.showLoadingMsg();
-                    ApiClient.getPluginConfiguration(PluginConfig.pluginUniqueId).then(function (config) {
-                        ApiClient.updatePluginConfiguration(PluginConfig.pluginUniqueId, config).then(function (result) {
+                    ApiClient.getPluginConfiguration(PluginConfig.pluginUniqueId)
+                        .then(function (config) {
+                            config.YtDlpPath = document.querySelector('#ytDlpPath').value;
+                            config.JsRuntime = document.querySelector('#jsRuntime').value;
+                            config.CookiesPath = document.querySelector('#cookiesPath').value;
+                            return ApiClient.updatePluginConfiguration(
+                                PluginConfig.pluginUniqueId, config);
+                        })
+                        .then(function (result) {
                             Dashboard.processPluginConfigurationUpdateResult(result);
                         });
-                    });
-
-                    e.preventDefault();
-                    return false;
                 });
         </script>
     </div>
 </body>
-
 </html>
