@@ -65,5 +65,8 @@ namespace Jellyfin.Plugin.VOD.Data.Models
 
         /// <summary>Gets or sets the detected source type (e.g. "youtube_channel", "arte_series").</summary>
         public string? SourceType { get; set; }
+
+        /// <summary>Gets or sets a value indicating whether this is a live stream at the time of last sync.</summary>
+        public bool IsLive { get; set; }
     }
 }

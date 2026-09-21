@@ -26,4 +26,8 @@
     <EmbeddedResource Include="Configuration\configPage.html" />
   </ItemGroup>
 
+  <ItemGroup>
+    <EmbeddedResource Include="Strings\*.json" />
+  </ItemGroup>
+
 </Project>

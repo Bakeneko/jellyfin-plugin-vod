@@ -39,56 +39,106 @@ namespace Jellyfin.Plugin.VOD.Data
             return conn;
         }
 
+        /// <summary>
+        /// Schema version this build expects, tracked in SQLite's <c>user_version</c>.
+        /// Bump it and add the matching case to <see cref="Migrate"/> whenever the schema changes.
+        /// </summary>
+        private const int SchemaVersion = 1;
+
         /// <inheritdoc />
         public void EnsureCreated()
         {
             lock (_sync)
             {
-                using var cmd = Connection.CreateCommand();
-                cmd.CommandText = """
-                    CREATE TABLE IF NOT EXISTS sources (
-                        url                  TEXT PRIMARY KEY,
-                        name                 TEXT,
-                        series_path          TEXT,
-                        series_thumbnail_url TEXT,
-                        series_synopsis      TEXT,
-                        last_synced_at       TEXT,
-                        last_error           TEXT,
-                        video_count          INTEGER NOT NULL DEFAULT 0
-                    );
+                var from = ReadSchemaVersion();
+                if (from < SchemaVersion)
+                {
+                    using var txn = Connection.BeginTransaction();
+                    for (var v = from + 1; v <= SchemaVersion; v++)
+                        Migrate(v, txn);
 
-                    CREATE TABLE IF NOT EXISTS videos (
-                        id               TEXT PRIMARY KEY,
-                        source_url       TEXT NOT NULL REFERENCES sources(url),
-                        extractor_key    TEXT,
-                        native_id        TEXT,
-                        video_url        TEXT NOT NULL,
-                        title            TEXT,
-                        date_is_fallback INTEGER NOT NULL DEFAULT 0,
-                        published_at     TEXT,
-                        duration_seconds INTEGER,
-                        series_path      TEXT,
-                        season_number    INTEGER,
-                        episode_number   INTEGER,
-                        strm_path        TEXT,
-                        synced_at        TEXT NOT NULL,
-                        audio_langs      TEXT,
-                        subtitle_langs   TEXT,
-                        thumbnail_url    TEXT,
-                        description      TEXT,
-                        available_until  TEXT,
-                        source_type      TEXT
-                    );
-
-                    CREATE INDEX IF NOT EXISTS idx_videos_source_url ON videos(source_url);
-                    CREATE INDEX IF NOT EXISTS idx_videos_synced_at  ON videos(synced_at);
-
-                    INSERT OR IGNORE INTO sources (url, name) VALUES ('__debug__', 'Debug (internal)');
-                    """;
-                cmd.ExecuteNonQuery();
+                    txn.Commit();
+                    LogSchemaMigrated(from, SchemaVersion);
+                }
             }
 
             LogSchemaReady(_dbPath);
+        }
+
+        /// <summary>
+        /// Applies the single step that takes the schema from <paramref name="version"/> - 1 to
+        /// <paramref name="version"/>. Steps replay in order on a fresh database, so a step must
+        /// keep describing the change it originally made even after later steps supersede it.
+        /// Each script stamps its own <c>user_version</c> as its last statement, so the recorded
+        /// version cannot drift from the schema it describes.
+        /// </summary>
+        private void Migrate(int version, SqliteTransaction txn)
+        {
+            using var cmd = Connection.CreateCommand();
+            cmd.Transaction = txn;
+
+            switch (version)
+            {
+                case 1:
+                    cmd.CommandText = """
+                        CREATE TABLE IF NOT EXISTS sources (
+                            url                  TEXT PRIMARY KEY,
+                            name                 TEXT,
+                            series_path          TEXT,
+                            series_thumbnail_url TEXT,
+                            series_synopsis      TEXT,
+                            last_synced_at       TEXT,
+                            last_error           TEXT,
+                            video_count          INTEGER NOT NULL DEFAULT 0
+                        );
+
+                        CREATE TABLE IF NOT EXISTS videos (
+                            id               TEXT PRIMARY KEY,
+                            source_url       TEXT NOT NULL REFERENCES sources(url),
+                            extractor_key    TEXT,
+                            native_id        TEXT,
+                            video_url        TEXT NOT NULL,
+                            title            TEXT,
+                            date_is_fallback INTEGER NOT NULL DEFAULT 0,
+                            published_at     TEXT,
+                            duration_seconds INTEGER,
+                            series_path      TEXT,
+                            season_number    INTEGER,
+                            episode_number   INTEGER,
+                            strm_path        TEXT,
+                            synced_at        TEXT NOT NULL,
+                            audio_langs      TEXT,
+                            subtitle_langs   TEXT,
+                            thumbnail_url    TEXT,
+                            description      TEXT,
+                            available_until  TEXT,
+                            source_type      TEXT,
+                            is_live          INTEGER NOT NULL DEFAULT 0
+                        );
+
+                        CREATE INDEX IF NOT EXISTS idx_videos_source_url ON videos(source_url);
+                        CREATE INDEX IF NOT EXISTS idx_videos_synced_at  ON videos(synced_at);
+                        CREATE INDEX IF NOT EXISTS idx_videos_native_id  ON videos(source_url, native_id);
+
+                        INSERT OR IGNORE INTO sources (url, name) VALUES ('__debug__', 'Debug (internal)');
+
+                        PRAGMA user_version = 1;
+                        """;
+                    break;
+
+                default:
+                    throw new InvalidOperationException(
+                        $"No migration defined for schema version {version}");
+            }
+
+            cmd.ExecuteNonQuery();
+        }
+
+        private int ReadSchemaVersion()
+        {
+            using var cmd = Connection.CreateCommand();
+            cmd.CommandText = "PRAGMA user_version";
+            return (int)(long)cmd.ExecuteScalar()!;
         }
 
         /// <inheritdoc />
@@ -168,13 +218,13 @@ namespace Jellyfin.Plugin.VOD.Data
                          date_is_fallback, published_at, duration_seconds, series_path,
                          season_number, episode_number, strm_path, synced_at,
                          audio_langs, subtitle_langs, thumbnail_url, description,
-                         available_until, source_type)
+                         available_until, source_type, is_live)
                     VALUES
                         ($id, $sourceUrl, $extractorKey, $nativeId, $videoUrl, $title,
                          $dateIsFallback, $publishedAt, $durationSeconds, $seriesPath,
                          $seasonNumber, $episodeNumber, $strmPath, $syncedAt,
                          $audioLangs, $subtitleLangs, $thumbnailUrl, $description,
-                         $availableUntil, $sourceType)
+                         $availableUntil, $sourceType, $isLive)
                     ON CONFLICT(id) DO UPDATE SET
                         source_url       = excluded.source_url,
                         extractor_key    = excluded.extractor_key,
@@ -194,7 +244,8 @@ namespace Jellyfin.Plugin.VOD.Data
                         thumbnail_url    = excluded.thumbnail_url,
                         description      = excluded.description,
                         available_until  = excluded.available_until,
-                        source_type      = excluded.source_type;
+                        source_type      = excluded.source_type,
+                        is_live          = excluded.is_live;
                     """;
                 BindVideo(cmd, video);
                 cmd.ExecuteNonQuery();
@@ -235,6 +286,20 @@ namespace Jellyfin.Plugin.VOD.Data
         }
 
         /// <inheritdoc />
+        public VideoRecord? GetVideoByNativeId(string sourceUrl, string nativeId)
+        {
+            lock (_sync)
+            {
+                using var cmd = Connection.CreateCommand();
+                cmd.CommandText = "SELECT * FROM videos WHERE source_url = $url AND native_id = $id LIMIT 1";
+                cmd.Parameters.AddWithValue("$url", sourceUrl);
+                cmd.Parameters.AddWithValue("$id", nativeId);
+                using var r = cmd.ExecuteReader();
+                return r.Read() ? MapVideo(r) : null;
+            }
+        }
+
+        /// <inheritdoc />
         public void DeleteVideo(string uuid)
         {
             lock (_sync)
@@ -247,22 +312,69 @@ namespace Jellyfin.Plugin.VOD.Data
         }
 
         /// <inheritdoc />
-        public IReadOnlyList<string> GetOrphanedVideoUuids(string sourceUrl, DateTimeOffset syncedBefore)
+        public void TouchVideos(string sourceUrl, IReadOnlyCollection<string> nativeIds, DateTimeOffset syncedAt)
+        {
+            if (nativeIds.Count == 0) return;
+            lock (_sync)
+            {
+                using var txn = Connection.BeginTransaction();
+                using var cmd = Connection.CreateCommand();
+                cmd.Transaction = txn;
+                cmd.CommandText =
+                    "UPDATE videos SET synced_at = $syncedAt WHERE source_url = $url AND native_id = $nativeId";
+                var pSyncedAt = cmd.CreateParameter();
+                pSyncedAt.ParameterName = "$syncedAt";
+                pSyncedAt.Value = syncedAt.ToString("O");
+                cmd.Parameters.Add(pSyncedAt);
+                var pUrl = cmd.CreateParameter();
+                pUrl.ParameterName = "$url";
+                pUrl.Value = sourceUrl;
+                cmd.Parameters.Add(pUrl);
+                var pNativeId = cmd.CreateParameter();
+                pNativeId.ParameterName = "$nativeId";
+                cmd.Parameters.Add(pNativeId);
+                foreach (var id in nativeIds)
+                {
+                    pNativeId.Value = id;
+                    cmd.ExecuteNonQuery();
+                }
+                txn.Commit();
+            }
+        }
+
+        /// <inheritdoc />
+        public IReadOnlyList<string> GetOrphanedVideoUuids(string sourceUrl, DateTimeOffset syncedBefore, DateTimeOffset? retentionCutoff = null)
         {
             lock (_sync)
             {
                 using var cmd = Connection.CreateCommand();
-                cmd.CommandText =
-                    "SELECT id FROM videos WHERE source_url = $url AND synced_at < $cutoff";
+                var sql = retentionCutoff.HasValue
+                    ? "SELECT id FROM videos WHERE source_url = $url AND (synced_at < $cutoff OR (published_at IS NOT NULL AND published_at < $retention))"
+                    : "SELECT id FROM videos WHERE source_url = $url AND synced_at < $cutoff";
+                cmd.CommandText = sql;
                 cmd.Parameters.AddWithValue("$url", sourceUrl);
                 cmd.Parameters.AddWithValue("$cutoff", syncedBefore.ToString("O"));
+                if (retentionCutoff.HasValue)
+                    cmd.Parameters.AddWithValue("$retention", retentionCutoff.Value.ToString("O"));
                 using var r = cmd.ExecuteReader();
                 var list = new List<string>();
                 while (r.Read())
-                {
                     list.Add(r.GetString(0));
-                }
+                return list;
+            }
+        }
 
+        /// <inheritdoc />
+        public IReadOnlyList<string> GetAllStrmPaths()
+        {
+            lock (_sync)
+            {
+                using var cmd = Connection.CreateCommand();
+                cmd.CommandText = "SELECT strm_path FROM videos WHERE strm_path IS NOT NULL";
+                using var r = cmd.ExecuteReader();
+                var list = new List<string>();
+                while (r.Read())
+                    list.Add(r.GetString(0));
                 return list;
             }
         }
@@ -292,6 +404,7 @@ namespace Jellyfin.Plugin.VOD.Data
             cmd.Parameters.AddWithValue("$description", (object?)v.Description ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$availableUntil", (object?)v.AvailableUntil?.ToString("O") ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$sourceType", (object?)v.SourceType ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$isLive", v.IsLive ? 1 : 0);
         }
 
         private static SourceRecord MapSource(SqliteDataReader r)
@@ -364,12 +477,17 @@ namespace Jellyfin.Plugin.VOD.Data
                 ThumbnailUrl = S("thumbnail_url"),
                 Description = S("description"),
                 AvailableUntil = D("available_until"),
-                SourceType = S("source_type")
+                SourceType = S("source_type"),
+                IsLive = r.GetInt32(r.GetOrdinal("is_live")) != 0
             };
         }
 
         [LoggerMessage(EventId = 100, Level = LogLevel.Information,
             Message = "VOD database schema ready at {DbPath}")]
         private partial void LogSchemaReady(string dbPath);
+
+        [LoggerMessage(EventId = 101, Level = LogLevel.Information,
+            Message = "VOD database migrated from schema v{FromVersion} to v{ToVersion}")]
+        private partial void LogSchemaMigrated(int fromVersion, int toVersion);
     }
 }

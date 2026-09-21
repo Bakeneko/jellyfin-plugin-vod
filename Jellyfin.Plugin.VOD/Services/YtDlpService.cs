@@ -1,7 +1,9 @@
 using System;
 using System.Diagnostics;
+using System.Globalization;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Plugin.VOD.Services.Sync.Dto;
 using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Plugin.VOD.Services
@@ -17,6 +19,7 @@ namespace Jellyfin.Plugin.VOD.Services
     public sealed partial class YtDlpService
     {
         private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(60);
+        private static readonly TimeSpan PlaylistTimeout = TimeSpan.FromMinutes(10);
 
         private readonly CookieJar _cookies;
         private readonly ILogger<YtDlpService> _logger;
@@ -42,28 +45,10 @@ namespace Jellyfin.Plugin.VOD.Services
             ArgumentException.ThrowIfNullOrWhiteSpace(pageUrl);
             ArgumentException.ThrowIfNullOrWhiteSpace(format);
 
-            var startInfo = new ProcessStartInfo
-            {
-                FileName = Plugin.Instance?.Configuration.YtDlpPath ?? "yt-dlp",
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-
+            var startInfo = BuildBaseStartInfo();
             using var cookies = await _cookies.AcquireAsync(cancellationToken).ConfigureAwait(false);
-            if (cookies.Path is not null)
-            {
-                startInfo.ArgumentList.Add("--cookies");
-                startInfo.ArgumentList.Add(cookies.Path);
-            }
-
-            var jsRuntime = Plugin.Instance?.Configuration.JsRuntime;
-            if (!string.IsNullOrWhiteSpace(jsRuntime))
-            {
-                startInfo.ArgumentList.Add("--js-runtimes");
-                startInfo.ArgumentList.Add(jsRuntime);
-            }
+            ApplyCookies(startInfo, cookies);
+            ApplyJsRuntime(startInfo);
 
             startInfo.ArgumentList.Add("--no-warnings");
             startInfo.ArgumentList.Add("--no-playlist");
@@ -75,35 +60,13 @@ namespace Jellyfin.Plugin.VOD.Services
             startInfo.ArgumentList.Add("%(url)s");
             startInfo.ArgumentList.Add(pageUrl);
 
-            using var process = new Process { StartInfo = startInfo };
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            cts.CancelAfter(Timeout);
-
             var sw = Stopwatch.StartNew();
-            process.Start();
-
-            var stdoutTask = process.StandardOutput.ReadToEndAsync(cts.Token);
-            var stderrTask = process.StandardError.ReadToEndAsync(cts.Token);
-
-            try
-            {
-                await process.WaitForExitAsync(cts.Token).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                TryKill(process);
-                throw;
-            }
-
-            var stdout = await stdoutTask.ConfigureAwait(false);
-            var stderr = await stderrTask.ConfigureAwait(false);
+            var stdout = await RunProcessAsync(startInfo, Timeout, cancellationToken)
+                .ConfigureAwait(false);
             sw.Stop();
 
-            if (process.ExitCode != 0)
-            {
-                LogResolveFailed(pageUrl, process.ExitCode, stderr.Trim());
+            if (stdout is null)
                 return null;
-            }
 
             var lines = stdout.Split('\n',
                 StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
@@ -120,6 +83,157 @@ namespace Jellyfin.Plugin.VOD.Services
 
             LogResolved(pageUrl, hasManifest, sw.ElapsedMilliseconds);
             return new StreamResolution(resolved, hasManifest);
+        }
+
+        /// <summary>
+        /// Runs <c>yt-dlp --flat-playlist -J [--playlist-end N] [--dateafter YYYYMMDD]</c> and returns the parsed result.
+        /// Returns <see langword="null"/> when yt-dlp exits non-zero or output cannot be parsed.
+        /// </summary>
+        /// <param name="url">The playlist or channel URL.</param>
+        /// <param name="maxEntries">When set, passes <c>--playlist-end N</c>.</param>
+        /// <param name="dateAfter">
+        /// When set, passes <c>--dateafter YYYYMMDD</c> so yt-dlp stops enumerating entries older than this date.
+        /// Use when <c>RetentionDays</c> is configured to avoid fetching videos that will be immediately discarded.
+        /// Note: behaviour varies by extractor — yt-dlp may still enumerate all entries and filter client-side.
+        /// </param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        public async Task<PlaylistInfo?> GetPlaylistEntriesAsync(
+            string url,
+            int? maxEntries,
+            DateTimeOffset? dateAfter,
+            CancellationToken cancellationToken)
+        {
+            var startInfo = BuildBaseStartInfo();
+            using var cookies = await _cookies.AcquireAsync(cancellationToken).ConfigureAwait(false);
+            ApplyCookies(startInfo, cookies);
+            ApplyJsRuntime(startInfo);
+
+            startInfo.ArgumentList.Add("--flat-playlist");
+            startInfo.ArgumentList.Add("-J");
+            if (maxEntries.HasValue)
+            {
+                startInfo.ArgumentList.Add("--playlist-end");
+                startInfo.ArgumentList.Add(maxEntries.Value.ToString(CultureInfo.InvariantCulture));
+            }
+
+            if (dateAfter.HasValue)
+            {
+                startInfo.ArgumentList.Add("--dateafter");
+                startInfo.ArgumentList.Add(dateAfter.Value.UtcDateTime.ToString("yyyyMMdd", CultureInfo.InvariantCulture));
+            }
+
+            startInfo.ArgumentList.Add("--no-warnings");
+            startInfo.ArgumentList.Add(url);
+
+            var stdout = await RunProcessAsync(startInfo, PlaylistTimeout, cancellationToken)
+                .ConfigureAwait(false);
+            if (stdout is null)
+                return null;
+
+            var info = PlaylistInfo.ParseJson(stdout);
+            if (info is null)
+                LogParseFailed(url, "flat-playlist");
+            return info;
+        }
+
+        /// <summary>
+        /// Runs <c>yt-dlp -J --no-playlist</c> for a single video and returns the parsed metadata.
+        /// Returns <see langword="null"/> when yt-dlp exits non-zero or output cannot be parsed.
+        /// </summary>
+        /// <param name="url">The video page URL.</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        public async Task<VideoMetadata?> GetVideoMetadataAsync(
+            string url,
+            CancellationToken cancellationToken)
+        {
+            var startInfo = BuildBaseStartInfo();
+            using var cookies = await _cookies.AcquireAsync(cancellationToken).ConfigureAwait(false);
+            ApplyCookies(startInfo, cookies);
+            ApplyJsRuntime(startInfo);
+
+            startInfo.ArgumentList.Add("-J");
+            startInfo.ArgumentList.Add("--no-playlist");
+            startInfo.ArgumentList.Add("--no-warnings");
+            startInfo.ArgumentList.Add(url);
+
+            var stdout = await RunProcessAsync(startInfo, Timeout, cancellationToken)
+                .ConfigureAwait(false);
+            if (stdout is null)
+                return null;
+
+            var meta = VideoMetadata.ParseJson(stdout);
+            if (meta is null)
+                LogParseFailed(url, "video metadata");
+            return meta;
+        }
+
+        private static ProcessStartInfo BuildBaseStartInfo() => new()
+        {
+            FileName = Plugin.Instance?.Configuration.YtDlpPath ?? "yt-dlp",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        private static void ApplyCookies(ProcessStartInfo startInfo, CookieLease cookies)
+        {
+            if (cookies.Path is not null)
+            {
+                startInfo.ArgumentList.Add("--cookies");
+                startInfo.ArgumentList.Add(cookies.Path);
+            }
+        }
+
+        private static void ApplyJsRuntime(ProcessStartInfo startInfo)
+        {
+            var js = Plugin.Instance?.Configuration.JsRuntime;
+            if (!string.IsNullOrWhiteSpace(js))
+            {
+                startInfo.ArgumentList.Add("--js-runtimes");
+                startInfo.ArgumentList.Add(js);
+            }
+        }
+
+        /// <summary>Runs a yt-dlp process and returns stdout, or null on non-zero exit.</summary>
+        private async Task<string?> RunProcessAsync(
+            ProcessStartInfo startInfo,
+            TimeSpan timeout,
+            CancellationToken cancellationToken)
+        {
+            using var process = new Process { StartInfo = startInfo };
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(timeout);
+
+            process.Start();
+            var stdoutTask = process.StandardOutput.ReadToEndAsync(cts.Token);
+            var stderrTask = process.StandardError.ReadToEndAsync(cts.Token);
+
+            try
+            {
+                await process.WaitForExitAsync(cts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                TryKill(process);
+                throw new TimeoutException($"yt-dlp timed out after {timeout.TotalSeconds:0}s");
+            }
+            catch (OperationCanceledException)
+            {
+                TryKill(process);
+                throw;
+            }
+
+            var stdout = await stdoutTask.ConfigureAwait(false);
+            var stderr = await stderrTask.ConfigureAwait(false);
+
+            if (process.ExitCode != 0)
+            {
+                LogResolveFailed(startInfo.ArgumentList[^1], process.ExitCode, stderr.Trim());
+                return null;
+            }
+
+            return stdout;
         }
 
         private void TryKill(Process process)
@@ -140,5 +254,9 @@ namespace Jellyfin.Plugin.VOD.Services
         [LoggerMessage(EventId = 3, Level = LogLevel.Warning,
             Message = "Could not kill yt-dlp process after timeout")]
         private partial void LogKillFailed(Exception exception);
+
+        [LoggerMessage(EventId = 4, Level = LogLevel.Warning,
+            Message = "yt-dlp output for {Url} ({Mode}) could not be parsed as JSON")]
+        private partial void LogParseFailed(string url, string mode);
     }
 }

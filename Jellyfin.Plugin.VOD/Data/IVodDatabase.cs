@@ -37,14 +37,36 @@ namespace Jellyfin.Plugin.VOD.Data
         /// <returns>A read-only list of matching <see cref="VideoRecord"/> entries.</returns>
         IReadOnlyList<VideoRecord> GetVideosBySource(string sourceUrl);
 
+        /// <summary>
+        /// Returns the video for a given source and platform-native ID, or <see langword="null"/> when not found.
+        /// Used by SyncService to detect updates to existing entries.
+        /// </summary>
+        VideoRecord? GetVideoByNativeId(string sourceUrl, string nativeId);
+
         /// <summary>Deletes a video by its UUID.</summary>
         /// <param name="uuid">The video UUID to delete.</param>
         void DeleteVideo(string uuid);
 
-        /// <summary>Returns UUIDs of videos belonging to <paramref name="sourceUrl"/> that were last synced before <paramref name="syncedBefore"/>.</summary>
+        /// <summary>
+        /// Bulk-updates <c>synced_at</c> for videos belonging to <paramref name="sourceUrl"/>
+        /// whose <c>native_id</c> is in <paramref name="nativeIds"/>, marking them as seen
+        /// in the current sync without re-fetching their full metadata.
+        /// </summary>
+        void TouchVideos(string sourceUrl, IReadOnlyCollection<string> nativeIds, DateTimeOffset syncedAt);
+
+        /// <summary>
+        /// Returns UUIDs of videos belonging to <paramref name="sourceUrl"/> that were last synced
+        /// before <paramref name="syncedBefore"/> (i.e. disappeared from the source), or whose
+        /// <c>published_at</c> is older than <paramref name="retentionCutoff"/> when provided.
+        /// </summary>
         /// <param name="sourceUrl">The parent source URL.</param>
-        /// <param name="syncedBefore">Cutoff timestamp; videos synced strictly before this are returned.</param>
+        /// <param name="syncedBefore">Videos synced strictly before this are considered orphaned.</param>
+        /// <param name="retentionCutoff">When set, videos published before this date are also returned.</param>
         /// <returns>A read-only list of orphaned video UUIDs.</returns>
-        IReadOnlyList<string> GetOrphanedVideoUuids(string sourceUrl, DateTimeOffset syncedBefore);
+        IReadOnlyList<string> GetOrphanedVideoUuids(string sourceUrl, DateTimeOffset syncedBefore, DateTimeOffset? retentionCutoff = null);
+
+        /// <summary>Returns all non-null strm_path values across every video record.</summary>
+        /// <returns>A read-only list of absolute file paths.</returns>
+        IReadOnlyList<string> GetAllStrmPaths();
     }
 }

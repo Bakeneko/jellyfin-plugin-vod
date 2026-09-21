@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using Jellyfin.Plugin.VOD.Data;
 using Jellyfin.Plugin.VOD.Data.Models;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -158,6 +159,61 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
         }
 
         [Fact]
+        public void TouchVideos_UpdatesSyncedAt()
+        {
+            _db.UpsertSource(new SourceRecord { Url = "https://example.com" });
+            var oldTime = DateTimeOffset.UtcNow.AddHours(-5);
+            var newTime = DateTimeOffset.UtcNow;
+
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = "touch-uuid",
+                NativeId = "native-abc",
+                SourceUrl = "https://example.com",
+                VideoUrl = "https://example.com/v/abc",
+                SyncedAt = oldTime
+            });
+
+            _db.TouchVideos("https://example.com", ["native-abc"], newTime);
+
+            // After touch, the video should no longer be considered an orphan
+            var orphans = _db.GetOrphanedVideoUuids("https://example.com", newTime.AddSeconds(-1));
+            Assert.DoesNotContain("touch-uuid", orphans);
+        }
+
+        [Fact]
+        public void GetOrphanedVideoUuids_WithRetentionCutoff_ReturnsOldVideos()
+        {
+            _db.UpsertSource(new SourceRecord { Url = "https://example.com" });
+            var syncStart = DateTimeOffset.UtcNow;
+            var retention = syncStart.AddDays(-30);
+
+            // Recent video — within retention, synced now
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = "recent-uuid",
+                SourceUrl = "https://example.com",
+                VideoUrl = "https://example.com/v/recent",
+                PublishedAt = syncStart.AddDays(-10),
+                SyncedAt = syncStart
+            });
+            // Old video — beyond retention, synced now (still on source but too old)
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = "old-uuid",
+                SourceUrl = "https://example.com",
+                VideoUrl = "https://example.com/v/old",
+                PublishedAt = syncStart.AddDays(-60),
+                SyncedAt = syncStart
+            });
+
+            var orphans = _db.GetOrphanedVideoUuids("https://example.com", syncStart, retention);
+
+            Assert.DoesNotContain("recent-uuid", orphans);
+            Assert.Contains("old-uuid", orphans);
+        }
+
+        [Fact]
         public void DeleteVideo_RemovesEntry()
         {
             _db.UpsertSource(new SourceRecord { Url = "https://example.com" });
@@ -172,6 +228,55 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
             _db.DeleteVideo("to-delete");
 
             Assert.Null(_db.GetVideoByUuid("to-delete"));
+        }
+
+        [Fact]
+        public void UpsertVideo_IsLive_RoundTrips()
+        {
+            _db.UpsertSource(new SourceRecord { Url = "https://www.youtube.com/@live" });
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = "live-uuid",
+                SourceUrl = "https://www.youtube.com/@live",
+                VideoUrl = "https://www.youtube.com/watch?v=live123",
+                IsLive = true,
+                SyncedAt = DateTimeOffset.UtcNow
+            });
+
+            var r = _db.GetVideoByUuid("live-uuid");
+
+            Assert.NotNull(r);
+            Assert.True(r.IsLive);
+        }
+
+        [Fact]
+        public void EnsureCreated_IsIdempotent()
+        {
+            // The constructor already ran it once; a second call must be a no-op, not a re-apply.
+            _db.EnsureCreated();
+
+            _db.UpsertSource(new SourceRecord { Url = "https://example.com" });
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = "idempotent-uuid",
+                SourceUrl = "https://example.com",
+                VideoUrl = "https://example.com/v/1",
+                IsLive = false,
+                SyncedAt = DateTimeOffset.UtcNow
+            });
+
+            Assert.NotNull(_db.GetVideoByUuid("idempotent-uuid"));
+        }
+
+        [Fact]
+        public void EnsureCreated_StampsSchemaVersion()
+        {
+            using var conn = new SqliteConnection($"Data Source={_dbPath}");
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "PRAGMA user_version";
+
+            Assert.Equal(1L, (long)cmd.ExecuteScalar()!);
         }
     }
 }

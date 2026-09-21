@@ -13,6 +13,8 @@
                 <h1>VOD</h1>
                 <form id="configurationForm">
 
+                    <h2>Tools</h2>
+
                     <div class="inputContainer">
                         <label class="inputLabel inputLabelUnfocused" for="ytDlpPath">yt-dlp path</label>
                         <input id="ytDlpPath" name="YtDlpPath" type="text"
@@ -27,11 +29,21 @@
                         <label class="inputLabel inputLabelUnfocused" for="jsRuntime">JS runtime</label>
                         <input id="jsRuntime" name="JsRuntime" type="text"
                                is="emby-input" class="emby-input"
-                               placeholder="/config/deno" />
+                               placeholder="deno:/config/deno" />
                         <div class="fieldDescription">
                             Passed to yt-dlp's <code>--js-runtimes</code> as <code>NAME</code> or
                             <code>NAME:PATH</code>. Required for YouTube (deno, node, bun or quickjs).
                             Leave empty to use yt-dlp's default.
+                        </div>
+                    </div>
+
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="ffmpegPath">FFmpeg path</label>
+                        <input id="ffmpegPath" name="FfmpegPath" type="text"
+                               is="emby-input" class="emby-input"
+                               placeholder="ffmpeg" />
+                        <div class="fieldDescription">
+                            Absolute path or PATH-resolvable name of the ffmpeg executable.
                         </div>
                     </div>
 
@@ -43,6 +55,77 @@
                         <div class="fieldDescription">
                             Absolute path to a Netscape-format cookie file. Use a throwaway account —
                             this file grants full account access.
+                        </div>
+                    </div>
+
+                    <h2>Library</h2>
+
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="libraryBasePath">Library base path</label>
+                        <input id="libraryBasePath" name="LibraryBasePath" type="text"
+                               is="emby-input" class="emby-input"
+                               placeholder="/media/vod" />
+                        <div class="fieldDescription">
+                            Root directory where .strm files are written. Must be a path that
+                            Jellyfin's library scanner watches.
+                        </div>
+                    </div>
+
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="localBaseUrl">Local base URL</label>
+                        <input id="localBaseUrl" name="LocalBaseUrl" type="text"
+                               is="emby-input" class="emby-input"
+                               placeholder="http://localhost:8096" />
+                        <div class="fieldDescription">
+                            Base URL embedded in .strm files. Must be reachable by the Jellyfin server
+                            itself (loopback is fine for single-host setups).
+                        </div>
+                    </div>
+
+                    <h2>Playback</h2>
+
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="cacheMinutes">Playlist cache (minutes)</label>
+                        <input id="cacheMinutes" name="CacheMinutes" type="number" min="1" max="60"
+                               is="emby-input" class="emby-input"
+                               placeholder="5" />
+                        <div class="fieldDescription">
+                            How long filtered HLS master playlists are cached before being re-fetched.
+                        </div>
+                    </div>
+
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="maxHeight">Max video height (px)</label>
+                        <input id="maxHeight" name="MaxHeight" type="number" min="144" max="2160"
+                               is="emby-input" class="emby-input"
+                               placeholder="1080" />
+                        <div class="fieldDescription">
+                            Maximum video height passed to HLS playlist filtering. Variants above this
+                            height are excluded. Fallback: uncapped if no variant fits.
+                        </div>
+                    </div>
+
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="preferredAudioLanguages">Preferred audio languages</label>
+                        <input id="preferredAudioLanguages" name="PreferredAudioLanguages" type="text"
+                               is="emby-input" class="emby-input"
+                               placeholder="en, fr" />
+                        <div class="fieldDescription">
+                            Comma-separated BCP-47 language prefixes (e.g. <code>en, fr</code>).
+                            Matching audio renditions are kept in HLS masters, original track always included.
+                            Leave empty to keep the original track only.
+                        </div>
+                    </div>
+
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="preferredSubtitleLanguages">Preferred subtitle languages</label>
+                        <input id="preferredSubtitleLanguages" name="PreferredSubtitleLanguages" type="text"
+                               is="emby-input" class="emby-input"
+                               placeholder="en, fr" />
+                        <div class="fieldDescription">
+                            Comma-separated BCP-47 language prefixes (e.g. <code>en, fr</code>).
+                            Matching subtitle tracks are included in HLS masters.
+                            Leave empty to include no subtitles.
                         </div>
                     </div>
 
@@ -65,9 +148,18 @@
                     Dashboard.showLoadingMsg();
                     ApiClient.getPluginConfiguration(PluginConfig.pluginUniqueId)
                         .then(function (config) {
-                            document.querySelector('#ytDlpPath').value = config.YtDlpPath || '';
-                            document.querySelector('#jsRuntime').value = config.JsRuntime || '';
-                            document.querySelector('#cookiesPath').value = config.CookiesPath || '';
+                            document.querySelector('#ytDlpPath').value        = config.YtDlpPath || '';
+                            document.querySelector('#jsRuntime').value         = config.JsRuntime || '';
+                            document.querySelector('#ffmpegPath').value        = config.FfmpegPath || '';
+                            document.querySelector('#cookiesPath').value       = config.CookiesPath || '';
+                            document.querySelector('#libraryBasePath').value   = config.LibraryBasePath || '';
+                            document.querySelector('#localBaseUrl').value      = config.LocalBaseUrl || 'http://localhost:8096';
+                            document.querySelector('#cacheMinutes').value      = config.CacheMinutes || 5;
+                            document.querySelector('#maxHeight').value         = config.MaxHeight || 1080;
+                            document.querySelector('#preferredAudioLanguages').value =
+                                (config.PreferredAudioLanguages || []).join(', ');
+                            document.querySelector('#preferredSubtitleLanguages').value =
+                                (config.PreferredSubtitleLanguages || []).join(', ');
                             Dashboard.hideLoadingMsg();
                         });
                 });
@@ -78,11 +170,19 @@
                     Dashboard.showLoadingMsg();
                     ApiClient.getPluginConfiguration(PluginConfig.pluginUniqueId)
                         .then(function (config) {
-                            config.YtDlpPath = document.querySelector('#ytDlpPath').value;
-                            config.JsRuntime = document.querySelector('#jsRuntime').value;
-                            config.CookiesPath = document.querySelector('#cookiesPath').value;
-                            return ApiClient.updatePluginConfiguration(
-                                PluginConfig.pluginUniqueId, config);
+                            config.YtDlpPath      = document.querySelector('#ytDlpPath').value;
+                            config.JsRuntime       = document.querySelector('#jsRuntime').value;
+                            config.FfmpegPath      = document.querySelector('#ffmpegPath').value;
+                            config.CookiesPath     = document.querySelector('#cookiesPath').value;
+                            config.LibraryBasePath = document.querySelector('#libraryBasePath').value;
+                            config.LocalBaseUrl    = document.querySelector('#localBaseUrl').value;
+                            config.CacheMinutes    = parseInt(document.querySelector('#cacheMinutes').value, 10) || 5;
+                            config.MaxHeight       = parseInt(document.querySelector('#maxHeight').value, 10) || 1080;
+                            config.PreferredAudioLanguages = document.querySelector('#preferredAudioLanguages').value
+                                .split(',').map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; });
+                            config.PreferredSubtitleLanguages = document.querySelector('#preferredSubtitleLanguages').value
+                                .split(',').map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; });
+                            return ApiClient.updatePluginConfiguration(PluginConfig.pluginUniqueId, config);
                         })
                         .then(function (result) {
                             Dashboard.processPluginConfigurationUpdateResult(result);
