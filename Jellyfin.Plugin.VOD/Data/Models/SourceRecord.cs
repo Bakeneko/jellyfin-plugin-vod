@@ -11,11 +11,28 @@ namespace Jellyfin.Plugin.VOD.Data.Models
         /// <summary>Gets or sets the resolved display name.</summary>
         public string? Name { get; set; }
 
-        /// <summary>Gets or sets the absolute path of the series folder on disk (Series mode only).</summary>
-        public string? SeriesPath { get; set; }
-
         /// <summary>Gets or sets the thumbnail URL for the series artwork.</summary>
         public string? SeriesThumbnailUrl { get; set; }
+
+        /// <summary>
+        /// The remote URL for the series image that was last published to Jellyfin. Compared against the
+        /// current URL to decide whether the artwork must be re-pointed; Jellyfin caches the image
+        /// locally and keeps no record of its origin.
+        /// </summary>
+        public string? PublishedImageUrl { get; set; }
+
+        /// <summary>
+        /// The wide image for the series, shown as its Thumb. On YouTube this is the channel banner;
+        /// most sources have none.
+        /// </summary>
+        public string? SeriesBannerUrl { get; set; }
+
+        /// <summary>The banner URL last published to Jellyfin, for the same reason as
+        /// <see cref="PublishedImageUrl"/>.</summary>
+        public string? PublishedBannerUrl { get; set; }
+
+        /// <summary>The channel's tags, as a JSON array. Published on the series.</summary>
+        public string? Tags { get; set; }
 
         /// <summary>Gets or sets the series synopsis as returned by yt-dlp.</summary>
         public string? SeriesSynopsis { get; set; }

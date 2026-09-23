@@ -1,3 +1,6 @@
 {
-  "UpcomingBroadcast": "Diffusion prévue : {0} UTC"
+  "UpcomingBroadcast": "Diffusion prévue : {0} UTC",
+  "LiveNow": "Diffusion en cours",
+  "SeasonLabel": "Saison {0}",
+  "SourceLabel": "Source : {0}"
 }

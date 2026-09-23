@@ -214,6 +214,47 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
         }
 
         [Fact]
+        public void DeleteSource_RemovesTheSourceAndItsVideos()
+        {
+            // Retiring a source deletes user data, so the cascade is pinned here rather than left to
+            // the foreign key: videos.source_url references sources.url, and deleting the parent row
+            // first would fail instead of taking the children with it.
+            _db.UpsertSource(new SourceRecord { Url = "https://retired.example" });
+            _db.UpsertSource(new SourceRecord { Url = "https://kept.example" });
+
+            foreach (var (id, source) in new[]
+            {
+                ("gone-1", "https://retired.example"),
+                ("gone-2", "https://retired.example"),
+                ("stays", "https://kept.example")
+            })
+            {
+                _db.UpsertVideo(new VideoRecord
+                {
+                    Id = id,
+                    SourceUrl = source,
+                    VideoUrl = "https://example.com/v/" + id,
+                    SyncedAt = DateTimeOffset.UtcNow
+                });
+            }
+
+            _db.DeleteSource("https://retired.example");
+
+            Assert.Null(_db.GetSource("https://retired.example"));
+            Assert.Empty(_db.GetVideosBySource("https://retired.example"));
+
+            // The other source must be untouched: retirement is per source, and an over-broad
+            // DELETE here would empty the whole library on the next reconciliation.
+            Assert.NotNull(_db.GetSource("https://kept.example"));
+            Assert.Single(_db.GetVideosBySource("https://kept.example"));
+            Assert.Contains("stays", _db.GetAllVideoIds());
+        }
+
+        [Fact]
+        public void DeleteSource_IsSilentOnAnUnknownUrl()
+            => _db.DeleteSource("https://never-existed.example");
+
+        [Fact]
         public void DeleteVideo_RemovesEntry()
         {
             _db.UpsertSource(new SourceRecord { Url = "https://example.com" });
@@ -266,6 +307,61 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
             });
 
             Assert.NotNull(_db.GetVideoByUuid("idempotent-uuid"));
+        }
+
+        // --- Published artwork URLs ---
+
+        [Fact]
+        public void UpsertSource_LeavesThePublishedArtworkUrlsAlone()
+        {
+            // UpsertSource deliberately omits published_image_url and published_banner_url from its
+            // INSERT and its ON CONFLICT list. SyncService re-upserts a SourceRecord it read before
+            // the publisher wrote those URLs, so "completing" the UPSERT would blank them and make
+            // every source image download again on every sync.
+            const string url = "https://www.youtube.com/@arte";
+            _db.UpsertSource(new SourceRecord { Url = url, Name = "Arte" });
+            _db.SetSourcePublishedImageUrl(url, "https://cdn.example.com/arte-poster.jpg");
+            _db.SetSourcePublishedBannerUrl(url, "https://cdn.example.com/arte-banner.jpg");
+
+            // The stale in-memory record: it never carried the published URLs.
+            _db.UpsertSource(new SourceRecord { Url = url, Name = "Arte", VideoCount = 7 });
+
+            var retrieved = _db.GetSource(url);
+            Assert.NotNull(retrieved);
+            Assert.Equal("https://cdn.example.com/arte-poster.jpg", retrieved.PublishedImageUrl);
+            Assert.Equal("https://cdn.example.com/arte-banner.jpg", retrieved.PublishedBannerUrl);
+            Assert.Equal(7, retrieved.VideoCount);
+        }
+
+        [Fact]
+        public void UpsertVideo_LeavesThePublishedImageUrlAlone()
+        {
+            // Same contract on the video side: published_image_url is the publisher's column.
+            const string uuid = "550e8400-e29b-41d4-a716-4466554400ff";
+            _db.UpsertSource(new SourceRecord { Url = "https://www.youtube.com/@arte" });
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = uuid,
+                SourceUrl = "https://www.youtube.com/@arte",
+                VideoUrl = "https://www.youtube.com/watch?v=abc123",
+                Title = "Before",
+                SyncedAt = DateTimeOffset.UtcNow
+            });
+            _db.SetPublishedImageUrl(uuid, "https://cdn.example.com/still.jpg");
+
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = uuid,
+                SourceUrl = "https://www.youtube.com/@arte",
+                VideoUrl = "https://www.youtube.com/watch?v=abc123",
+                Title = "After",
+                SyncedAt = DateTimeOffset.UtcNow
+            });
+
+            var retrieved = _db.GetVideoByUuid(uuid);
+            Assert.NotNull(retrieved);
+            Assert.Equal("https://cdn.example.com/still.jpg", retrieved.PublishedImageUrl);
+            Assert.Equal("After", retrieved.Title);
         }
 
         [Fact]

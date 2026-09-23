@@ -39,13 +39,44 @@ namespace Jellyfin.Plugin.VOD.Data
 
         /// <summary>
         /// Returns the video for a given source and platform-native ID, or <see langword="null"/> when not found.
-        /// Used by SyncService to detect updates to existing entries.
+        /// Nothing in the plugin calls this: the sync path keys on the video UUID. It is kept as the
+        /// only way to reach a row from the identifiers a platform hands out, which is what a
+        /// migration or a diagnostic endpoint would need.
         /// </summary>
         VideoRecord? GetVideoByNativeId(string sourceUrl, string nativeId);
+
+        /// <summary>
+        /// Records the remote image URL last handed to Jellyfin for a video. Jellyfin localises the
+        /// image on first display and forgets where it came from, so this is the only way a later
+        /// sync can tell that the upstream artwork changed.
+        /// </summary>
+        /// <param name="videoId">The video UUID.</param>
+        /// <param name="url">The remote image URL that was published, or <see langword="null"/>.</param>
+        void SetPublishedImageUrl(string videoId, string? url);
+
+        /// <summary>Same as <see cref="SetPublishedImageUrl"/>, for a source's series image.</summary>
+        /// <param name="sourceUrl">The source URL (primary key).</param>
+        /// <param name="url">The remote image URL that was published, or <see langword="null"/>.</param>
+        void SetSourcePublishedImageUrl(string sourceUrl, string? url);
+
+        /// <summary>Same as <see cref="SetSourcePublishedImageUrl"/>, for the wide Thumb image.</summary>
+        /// <param name="sourceUrl">The source URL (primary key).</param>
+        /// <param name="url">The remote banner URL that was published, or <see langword="null"/>.</param>
+        void SetSourcePublishedBannerUrl(string sourceUrl, string? url);
 
         /// <summary>Deletes a video by its UUID.</summary>
         /// <param name="uuid">The video UUID to delete.</param>
         void DeleteVideo(string uuid);
+
+        /// <summary>
+        /// Deletes a source and every video belonging to it, for a source the configuration no
+        /// longer lists.
+        /// </summary>
+        /// <param name="url">The source URL (primary key).</param>
+        void DeleteSource(string url);
+
+        /// <summary>Returns the UUIDs of every video the plugin knows, across all sources.</summary>
+        IReadOnlyList<string> GetAllVideoIds();
 
         /// <summary>
         /// Bulk-updates <c>synced_at</c> for videos belonging to <paramref name="sourceUrl"/>
@@ -64,9 +95,5 @@ namespace Jellyfin.Plugin.VOD.Data
         /// <param name="retentionCutoff">When set, videos published before this date are also returned.</param>
         /// <returns>A read-only list of orphaned video UUIDs.</returns>
         IReadOnlyList<string> GetOrphanedVideoUuids(string sourceUrl, DateTimeOffset syncedBefore, DateTimeOffset? retentionCutoff = null);
-
-        /// <summary>Returns all non-null strm_path values across every video record.</summary>
-        /// <returns>A read-only list of absolute file paths.</returns>
-        IReadOnlyList<string> GetAllStrmPaths();
     }
 }

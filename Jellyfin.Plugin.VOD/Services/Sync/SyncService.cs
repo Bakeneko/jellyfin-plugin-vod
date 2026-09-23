@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
 using System.Text.Json;
 using System.Threading;
@@ -10,13 +9,14 @@ using Jellyfin.Plugin.VOD.Data;
 using Jellyfin.Plugin.VOD.Data.Models;
 using Jellyfin.Plugin.VOD.Localization;
 using Jellyfin.Plugin.VOD.Services.Sync.Dto;
+using MediaBrowser.Controller.Entities;
 using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Plugin.VOD.Services.Sync
 {
     /// <summary>
     /// Orchestrates the full sync of a single source: enumerate entries, fetch metadata,
-    /// assign episode numbers, write .strm files, upsert the database and clean up orphans.
+    /// assign episode numbers, upsert the database and clean up orphans.
     /// </summary>
     public sealed partial class SyncService
     {
@@ -24,7 +24,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
         private readonly IVodDatabase _db;
         private readonly YtDlpService _ytDlp;
-        private readonly LibraryWriter _library;
+        private readonly LibraryPublisher _publisher;
         private readonly IVodLocalizer _localizer;
         private readonly ILogger<SyncService> _logger;
 
@@ -32,25 +32,88 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         public SyncService(
             IVodDatabase db,
             YtDlpService ytDlp,
-            LibraryWriter library,
+            LibraryPublisher publisher,
             IVodLocalizer localizer,
             ILogger<SyncService> logger)
         {
             _db = db;
             _ytDlp = ytDlp;
-            _library = library;
+            _publisher = publisher;
             _localizer = localizer;
             _logger = logger;
+        }
+
+        /// <summary>
+        /// Removes every trace of the sources the configuration no longer lists: their library
+        /// items, the containers holding them, and their rows.
+        /// </summary>
+        /// <remarks>
+        /// Runs first in a sync pass, because the rest of the sync only ever reads the configuration
+        /// and would never look at a source that is no longer in it. A source with
+        /// <c>Enabled = false</c> is NOT retired — it is paused, and its items stay: deletion cascades
+        /// to the user's watch history, which recreating the item does not bring back, so a cleared
+        /// checkbox must not destroy data.
+        /// </remarks>
+        /// <param name="cancellationToken">A token to cancel the operation.</param>
+        /// <returns>The number of sources retired.</returns>
+        public async Task<int> RetireRemovedSourcesAsync(CancellationToken cancellationToken)
+        {
+            var config = Plugin.Instance?.Configuration;
+            if (config is null || string.IsNullOrWhiteSpace(config.LibraryName))
+                return 0;
+
+            // Every configured source, enabled or not — only absence from the configuration retires.
+            var configured = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var definition in config.Sources)
+                configured.Add(definition.Url);
+
+            var retired = new List<SourceRecord>();
+            foreach (var record in _db.GetAllSources())
+            {
+                if (!configured.Contains(record.Url))
+                    retired.Add(record);
+            }
+
+            if (retired.Count == 0)
+                return 0;
+
+            var anchor = _publisher.ResolveAnchor(config.LibraryName);
+
+            foreach (var record in retired)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                // Rows first: the orphan loop spares any video the database still knows, so
+                // reconciling before the purge would leave every item exactly where it is.
+                _db.DeleteSource(record.Url);
+
+                // An empty expectation deletes the source's items and, through the container
+                // reconciliation, its series and seasons. The mode no longer exists in the
+                // configuration, but it does not matter: with nothing expected, the Series branch
+                // finds a series to reap or finds none, and the Movies branch reaps nothing.
+                await _publisher.ReconcileAsync(
+                        anchor, record, SourceMode.Series, record.Name ?? record.Url,
+                        [],
+                        _db.GetAllVideoIds().ToHashSet(StringComparer.OrdinalIgnoreCase),
+                        config.LocalBaseUrl, cancellationToken)
+                    .ConfigureAwait(false);
+
+                LogRetiredSource(record.Url);
+            }
+
+            return retired.Count;
         }
 
         /// <summary>
         /// Performs a full sync for one source. Updates <see cref="SourceRecord"/> in the database
         /// with the outcome (success or error) regardless of whether the sync succeeds.
         /// </summary>
+        /// <param name="source">The source to sync.</param>
+        /// <param name="cancellationToken">A token to cancel the operation.</param>
         public async Task SyncSourceAsync(SourceDefinition source, CancellationToken cancellationToken)
         {
             var config = Plugin.Instance?.Configuration;
-            if (config is null || string.IsNullOrWhiteSpace(config.LibraryBasePath))
+            if (config is null || string.IsNullOrWhiteSpace(config.LibraryName))
             {
                 LogSkippedNoConfig(source.Url);
                 return;
@@ -94,12 +157,18 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 throw new InvalidOperationException($"yt-dlp failed to enumerate {source.Url}");
 
             // Step 3: resolve series name
-            var seriesName = !string.IsNullOrWhiteSpace(source.Name)
-                ? source.Name
-                : (playlist.Title ?? source.Url);
+            var seriesName = ResolveSeriesName(source, playlist);
 
             // Ensure the FK parent row exists before inserting videos
             sourceRecord.Name = seriesName;
+            // Keep what the platform last published; an empty field must not erase a good value.
+            if (!string.IsNullOrWhiteSpace(playlist.Description))
+                sourceRecord.SeriesSynopsis = playlist.Description;
+            if (!string.IsNullOrWhiteSpace(playlist.ThumbnailUrl))
+                sourceRecord.SeriesThumbnailUrl = playlist.ThumbnailUrl;
+            if (!string.IsNullOrWhiteSpace(playlist.BannerUrl))
+                sourceRecord.SeriesBannerUrl = playlist.BannerUrl;
+            sourceRecord.Tags = playlist.Tags.Count > 0 ? JsonSerializer.Serialize(playlist.Tags) : null;
             _db.UpsertSource(sourceRecord);
 
             // Step 4: per-video metadata
@@ -192,14 +261,32 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 await Task.WhenAll(metaTasks).ConfigureAwait(false);
             }
 
-            // Step 5 + 6 + 7: assign episode numbers, write .strm, upsert DB
+            // Step 5 + 6 + 7: assign episode numbers, upsert DB
             ProcessEntries(
-                source, sourceType, playlist.Entries, metadataMap, existingVideos,
-                seriesName, config, syncStart, ct);
+                source, playlist.Entries, metadataMap, existingVideos,
+                seriesName, syncStart, ct);
 
             // Step 8: cleanup orphans — videos no longer in the playlist (deleted from source)
             // or older than RetentionDays.
-            CleanupOrphans(source, config.LibraryBasePath, syncStart, retentionCutoff, playlist.Entries.Count);
+            // Runs BEFORE publication, not after: the reconciliation reads the database to decide what
+            // the library should hold, so leaving the dead rows in place made every removal take two
+            // passes — one to drop the row, the next to notice the item was unaccounted for. This only
+            // touches the database, so nothing here depends on the library being up to date.
+            CleanupOrphans(source, syncStart, retentionCutoff, playlist.Entries.Count);
+
+            // Step 7b: publish items to the Jellyfin library.
+            // Resolved per sync: fails loudly when the library is missing or unscanned.
+            var anchor = _publisher.ResolveAnchor(config.LibraryName);
+
+            // Publication is driven by what the database holds, not by what this pass happened
+            // to re-fetch: entries already known are deliberately skipped for metadata, and
+            // would otherwise never reach the library.
+            await _publisher.ReconcileAsync(
+                    anchor, sourceRecord, source.Mode, seriesName,
+                    _db.GetVideosBySource(source.Url),
+                    _db.GetAllVideoIds().ToHashSet(StringComparer.OrdinalIgnoreCase),
+                    config.LocalBaseUrl, ct)
+                .ConfigureAwait(false);
 
             // Step 9: update source record
             var videoCount = _db.GetVideosBySource(source.Url).Count;
@@ -233,6 +320,9 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 {
                     Title = meta.Title,
                     ThumbnailUrl = meta.Thumbnail,
+                    // A single-video source has no channel of its own to describe, so its tags are
+                    // the video's; the series it may produce is that one video.
+                    Tags = meta.Tags,
                     Description = meta.Description,
                     Entries =
                     [
@@ -261,12 +351,10 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
         private void ProcessEntries(
             SourceDefinition source,
-            SourceType sourceType,
             IReadOnlyList<PlaylistEntry> entries,
             Dictionary<string, VideoMetadata> metadataMap,
             IReadOnlyList<VideoRecord> existingVideos,
             string seriesName,
-            PluginConfiguration config,
             DateTimeOffset syncStart,
             CancellationToken ct)
         {
@@ -307,29 +395,19 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 // The localized prefix is resolved via ILocalizationManager (see Task 1b)
                 record.Description = BuildDescription(meta, publishedAt, _localizer);
                 record.ThumbnailUrl = meta.Thumbnail;
+                record.Tags = meta.Tags.Count > 0 ? JsonSerializer.Serialize(meta.Tags) : null;
+                record.Categories = meta.Categories.Count > 0
+                    ? JsonSerializer.Serialize(meta.Categories) : null;
                 record.DurationSeconds = meta.Duration.HasValue ? (int)meta.Duration.Value : null;
                 record.AudioLangs = meta.AudioLanguages.Count > 0
                     ? JsonSerializer.Serialize(meta.AudioLanguages) : null;
                 record.SubtitleLangs = meta.SubtitleLanguages.Count > 0
                     ? JsonSerializer.Serialize(meta.SubtitleLanguages) : null;
-                record.SourceType = sourceType.ToString();
                 record.IsLive = meta.IsLive;
                 record.SyncedAt = syncStart;
 
                 // Preserve existing publication date (immutable once set)
-                if (!record.PublishedAt.HasValue)
-                {
-                    if (publishedAt.HasValue)
-                    {
-                        record.PublishedAt = publishedAt;
-                        record.DateIsFallback = false;
-                    }
-                    else
-                    {
-                        record.PublishedAt = syncStart;
-                        record.DateIsFallback = true;
-                    }
-                }
+                record.PublishedAt ??= publishedAt ?? syncStart;
 
                 // Prefer native season/episode over date-based fallback, always overwriting
                 // a previously stored date-based value when a better source becomes available.
@@ -348,20 +426,6 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 {
                     record.SeasonNumber = ep.season;
                     record.EpisodeNumber = ep.episode;
-                }
-
-                // Write .strm
-                var streamUrl = BuildStreamUrl(config.LocalBaseUrl, record.Id);
-                try
-                {
-                    var strmPath = _library.WriteStrm(
-                        record, source.Mode, seriesName, config.LibraryBasePath, streamUrl);
-                    record.StrmPath = strmPath;
-                }
-                catch (Exception ex)
-                {
-                    LogStrmWriteFailed(entry.VideoUrl, ex);
-                    continue;
                 }
 
                 _db.UpsertVideo(record);
@@ -423,7 +487,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             return result;
         }
 
-        private void CleanupOrphans(SourceDefinition source, string libraryBasePath, DateTimeOffset syncStart, DateTimeOffset? retentionCutoff, int enumeratedCount)
+        private void CleanupOrphans(SourceDefinition source, DateTimeOffset syncStart, DateTimeOffset? retentionCutoff, int enumeratedCount)
         {
             if (enumeratedCount == 0)
             {
@@ -434,12 +498,35 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             var orphans = _db.GetOrphanedVideoUuids(source.Url, syncStart, retentionCutoff);
             foreach (var uuid in orphans)
             {
-                var video = _db.GetVideoByUuid(uuid);
-                if (video?.StrmPath is not null)
-                    _library.DeleteStrm(video.StrmPath, libraryBasePath);
                 _db.DeleteVideo(uuid);
                 LogDeletedOrphan(uuid);
             }
+        }
+
+        /// <summary>
+        /// Picks the name a source's series carries.
+        /// </summary>
+        /// <remarks>
+        /// yt-dlp names a channel's playlist after the TAB rather than the channel — "Le Fossoyeur
+        /// de Films - Videos", "… - Live", "… - Shorts" — so a channel takes its <c>channel</c>
+        /// field instead. A playlist reports that field too, but there it holds the playlist's
+        /// OWNER, which would rename "WORLDS 2025" to "OTP - VODs"; hence the channel-only test.
+        /// This also settles a name that used to flip: two tabs of one channel resolve to the same
+        /// source key, so they share one series, and whichever synced last decided what it was
+        /// called.
+        /// </remarks>
+        private static string ResolveSeriesName(SourceDefinition source, PlaylistInfo playlist)
+        {
+            if (!string.IsNullOrWhiteSpace(source.Name))
+                return source.Name;
+
+            if (VodNativeId.IsChannel(VodNativeId.ForSource(source.Url))
+                && !string.IsNullOrWhiteSpace(playlist.ChannelName))
+            {
+                return playlist.ChannelName;
+            }
+
+            return playlist.Title ?? source.Url;
         }
 
         private static string? BuildDescription(
@@ -490,9 +577,6 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             return null;
         }
 
-        private static string BuildStreamUrl(string localBaseUrl, string uuid)
-            => $"{localBaseUrl.TrimEnd('/')}/VOD/stream/{uuid}.m3u8";
-
         [LoggerMessage(EventId = 1, Level = LogLevel.Information, Message = "Starting sync for {SourceUrl}")]
         private partial void LogSyncStarted(string sourceUrl);
 
@@ -505,20 +589,21 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         [LoggerMessage(EventId = 4, Level = LogLevel.Warning, Message = "Failed to fetch metadata for {VideoUrl}")]
         private partial void LogMetadataFailed(string videoUrl, Exception exception);
 
-        [LoggerMessage(EventId = 5, Level = LogLevel.Warning, Message = "Failed to write .strm for {VideoUrl}")]
-        private partial void LogStrmWriteFailed(string videoUrl, Exception exception);
-
         [LoggerMessage(EventId = 6, Level = LogLevel.Debug, Message = "Deleted orphan {Uuid}")]
         private partial void LogDeletedOrphan(string uuid);
 
         [LoggerMessage(EventId = 7, Level = LogLevel.Error, Message = "Too many videos on {Date} for {VideoUrl}: rank {Rank} > 999 — skipping remaining entries for this date")]
         private partial void LogRankOverflow(string videoUrl, DateOnly date, int rank);
 
-        [LoggerMessage(EventId = 8, Level = LogLevel.Warning, Message = "Skipping sync for {SourceUrl}: LibraryBasePath not configured")]
+        [LoggerMessage(EventId = 8, Level = LogLevel.Warning, Message = "Skipping sync for {SourceUrl}: LibraryName not configured")]
         private partial void LogSkippedNoConfig(string sourceUrl);
 
         [LoggerMessage(EventId = 9, Level = LogLevel.Warning,
             Message = "Skipping orphan cleanup for {SourceUrl} — no entries were enumerated (possible transient failure)")]
         private partial void LogSkippingCleanup(string sourceUrl);
+
+        [LoggerMessage(EventId = 10, Level = LogLevel.Information,
+            Message = "Retired {SourceUrl}: no longer in the configuration, its items and rows are gone")]
+        private partial void LogRetiredSource(string sourceUrl);
     }
 }

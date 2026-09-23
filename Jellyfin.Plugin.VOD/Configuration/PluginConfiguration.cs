@@ -30,13 +30,13 @@ namespace Jellyfin.Plugin.VOD.Configuration
         // ── Library ──────────────────────────────────────────────────────────────
 
         /// <summary>
-        /// Gets or sets the root directory where .strm files and artwork are written.
-        /// Must be a path that Jellyfin's library scanner watches.
+        /// Gets or sets the name of the Jellyfin library to publish into.
+        /// The library must exist and have been scanned at least once.
         /// </summary>
-        public string LibraryBasePath { get; set; } = string.Empty;
+        public string LibraryName { get; set; } = "VOD";
 
         /// <summary>
-        /// Gets or sets the base URL used inside .strm files.
+        /// Gets or sets the base URL used to build stream URLs served to Jellyfin.
         /// Should be reachable by the Jellyfin server itself (loopback is fine).
         /// Example: <c>http://localhost:8096</c>.
         /// </summary>

@@ -61,13 +61,13 @@
                     <h2>Library</h2>
 
                     <div class="inputContainer">
-                        <label class="inputLabel inputLabelUnfocused" for="libraryBasePath">Library base path</label>
-                        <input id="libraryBasePath" name="LibraryBasePath" type="text"
+                        <label class="inputLabel inputLabelUnfocused" for="libraryName">Library name</label>
+                        <input id="libraryName" name="LibraryName" type="text"
                                is="emby-input" class="emby-input"
-                               placeholder="/media/vod" />
+                               placeholder="VOD" />
                         <div class="fieldDescription">
-                            Root directory where .strm files are written. Must be a path that
-                            Jellyfin's library scanner watches.
+                            Name of the Jellyfin library to publish VOD items into.
+                            The library must exist and have been scanned at least once.
                         </div>
                     </div>
 
@@ -77,7 +77,7 @@
                                is="emby-input" class="emby-input"
                                placeholder="http://localhost:8096" />
                         <div class="fieldDescription">
-                            Base URL embedded in .strm files. Must be reachable by the Jellyfin server
+                            Base URL used to build stream URLs. Must be reachable by the Jellyfin server
                             itself (loopback is fine for single-host setups).
                         </div>
                     </div>
@@ -152,7 +152,7 @@
                             document.querySelector('#jsRuntime').value         = config.JsRuntime || '';
                             document.querySelector('#ffmpegPath').value        = config.FfmpegPath || '';
                             document.querySelector('#cookiesPath').value       = config.CookiesPath || '';
-                            document.querySelector('#libraryBasePath').value   = config.LibraryBasePath || '';
+                            document.querySelector('#libraryName').value        = config.LibraryName       || 'VOD';
                             document.querySelector('#localBaseUrl').value      = config.LocalBaseUrl || 'http://localhost:8096';
                             document.querySelector('#cacheMinutes').value      = config.CacheMinutes || 5;
                             document.querySelector('#maxHeight').value         = config.MaxHeight || 1080;
@@ -174,7 +174,7 @@
                             config.JsRuntime       = document.querySelector('#jsRuntime').value;
                             config.FfmpegPath      = document.querySelector('#ffmpegPath').value;
                             config.CookiesPath     = document.querySelector('#cookiesPath').value;
-                            config.LibraryBasePath = document.querySelector('#libraryBasePath').value;
+                            config.LibraryName     = document.querySelector('#libraryName').value;
                             config.LocalBaseUrl    = document.querySelector('#localBaseUrl').value;
                             config.CacheMinutes    = parseInt(document.querySelector('#cacheMinutes').value, 10) || 5;
                             config.MaxHeight       = parseInt(document.querySelector('#maxHeight').value, 10) || 1080;

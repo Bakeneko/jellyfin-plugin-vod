@@ -13,6 +13,12 @@
   <ItemGroup>
     <PackageReference Include="Jellyfin.Controller" Version="12.0.0" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
+    <!-- Compile-time only: the server already loads SkiaSharp and its native library from
+         /jellyfin, so shipping our own copy would duplicate it and risk two versions in one
+         process. "runtime" keeps the managed assembly out of the published plugin; "native" is
+         needed too, or the publish output still carries the win-x64, win-x86, win-arm64 and osx
+         copies of libSkiaSharp — 40 MB of payload the plugin never loads. -->
+    <PackageReference Include="SkiaSharp" Version="3.119.4" ExcludeAssets="runtime;native" />
   </ItemGroup>
 
   <ItemGroup>

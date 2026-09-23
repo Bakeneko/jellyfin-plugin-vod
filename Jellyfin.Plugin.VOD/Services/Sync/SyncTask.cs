@@ -1,7 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
-using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.VOD.Data;
@@ -15,15 +13,13 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
     {
         private readonly SyncService _syncService;
         private readonly IVodDatabase _db;
-        private readonly LibraryWriter _library;
         private readonly ILogger<SyncTask> _logger;
 
         /// <summary>Initializes a new instance of the <see cref="SyncTask"/> class.</summary>
-        public SyncTask(SyncService syncService, IVodDatabase db, LibraryWriter library, ILogger<SyncTask> logger)
+        public SyncTask(SyncService syncService, IVodDatabase db, ILogger<SyncTask> logger)
         {
             _syncService = syncService;
             _db = db;
-            _library = library;
             _logger = logger;
         }
 
@@ -34,7 +30,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         public string Key => "VodSync";
 
         /// <inheritdoc />
-        public string Description => "Syncs all enabled VOD sources and writes .strm files to the library.";
+        public string Description => "Syncs all enabled VOD sources into the Jellyfin library.";
 
         /// <inheritdoc />
         public string Category => "VOD";
@@ -63,6 +59,12 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             if (config is null)
                 return;
 
+            // First, and before the early return below: a source removed from the configuration is
+            // never visited by the loop that follows, since that loop only ever reads the
+            // configuration. Retiring has to be driven from the database instead — and emptying the
+            // source list entirely is exactly the case where it matters most.
+            await _syncService.RetireRemovedSourcesAsync(cancellationToken).ConfigureAwait(false);
+
             var sources = config.Sources.FindAll(s => s.Enabled);
             if (sources.Count == 0)
             {
@@ -88,15 +90,6 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
                 await _syncService.SyncSourceAsync(sources[i], cancellationToken)
                     .ConfigureAwait(false);
-            }
-
-            // Reconcile: delete .strm files on disk that have no DB record
-            if (!string.IsNullOrWhiteSpace(config.LibraryBasePath))
-            {
-                var knownPaths = new HashSet<string>(
-                    _db.GetAllStrmPaths().Select(Path.GetFullPath),
-                    StringComparer.OrdinalIgnoreCase);
-                _library.ReconcileLibrary(config.LibraryBasePath, knownPaths);
             }
 
             progress.Report(100);

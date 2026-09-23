@@ -1,15 +1,17 @@
+using System;
 using System.Text.RegularExpressions;
 
 namespace Jellyfin.Plugin.VOD.Services.Sync
 {
     /// <summary>
     /// Derives stable, human-readable identifiers from yt-dlp extractor keys and source URLs.
-    /// These are used as fake IMDB IDs in the library path and in provider metadata so that
-    /// Jellyfin's <c>GetUserDataKeys()</c> can recover watch history after a file rename.
+    /// These identifiers are published as the plugin's own <c>VOD</c> provider id, and on a series
+    /// also under the yt-dlp extractor key and <c>MetadataProvider.Custom</c> — the last of these
+    /// being what keeps a series' presentation key independent of its name.
     /// </summary>
     /// <remarks>
     /// Format: <c>youtube_v_{id}</c>, <c>youtube_ch_{handle}</c>, <c>youtube_pl_{id}</c>,
-    /// <c>arte_v_{id}</c>, <c>arte_pl_{RC-id}</c>, <c>ftv_v_{uuid}</c>.
+    /// <c>arte_v_{id}</c>, <c>arte_pl_{RC-id}</c>, <c>ftv_v_{id}</c> (numeric for sources, UUID for videos).
     /// </remarks>
     public static partial class VodNativeId
     {
@@ -29,6 +31,21 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 _ => null
             };
         }
+
+        /// <summary>
+        /// Returns <see langword="true"/> when a source key denotes a channel rather than a playlist
+        /// or a single video.
+        /// </summary>
+        /// <remarks>
+        /// Only a channel may take its name from yt-dlp's <c>channel</c> field. A playlist carries
+        /// that field too, but it holds the playlist's OWNER — preferring it would rename
+        /// "WORLDS 2025" to "OTP - VODs".
+        /// </remarks>
+        /// <param name="sourceKey">A key returned by <see cref="ForSource"/>.</param>
+        /// <returns><see langword="true"/> for a channel key.</returns>
+        public static bool IsChannel(string? sourceKey)
+            => sourceKey is not null
+               && sourceKey.Contains("_ch_", StringComparison.Ordinal);
 
         /// <summary>
         /// Returns the stable ID for a source (channel, playlist, or series URL),
@@ -63,6 +80,10 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             m = ArteVideoRegex().Match(sourceUrl);
             if (m.Success) return $"arte_v_{m.Groups[1].Value}";
 
+            // france.tv: https://www.france.tv/documentaires/doc/8808888-le-titre.html
+            m = FranceTvVideoRegex().Match(sourceUrl);
+            if (m.Success) return $"ftv_v_{m.Groups[1].Value}";
+
             return null;
         }
 
@@ -86,5 +107,11 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         // Arte NNNNNN-NNN-A (single video)
         [GeneratedRegex(@"arte\.tv/[a-z]*/videos/(\d+-\d+-[A-Z]+)/", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
         private static partial Regex ArteVideoRegex();
+
+        // france.tv video id — anchored to the final path segment, so a digit-leading
+        // intermediate segment cannot be mistaken for the video id.
+        [GeneratedRegex(@"france\.tv/(?:[^/]+/)*(\d+)-[^/?#]*/?(?:[?#]|$)",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+        private static partial Regex FranceTvVideoRegex();
     }
 }

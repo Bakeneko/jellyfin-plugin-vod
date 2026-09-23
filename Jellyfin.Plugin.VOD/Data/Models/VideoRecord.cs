@@ -24,17 +24,11 @@ namespace Jellyfin.Plugin.VOD.Data.Models
         /// <summary>Gets or sets the video title.</summary>
         public string? Title { get; set; }
 
-        /// <summary>Gets or sets a value indicating whether <see cref="PublishedAt"/> is a sync-date fallback.</summary>
-        public bool DateIsFallback { get; set; }
-
         /// <summary>Gets or sets the UTC publication date (frozen at first sync).</summary>
         public DateTimeOffset? PublishedAt { get; set; }
 
         /// <summary>Gets or sets the duration in seconds.</summary>
         public int? DurationSeconds { get; set; }
-
-        /// <summary>Gets or sets the absolute path of the series folder.</summary>
-        public string? SeriesPath { get; set; }
 
         /// <summary>Gets or sets the season number (calendar year for non-native Arte; real season for native Arte).</summary>
         public int? SeasonNumber { get; set; }
@@ -42,29 +36,37 @@ namespace Jellyfin.Plugin.VOD.Data.Models
         /// <summary>Gets or sets the episode number within the season.</summary>
         public int? EpisodeNumber { get; set; }
 
-        /// <summary>Gets or sets the absolute path of the generated .strm file.</summary>
-        public string? StrmPath { get; set; }
-
         /// <summary>Gets or sets the UTC timestamp of the last sync of this entry.</summary>
         public DateTimeOffset SyncedAt { get; set; }
 
+        // Written by the sync, read by nothing yet: reserved for the remux path.
+        // No provider may rely on these — tracks come from the filtered HLS master.
         /// <summary>Gets or sets the JSON array of available audio language codes.</summary>
         public string? AudioLangs { get; set; }
 
+        // Written by the sync, read by nothing yet: reserved for the remux path.
+        // No provider may rely on these — tracks come from the filtered HLS master.
         /// <summary>Gets or sets the JSON array of available subtitle language codes.</summary>
         public string? SubtitleLangs { get; set; }
 
         /// <summary>Gets or sets the thumbnail URL.</summary>
         public string? ThumbnailUrl { get; set; }
 
+        /// <summary>The video's tags, as a JSON array, capped at the platform-agnostic limit.</summary>
+        public string? Tags { get; set; }
+
+        /// <summary>The video's categories, as a JSON array. Published as Jellyfin genres.</summary>
+        public string? Categories { get; set; }
+
+        /// <summary>
+        /// The remote URL for the video thumbnail that was last published to Jellyfin. Compared against the
+        /// current URL to decide whether the artwork must be re-pointed; Jellyfin caches the image
+        /// locally and keeps no record of its origin.
+        /// </summary>
+        public string? PublishedImageUrl { get; set; }
+
         /// <summary>Gets or sets the description / synopsis.</summary>
         public string? Description { get; set; }
-
-        /// <summary>Gets or sets the availability expiry date (UTC), when known.</summary>
-        public DateTimeOffset? AvailableUntil { get; set; }
-
-        /// <summary>Gets or sets the detected source type (e.g. "youtube_channel", "arte_series").</summary>
-        public string? SourceType { get; set; }
 
         /// <summary>Gets or sets a value indicating whether this is a live stream at the time of last sync.</summary>
         public bool IsLive { get; set; }

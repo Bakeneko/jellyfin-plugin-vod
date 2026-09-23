@@ -46,13 +46,32 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         [InlineData("https://www.arte.tv/fr/videos/RC-022076/les-idees-larges/",   "arte_pl_RC-022076")]
         [InlineData("https://www.arte.tv/de/videos/RC-012345/some-show/",          "arte_pl_RC-012345")]
         [InlineData("https://www.arte.tv/fr/videos/128788-000-A/la-femme-qui-murmure-a-l-oreille-des-baleines-bleues/", "arte_v_128788-000-A")]
+        [InlineData("https://www.france.tv/documentaires/doc/8808888-le-titre.html", "ftv_v_8808888")]
+        [InlineData("https://www.france.tv/france-5/c-dans-l-air/7654321-emission.html", "ftv_v_7654321")]
+        [InlineData("https://www.france.tv/documentaires/doc/8808888-le-titre.html?autoplay=1", "ftv_v_8808888")]
+        [InlineData("https://www.france.tv/documentaires/doc/8808888-le-titre/", "ftv_v_8808888")]
         public void ForSource_KnownUrl_ReturnsCorrectId(string url, string expected)
             => Assert.Equal(expected, VodNativeId.ForSource(url));
+
+        // ── IsChannel ─────────────────────────────────────────────────────────
+
+        [Theory]
+        [InlineData("youtube_ch_arte",   true)]
+        [InlineData("youtube_ch_UCabc",  true)]
+        [InlineData("youtube_pl_PLabc",  false)]
+        [InlineData("arte_pl_RC-027708", false)]
+        [InlineData("arte_v_128788-000-A", false)]
+        [InlineData("ftv_v_8808888",     false)]
+        [InlineData(null,                false)]
+        [InlineData("",                  false)]
+        public void IsChannel_DistinguishesChannelsFromEverythingElse(string? key, bool expected)
+            => Assert.Equal(expected, VodNativeId.IsChannel(key));
 
         [Theory]
         [InlineData(null)]
         [InlineData("")]
-        [InlineData("https://www.france.tv/documentaires/doc/8808888-title.html")]  // no stable series ID
+        [InlineData("https://www.france.tv/direct")]
+        [InlineData("https://www.france.tv/sport/123-categorie/latest-news.html")]
         [InlineData("https://example.com/some/path")]
         public void ForSource_UnknownOrNull_ReturnsNull(string? url)
             => Assert.Null(VodNativeId.ForSource(url));

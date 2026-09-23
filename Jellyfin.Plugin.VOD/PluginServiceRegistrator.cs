@@ -1,5 +1,6 @@
 using System.IO;
 using Jellyfin.Plugin.VOD.Data;
+using Jellyfin.Plugin.VOD.Imaging;
 using Jellyfin.Plugin.VOD.Localization;
 using Jellyfin.Plugin.VOD.Services;
 using Jellyfin.Plugin.VOD.Services.Sync;
@@ -33,12 +34,17 @@ namespace Jellyfin.Plugin.VOD
             serviceCollection.AddSingleton<CookieJar>();
             serviceCollection.AddSingleton<YtDlpService>();
             serviceCollection.AddSingleton<PlaylistCache>();
+            serviceCollection.AddSingleton<MediaStreamWriter>();
 
             // Localisation
             serviceCollection.AddSingleton<IVodLocalizer, VodLocalizer>();
 
+            // Generated artwork, written next to the plugin's database
+            serviceCollection.AddSingleton(
+                _ => new ArtworkStore(Plugin.Instance!.DataFolderPath));
+
             // Sync services
-            serviceCollection.AddSingleton<LibraryWriter>();
+            serviceCollection.AddSingleton<LibraryPublisher>();
             serviceCollection.AddSingleton<SyncService>();
 
             // Scheduled tasks

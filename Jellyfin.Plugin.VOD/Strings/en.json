@@ -1,3 +1,6 @@
 {
-  "UpcomingBroadcast": "Scheduled broadcast: {0} UTC"
+  "UpcomingBroadcast": "Scheduled broadcast: {0} UTC",
+  "LiveNow": "Live now",
+  "SeasonLabel": "Season {0}",
+  "SourceLabel": "Source: {0}"
 }

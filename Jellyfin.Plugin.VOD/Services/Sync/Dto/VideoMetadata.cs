@@ -72,6 +72,23 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
         /// <summary>Gets the subtitle language codes from the yt-dlp subtitles dictionary (not auto-captions).</summary>
         public IReadOnlyList<string> SubtitleLanguages { get; init; } = [];
 
+        /// <summary>Gets the video's tags, capped at <see cref="MaxTags"/>.</summary>
+        public IReadOnlyList<string> Tags { get; init; } = [];
+
+        /// <summary>Gets the video's categories, published as Jellyfin genres.</summary>
+        public IReadOnlyList<string> Categories { get; init; } = [];
+
+        /// <summary>
+        /// How many tags an item keeps.
+        /// </summary>
+        /// <remarks>
+        /// yt-dlp preserves the order the author declared, and on every sample measured the general
+        /// tags come first and the tail degrades into search-engine filler — film titles merely
+        /// mentioned in the video, or player nicknames. Keeping the head is therefore keeping the
+        /// meaningful ones.
+        /// </remarks>
+        public const int MaxTags = 15;
+
         /// <summary>
         /// Parses the JSON output of <c>yt-dlp -J --no-playlist</c>.
         /// Returns <see langword="null"/> on parse failure.
@@ -157,7 +174,9 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
                     ReleaseTimestamp = root.TryGetProperty("release_timestamp", out var rt) && rt.ValueKind == JsonValueKind.Number
                         ? rt.GetInt64() : null,
                     AudioLanguages = [.. audioLangs],
-                    SubtitleLanguages = subLangs
+                    SubtitleLanguages = subLangs,
+                    Tags = JsonArrays.ReadStrings(root, "tags", MaxTags),
+                    Categories = JsonArrays.ReadStrings(root, "categories", MaxTags)
                 };
             }
             catch (JsonException)

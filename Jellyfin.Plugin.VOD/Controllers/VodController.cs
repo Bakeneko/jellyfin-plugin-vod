@@ -28,20 +28,29 @@ namespace Jellyfin.Plugin.VOD.Controllers
         private readonly IVodDatabase _db;
         private readonly YtDlpService _ytDlp;
         private readonly PlaylistCache _cache;
+        private readonly MediaStreamWriter _streamWriter;
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly ILogger<VodController> _logger;
 
         /// <summary>Initializes a new instance of the <see cref="VodController"/> class.</summary>
+        /// <param name="db">The VOD database used to look up videos by UUID.</param>
+        /// <param name="ytDlp">The yt-dlp service used to resolve stream URLs.</param>
+        /// <param name="cache">The playlist cache.</param>
+        /// <param name="streamWriter">Stores media streams so Jellyfin does not have to re-probe.</param>
+        /// <param name="httpClientFactory">The HTTP client factory.</param>
+        /// <param name="logger">The logger.</param>
         public VodController(
             IVodDatabase db,
             YtDlpService ytDlp,
             PlaylistCache cache,
+            MediaStreamWriter streamWriter,
             IHttpClientFactory httpClientFactory,
             ILogger<VodController> logger)
         {
             _db = db;
             _ytDlp = ytDlp;
             _cache = cache;
+            _streamWriter = streamWriter;
             _httpClientFactory = httpClientFactory;
             _logger = logger;
         }
@@ -106,6 +115,21 @@ namespace Jellyfin.Plugin.VOD.Controllers
             if (filtered is null)
             {
                 return Redirect(resolution.Url);
+            }
+
+            // Cache miss only: this bounds stream writes to roughly one per playlist TTL.
+            // Storing the tracks is a fidelity gain, not a prerequisite for playback, so a failure
+            // here must not cost the caller its playlist nor keep it out of the cache.
+            try
+            {
+                var streams = MediaStreamBuilder.Build(filtered);
+                _streamWriter.TryWrite(id, streams, cancellationToken);
+            }
+#pragma warning disable CA1031 // nothing about persisting track labels is worth failing playback for
+            catch (Exception ex)
+#pragma warning restore CA1031
+            {
+                LogStreamPersistFailed(ex, id);
             }
 
             _cache.Set(cacheKey, filtered);
@@ -249,5 +273,9 @@ namespace Jellyfin.Plugin.VOD.Controllers
         [LoggerMessage(EventId = 10, Level = LogLevel.Warning,
             Message = "{VideoUrl} resolved with {Format} to a bare media URL (no HLS manifest): expect video-only")]
         private partial void LogNoManifest(string videoUrl, string format);
+
+        [LoggerMessage(EventId = 11, Level = LogLevel.Warning,
+            Message = "Could not persist the media streams of {VideoId}; playback is unaffected")]
+        private partial void LogStreamPersistFailed(Exception exception, string videoId);
     }
 }
