@@ -181,6 +181,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             IReadOnlyList<VideoRecord> expected,
             IReadOnlySet<string> allKnownVideoIds,
             string localBaseUrl,
+            bool useReleaseDateAsDateAdded,
             CancellationToken cancellationToken)
         {
             ArgumentNullException.ThrowIfNull(anchor);
@@ -205,18 +206,21 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 if (mode == SourceMode.Movies)
                 {
                     outcome = await UpsertMovieAsync(
-                        anchor, video, streamUrl, published, cancellationToken).ConfigureAwait(false);
+                        anchor, video, streamUrl, published, useReleaseDateAsDateAdded,
+                        cancellationToken).ConfigureAwait(false);
                 }
                 else
                 {
                     series ??= await EnsureSeriesAsync(
                         anchor, source, seriesName, FirstAvailableThumbnail(expected),
-                        OldestPublishedAt(expected), studios, cancellationToken)
+                        OldestPublishedAt(expected), studios,
+                        SeriesDates(expected, useReleaseDateAsDateAdded), cancellationToken)
                         .ConfigureAwait(false);
                     currentSeason = await EnsureSeasonAsync(series, video.SeasonNumber, currentSeason, cancellationToken).ConfigureAwait(false);
 
                     outcome = await UpsertEpisodeAsync(
-                        series, currentSeason, video, streamUrl, published, cancellationToken)
+                        series, currentSeason, video, streamUrl, published,
+                        useReleaseDateAsDateAdded, cancellationToken)
                         .ConfigureAwait(false);
                 }
 
@@ -388,6 +392,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             VideoRecord video,
             string streamUrl,
             Dictionary<string, BaseItem> published,
+            bool useReleaseDateAsDateAdded,
             CancellationToken cancellationToken)
         {
             var isNew = !published.TryGetValue(video.Id, out var existing);
@@ -412,6 +417,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             var premiereDate = video.PublishedAt?.UtcDateTime;
             var productionYear = video.PublishedAt?.UtcDateTime.Year;
             var runTimeTicks = RunTimeTicks(video);
+            var dateAdded = DateAddedFor(video, useReleaseDateAsDateAdded);
 
             var changed = isNew
                 || !string.Equals(movie.Name, video.Title, StringComparison.Ordinal)
@@ -429,6 +435,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             movie.PremiereDate = premiereDate;
             movie.ProductionYear = productionYear;
             movie.RunTimeTicks = runTimeTicks;
+            changed |= ApplyDateAdded(movie, dateAdded);
             changed |= ApplyVideoIds(movie, video);
             changed |= ApplyTags(movie, video.Tags, video.Categories);
             changed |= ApplyStudios(movie, StudiosFor(video));
@@ -459,6 +466,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             VideoRecord video,
             string streamUrl,
             Dictionary<string, BaseItem> published,
+            bool useReleaseDateAsDateAdded,
             CancellationToken cancellationToken)
         {
             var isNew = !published.TryGetValue(video.Id, out var existing);
@@ -483,6 +491,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             var premiereDate = video.PublishedAt?.UtcDateTime;
             var productionYear = video.PublishedAt?.UtcDateTime.Year;
             var runTimeTicks = RunTimeTicks(video);
+            var dateAdded = DateAddedFor(video, useReleaseDateAsDateAdded);
             // Queries tie an episode to its series through this field, not through ParentId.
             var seriesKey = series.GetPresentationUniqueKey();
 
@@ -516,6 +525,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             episode.SeriesId = series.Id;
             episode.SeriesName = series.Name;
             episode.SeriesPresentationUniqueKey = seriesKey;
+            changed |= ApplyDateAdded(episode, dateAdded);
             changed |= ApplyVideoIds(episode, video);
             changed |= ApplyTags(episode, video.Tags, video.Categories);
             changed |= ApplyStudios(episode, StudiosFor(video));
@@ -561,6 +571,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             string? fallbackImageUrl,
             DateTimeOffset? oldestPublishedAt,
             string[] studios,
+            (DateTime? Added, DateTime LastContent) dates,
             CancellationToken cancellationToken)
         {
             var key = VodNativeId.ForSource(source.Url) ?? source.Url;
@@ -577,13 +588,16 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 || !string.Equals(series.Overview, overview, StringComparison.Ordinal)
                 || series.ParentId != anchor.Id
                 || series.PremiereDate != premiereDate
-                || series.ProductionYear != productionYear;
+                || series.ProductionYear != productionYear
+                || series.DateLastMediaAdded != dates.LastContent;
 
             series.Name = seriesName;
             series.Overview = overview;
             series.ParentId = anchor.Id;
             series.PremiereDate = premiereDate;
             series.ProductionYear = productionYear;
+            series.DateLastMediaAdded = dates.LastContent;
+            changed |= ApplyDateAdded(series, dates.Added);
             changed |= ApplySourceIds(series, key);
             changed |= ApplyTags(series, source.Tags, null);
             changed |= ApplyStudios(series, studios);
@@ -919,6 +933,99 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             var current = item.Studios.Where(s => !string.IsNullOrEmpty(s));
             var changed = !current.SequenceEqual(studios, StringComparer.Ordinal);
             item.Studios = studios;
+
+            return changed;
+        }
+
+        /// <summary>
+        /// The date added to publish for one video: its release date when the option is on, otherwise
+        /// the date the plugin first saw it.
+        /// </summary>
+        /// <remarks>
+        /// Derived at publish time rather than stored, which is what makes the option reversible: both
+        /// sources survive in the database, so flipping the setting either way just republishes with
+        /// the other value.
+        /// <para>
+        /// Reads only fields that are set once. <see cref="VideoRecord.SyncedAt"/> is deliberately NOT
+        /// consulted as a fallback, however tempting: it is rewritten on every pass, so a date derived
+        /// from it would move every pass and rewrite the item for ever. A row with neither a discovery
+        /// nor a release date therefore yields null, and the item keeps whatever date it already
+        /// carries — stable, and honest about having nothing to say.
+        /// </para>
+        /// </remarks>
+        internal static DateTime? DateAddedFor(VideoRecord video, bool useReleaseDate)
+        {
+            var released = video.PublishedAt?.UtcDateTime;
+            var discovered = video.FirstSeenAt?.UtcDateTime;
+            var chosen = useReleaseDate ? released ?? discovered : discovered;
+
+            // Null rather than MinValue, because MinValue is a poison value for this field: AddChild
+            // reads it as "unset" and replaces it with UtcNow, so the next pass would compare that
+            // timestamp against MinValue, differ, and rewrite the item on every pass for ever.
+            return chosen == DateTime.MinValue ? null : chosen;
+        }
+
+        /// <summary>
+        /// The dates to publish on a series: when it was added, and when it last gained content.
+        /// </summary>
+        /// <remarks>
+        /// Both are assigned in both states of the option, and that is deliberate. A field written in
+        /// only one direction is not reversible: turning the option on would write the release date and
+        /// turning it off would leave it there for ever. The added date therefore follows the option,
+        /// while the content date always reports the truth about acquisition, whatever the setting.
+        /// <para>
+        /// The two states do not aggregate the same way, and that asymmetry is the point. Off, the
+        /// added date is when the series first appeared, so the OLDEST discovery wins. On, the whole
+        /// purpose is to surface series with recent videos, so the NEWEST release wins.
+        /// </para>
+        /// <para>
+        /// Aggregated over the videos being published for the source — the same set
+        /// <c>OldestPublishedAt</c> uses — so a MaxVideosPerSource cap narrows it to what the library
+        /// actually holds. The content date is never null: Jellyfin stores null there and reads it back
+        /// as MinValue, which would rewrite the series on every pass.
+        /// </para>
+        /// </remarks>
+        private static (DateTime? Added, DateTime LastContent) SeriesDates(
+            IReadOnlyList<VideoRecord> videos, bool useReleaseDate)
+        {
+            DateTime? oldestSeen = null;
+            var newestSeen = DateTime.MinValue;
+            DateTime? newestReleased = null;
+
+            foreach (var video in videos)
+            {
+                var seen = DateAddedFor(video, useReleaseDate: false);
+                if (seen.HasValue)
+                {
+                    if (oldestSeen is null || seen.Value < oldestSeen.Value)
+                        oldestSeen = seen.Value;
+                    if (seen.Value > newestSeen)
+                        newestSeen = seen.Value;
+                }
+
+                var released = DateAddedFor(video, useReleaseDate: true);
+                if (released.HasValue && (newestReleased is null || released.Value > newestReleased.Value))
+                    newestReleased = released.Value;
+            }
+
+            return (useReleaseDate ? newestReleased : oldestSeen, newestSeen);
+        }
+
+        /// <summary>
+        /// Publishes the date added, leaving whatever the item already carries when there is none to
+        /// publish.
+        /// </summary>
+        /// <remarks>
+        /// Returns a flag rather than assigning blindly, for the reason given on
+        /// <see cref="ApplyTags"/>.
+        /// </remarks>
+        private static bool ApplyDateAdded(BaseItem item, DateTime? dateAdded)
+        {
+            if (dateAdded is null)
+                return false;
+
+            var changed = item.DateCreated != dateAdded.Value;
+            item.DateCreated = dateAdded.Value;
 
             return changed;
         }

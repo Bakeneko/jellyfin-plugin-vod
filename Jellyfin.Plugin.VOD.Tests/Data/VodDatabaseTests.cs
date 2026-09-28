@@ -372,7 +372,122 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
             using var cmd = conn.CreateCommand();
             cmd.CommandText = "PRAGMA user_version";
 
-            Assert.Equal(2L, (long)cmd.ExecuteScalar()!);
+            Assert.Equal(3L, (long)cmd.ExecuteScalar()!);
+        }
+
+        [Fact]
+        public void FirstSeenAt_RoundTripsThroughTheV3Column()
+        {
+            var seen = new DateTimeOffset(2026, 3, 4, 5, 6, 7, TimeSpan.Zero);
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/fs" });
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = "uuid-first-seen",
+                SourceUrl = "https://example.test/fs",
+                VideoUrl = "https://example.test/v",
+                FirstSeenAt = seen,
+                SyncedAt = DateTimeOffset.UtcNow
+            });
+
+            Assert.Equal(seen, _db.GetVideoByUuid("uuid-first-seen")!.FirstSeenAt);
+        }
+
+        /// <summary>
+        /// The upgrade path every existing installation takes: a database stamped v2 must gain the
+        /// column AND have it backfilled from synced_at, because nothing else knows when a row that
+        /// predates v3 was first seen.
+        /// </summary>
+        [Fact]
+        public void EnsureCreated_UpgradesAV2DatabaseAndBackfillsFirstSeenAt()
+        {
+            var path = Path.GetTempFileName();
+            try
+            {
+                using (var seed = new SqliteConnection($"Data Source={path}"))
+                {
+                    seed.Open();
+                    using var cmd = seed.CreateCommand();
+                    cmd.CommandText = """
+                        CREATE TABLE sources (url TEXT PRIMARY KEY, name TEXT);
+                        CREATE TABLE videos (
+                            id         TEXT PRIMARY KEY,
+                            source_url TEXT NOT NULL,
+                            video_url  TEXT NOT NULL,
+                            synced_at  TEXT NOT NULL,
+                            channels   TEXT
+                        );
+                        INSERT INTO videos (id, source_url, video_url, synced_at)
+                        VALUES ('legacy', 'https://example.test/s', 'https://example.test/v',
+                                '2026-01-02T03:04:05.0000000+00:00');
+                        PRAGMA user_version = 2;
+                        """;
+                    cmd.ExecuteNonQuery();
+                }
+
+                using var db = new VodDatabase(path, NullLogger<VodDatabase>.Instance);
+                db.EnsureCreated();
+
+                using var conn = new SqliteConnection($"Data Source={path}");
+                conn.Open();
+
+                using var version = conn.CreateCommand();
+                version.CommandText = "PRAGMA user_version";
+                Assert.Equal(3L, (long)version.ExecuteScalar()!);
+
+                using var backfilled = conn.CreateCommand();
+                backfilled.CommandText = "SELECT first_seen_at FROM videos WHERE id = 'legacy'";
+                Assert.Equal("2026-01-02T03:04:05.0000000+00:00", backfilled.ExecuteScalar());
+            }
+            finally
+            {
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+        }
+
+        /// <summary>
+        /// "Set once, never updated" is enforced in SQL by a COALESCE in the upsert, not by the caller.
+        /// If that guard were dropped, the discovery date would move whenever a later pass proposed a
+        /// different one, and the published date added would move with it on every sync.
+        /// </summary>
+        [Fact]
+        public void FirstSeenAt_IsNeverOverwrittenByALaterUpsert()
+        {
+            var first = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/once" });
+
+            var video = new VideoRecord
+            {
+                Id = "uuid-set-once",
+                SourceUrl = "https://example.test/once",
+                VideoUrl = "https://example.test/v",
+                FirstSeenAt = first,
+                SyncedAt = DateTimeOffset.UtcNow
+            };
+            _db.UpsertVideo(video);
+
+            // A later pass proposes a different discovery date. The stored one has to win.
+            video.FirstSeenAt = new DateTimeOffset(2026, 6, 6, 0, 0, 0, TimeSpan.Zero);
+            _db.UpsertVideo(video);
+
+            Assert.Equal(first, _db.GetVideoByUuid("uuid-set-once")!.FirstSeenAt);
+        }
+
+        [Fact]
+        public void FirstSeenAt_DefaultsToNullWhenNotSet()
+        {
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/nofs" });
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = "uuid-no-first-seen",
+                SourceUrl = "https://example.test/nofs",
+                VideoUrl = "https://example.test/v",
+                SyncedAt = DateTimeOffset.UtcNow
+            });
+
+            Assert.Null(_db.GetVideoByUuid("uuid-no-first-seen")!.FirstSeenAt);
         }
 
         /// <summary>
@@ -402,11 +517,16 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
 
         /// <summary>
         /// The upgrade path, as opposed to a fresh install: a database already stamped v1 has to gain
-        /// the v2 column when it is opened, and end up with the same columns as one that replayed both
-        /// steps. This is the path every existing installation takes, and no other test covers it.
+        /// the v2 column when it is opened, and end up with the same columns as one that replayed
+        /// every step. This is the path every existing installation takes.
         /// </summary>
+        /// <remarks>
+        /// Asserts the CURRENT schema version rather than 2, because opening a v1 database replays
+        /// every step after it, not just the next one. The `channels` assertion is what actually pins
+        /// the v1 → v2 step.
+        /// </remarks>
         [Fact]
-        public void EnsureCreated_UpgradesAV1DatabaseToV2()
+        public void EnsureCreated_UpgradesAV1DatabaseAndAddsTheV2Column()
         {
             var upgradedPath = Path.GetTempFileName();
             try
@@ -437,7 +557,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
 
                 using var version = conn.CreateCommand();
                 version.CommandText = "PRAGMA user_version";
-                Assert.Equal(2L, (long)version.ExecuteScalar()!);
+                Assert.Equal(3L, (long)version.ExecuteScalar()!);
 
                 using var columns = conn.CreateCommand();
                 columns.CommandText = "SELECT name FROM pragma_table_info('videos') WHERE name = 'channels'";

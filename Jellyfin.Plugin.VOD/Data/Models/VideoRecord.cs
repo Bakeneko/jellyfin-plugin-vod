@@ -70,6 +70,18 @@ namespace Jellyfin.Plugin.VOD.Data.Models
         public string? Channels { get; set; }
 
         /// <summary>
+        /// When the plugin first discovered this video. Set once, at the initial insert, and never
+        /// updated afterwards — that is what distinguishes it from <see cref="SyncedAt"/>, which
+        /// carries the latest sync.
+        /// </summary>
+        /// <remarks>
+        /// Holding the discovery date separately is what makes the "use the release date as the date
+        /// added" option reversible: neither date is ever the only copy of itself, so the published
+        /// DateCreated can be recomputed from either one, in both directions.
+        /// </remarks>
+        public DateTimeOffset? FirstSeenAt { get; set; }
+
+        /// <summary>
         /// The remote URL for the video thumbnail that was last published to Jellyfin. Compared against the
         /// current URL to decide whether the artwork must be re-pointed; Jellyfin caches the image
         /// locally and keeps no record of its origin.

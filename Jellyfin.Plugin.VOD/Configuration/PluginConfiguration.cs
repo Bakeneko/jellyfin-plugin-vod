@@ -36,6 +36,19 @@ namespace Jellyfin.Plugin.VOD.Configuration
         public string LibraryName { get; set; } = "VOD";
 
         /// <summary>
+        /// Gets or sets a value indicating whether the published date added is the video's release
+        /// date instead of the date the plugin first saw it.
+        /// </summary>
+        /// <remarks>
+        /// For a MIXED library (movies and series in one), where Jellyfin's default view makes
+        /// recently added episodes hard to find. Turning it on makes "date added" sort
+        /// chronologically by publication; the cost is that a channel added today but active for
+        /// years will never surface in "recently added", because its videos carry their old release
+        /// dates. Reversible either way: nothing is overwritten, the published date is recomputed.
+        /// </remarks>
+        public bool UseReleaseDateAsDateAdded { get; set; }
+
+        /// <summary>
         /// Gets or sets the base URL used to build stream URLs served to Jellyfin.
         /// Should be reachable by the Jellyfin server itself (loopback is fine).
         /// Example: <c>http://localhost:8096</c>.

@@ -43,7 +43,7 @@ namespace Jellyfin.Plugin.VOD.Data
         /// Schema version this build expects, tracked in SQLite's <c>user_version</c>.
         /// Bump it and add the matching case to <see cref="Migrate"/> whenever the schema changes.
         /// </summary>
-        private const int SchemaVersion = 2;
+        private const int SchemaVersion = 3;
 
         /// <inheritdoc />
         public void EnsureCreated()
@@ -132,6 +132,19 @@ namespace Jellyfin.Plugin.VOD.Data
                         ALTER TABLE videos ADD COLUMN channels TEXT;
 
                         PRAGMA user_version = 2;
+                        """;
+                    break;
+
+                case 3:
+                    // Backfilled from synced_at, which is the LATEST sync rather than the first: an
+                    // approximation, and the only one available for a row that predates this column.
+                    // Far better than null, which would leave the published date added undefined.
+                    cmd.CommandText = """
+                        ALTER TABLE videos ADD COLUMN first_seen_at TEXT;
+
+                        UPDATE videos SET first_seen_at = synced_at WHERE first_seen_at IS NULL;
+
+                        PRAGMA user_version = 3;
                         """;
                     break;
 
@@ -229,13 +242,13 @@ namespace Jellyfin.Plugin.VOD.Data
                          published_at, duration_seconds,
                          season_number, episode_number, synced_at,
                          audio_langs, subtitle_langs, thumbnail_url, tags, categories, channels,
-                         description, is_live)
+                         description, is_live, first_seen_at)
                     VALUES
                         ($id, $sourceUrl, $extractorKey, $nativeId, $videoUrl, $title,
                          $publishedAt, $durationSeconds,
                          $seasonNumber, $episodeNumber, $syncedAt,
                          $audioLangs, $subtitleLangs, $thumbnailUrl, $tags, $categories, $channels,
-                         $description, $isLive)
+                         $description, $isLive, $firstSeenAt)
                     ON CONFLICT(id) DO UPDATE SET
                         source_url       = excluded.source_url,
                         extractor_key    = excluded.extractor_key,
@@ -254,7 +267,10 @@ namespace Jellyfin.Plugin.VOD.Data
                         categories       = excluded.categories,
                         channels         = excluded.channels,
                         description      = excluded.description,
-                        is_live          = excluded.is_live;
+                        is_live          = excluded.is_live,
+                        -- Never overwritten: an existing discovery date always beats the one the new
+                        -- upsert proposes. This COALESCE is what enforces "set once, never updated".
+                        first_seen_at    = COALESCE(videos.first_seen_at, excluded.first_seen_at);
                     """;
                 BindVideo(cmd, video);
                 cmd.ExecuteNonQuery();
@@ -468,6 +484,7 @@ namespace Jellyfin.Plugin.VOD.Data
             cmd.Parameters.AddWithValue("$tags", (object?)v.Tags ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$categories", (object?)v.Categories ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$channels", (object?)v.Channels ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$firstSeenAt", (object?)v.FirstSeenAt?.ToString("O") ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$description", (object?)v.Description ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$isLive", v.IsLive ? 1 : 0);
         }
@@ -543,6 +560,7 @@ namespace Jellyfin.Plugin.VOD.Data
                 Tags = S("tags"),
                 Categories = S("categories"),
                 Channels = S("channels"),
+                FirstSeenAt = D("first_seen_at"),
                 PublishedImageUrl = S("published_image_url"),
                 Description = S("description"),
                 IsLive = r.GetInt32(r.GetOrdinal("is_live")) != 0

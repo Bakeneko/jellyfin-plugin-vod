@@ -135,7 +135,8 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                         anchor, record, SourceMode.Series, record.Name ?? record.Url,
                         [],
                         _db.GetAllVideoIds().ToHashSet(StringComparer.OrdinalIgnoreCase),
-                        config.LocalBaseUrl, cancellationToken)
+                        // Nothing is expected, so no date is derived and the flag cannot matter.
+                        config.LocalBaseUrl, useReleaseDateAsDateAdded: false, cancellationToken)
                     .ConfigureAwait(false);
 
                 LogRetiredSource(record.Url);
@@ -325,7 +326,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                     anchor, sourceRecord, source.Mode, seriesName,
                     _db.GetVideosBySource(source.Url),
                     _db.GetAllVideoIds().ToHashSet(StringComparer.OrdinalIgnoreCase),
-                    config.LocalBaseUrl, ct)
+                    config.LocalBaseUrl, config.UseReleaseDateAsDateAdded, ct)
                 .ConfigureAwait(false);
 
             // Step 9: update source record
@@ -421,13 +422,18 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 var effectiveTitle = ResolveTitle(meta, seriesName);
 
                 // Build or update VideoRecord
+                // FirstSeenAt is the one property never refreshed below: it must keep the date of the
+                // FIRST sync that saw this video, which is what makes the published date added
+                // recomputable in both directions. UpsertVideo's COALESCE enforces the same invariant
+                // on the database side.
                 var record = existing ?? new VideoRecord
                 {
                     Id = Guid.NewGuid().ToString(),
                     SourceUrl = source.Url,
                     NativeId = meta.Id,
                     ExtractorKey = meta.ExtractorKey,
-                    VideoUrl = entry.VideoUrl
+                    VideoUrl = entry.VideoUrl,
+                    FirstSeenAt = syncStart
                 };
 
                 record.Title = effectiveTitle;

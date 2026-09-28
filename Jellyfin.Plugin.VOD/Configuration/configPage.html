@@ -74,6 +74,21 @@
                         </div>
                     </div>
 
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label class="emby-checkbox-label">
+                            <input id="useReleaseDateAsDateAdded" name="UseReleaseDateAsDateAdded"
+                                   type="checkbox" is="emby-checkbox" />
+                            <span>Use the release date as the date added</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription">
+                            For a mixed library, so sorting by date added follows publication order.
+                            Note the trade-off: a channel you add today but which has been running for
+                            years will never appear in "Recently added", because its videos keep their
+                            old release dates. You can turn this back off at any time — nothing is
+                            overwritten.
+                        </div>
+                    </div>
+
                     <div class="inputContainer">
                         <label class="inputLabel inputLabelUnfocused" for="localBaseUrl">Local base URL</label>
                         <input id="localBaseUrl" name="LocalBaseUrl" type="text"
@@ -456,6 +471,8 @@
                                 (config.PreferredAudioLanguages || []).join(', ');
                             document.querySelector('#preferredSubtitleLanguages').value =
                                 (config.PreferredSubtitleLanguages || []).join(', ');
+                            document.querySelector('#useReleaseDateAsDateAdded').checked =
+                                config.UseReleaseDateAsDateAdded || false;
                             document.getElementById('sourcesBody').innerHTML = '';
                             (config.Sources || []).forEach(addSourceRow);
                             return populateLibraries(config.LibraryName)
@@ -488,6 +505,8 @@
                                 .split(',').map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; });
                             config.PreferredSubtitleLanguages = document.querySelector('#preferredSubtitleLanguages').value
                                 .split(',').map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; });
+                            config.UseReleaseDateAsDateAdded =
+                                document.querySelector('#useReleaseDateAsDateAdded').checked;
                             var sources = collectSources();
                             var duplicate = findDuplicateUrl(sources);
                             if (duplicate) {

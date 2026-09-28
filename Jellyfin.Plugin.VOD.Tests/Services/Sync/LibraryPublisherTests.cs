@@ -1,6 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.VOD.Configuration;
@@ -13,6 +17,7 @@ using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.Movies;
 using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Controller.Library;
+using MediaBrowser.Model.Configuration;
 using MediaBrowser.Model.Entities;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
@@ -32,6 +37,15 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             // BaseItem routes AddChild and UpdateToRepositoryAsync through this static, so the
             // substitute has to be installed before either path is exercised.
             BaseItem.LibraryManager = _library;
+            // Publishing a Series reaches CreatePresentationUniqueKey, which walks back into the
+            // library manager twice. An unconfigured substitute returns null from both, where the real
+            // one never does, so the Series path would throw before reaching anything under test.
+            // PreferredMetadataLanguage is set so GetPreferredMetadataLanguage resolves here rather
+            // than walking on to BaseItem.ConfigurationManager, a second static this harness does not
+            // install. A real library carries one, so this is a production path, not a shortcut.
+            _library.GetLibraryOptions(Arg.Any<BaseItem>())
+                .Returns(new LibraryOptions { PreferredMetadataLanguage = "en" });
+            _library.GetCollectionFolders(Arg.Any<BaseItem>()).Returns([]);
             _publisher = new LibraryPublisher(
                 _library, _db, new ArtworkStore(Path.Combine(Path.GetTempPath(), "vod-tests-artwork")),
                 _localizer, NullLogger<LibraryPublisher>.Instance);
@@ -128,7 +142,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 anchor, source, SourceMode.Movies, "Test",
                 Array.Empty<VideoRecord>(),
                 new HashSet<string> { vodId },
-                "http://localhost:8096",
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
                 CancellationToken.None);
 
             _library.DidNotReceive().DeleteItem(
@@ -154,7 +168,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 anchor, source, SourceMode.Movies, "Test",
                 Array.Empty<VideoRecord>(),
                 new HashSet<string>(),
-                "http://localhost:8096",
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
                 CancellationToken.None);
 
             _library.Received(1).DeleteItem(orphan, Arg.Any<DeleteOptions>(), true);
@@ -178,7 +192,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 anchor, source, SourceMode.Series, "Arte",
                 Array.Empty<VideoRecord>(),
                 new HashSet<string>(),
-                "http://localhost:8096",
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
                 CancellationToken.None);
 
             _library.DidNotReceive().DeleteItem(
@@ -201,7 +215,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 anchor, source, SourceMode.Series, "Arte",
                 Array.Empty<VideoRecord>(),
                 new HashSet<string>(),
-                "http://localhost:8096",
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
                 CancellationToken.None);
 
             _library.Received(1).DeleteItem(series, Arg.Any<DeleteOptions>(), true);
@@ -234,7 +248,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 anchor, source, SourceMode.Movies, "Test",
                 new[] { video },
                 new HashSet<string> { vodId },
-                "http://localhost:8096",
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
                 CancellationToken.None);
 
             _library.Received(1).DeleteItem(stale, Arg.Any<DeleteOptions>(), true);
@@ -271,7 +285,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 anchor, source, SourceMode.Movies, "Test",
                 new[] { video },
                 new HashSet<string> { vodId },
-                "http://localhost:8096",
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
                 CancellationToken.None);
 
             Assert.Equal(1, first.Created);
@@ -286,7 +300,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 anchor, source, SourceMode.Movies, "Test",
                 new[] { video },
                 new HashSet<string> { vodId },
-                "http://localhost:8096",
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
                 CancellationToken.None);
 
             Assert.Equal(0, second.Created);
@@ -322,7 +336,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 anchor, source, SourceMode.Movies, "Test",
                 new[] { video },
                 new HashSet<string> { vodId },
-                "http://localhost:8096",
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
                 CancellationToken.None);
 
             Assert.NotNull(created);
@@ -335,7 +349,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 anchor, source, SourceMode.Movies, "Test",
                 new[] { video },
                 new HashSet<string> { vodId },
-                "http://localhost:8096",
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
                 CancellationToken.None);
 
             Assert.Equal(1, second.Updated);
@@ -413,11 +427,387 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 SourceMode.Movies, "Test",
                 new[] { VideoWith(vodId, "Youtube", """["Terrapodia"]""") },
                 new HashSet<string> { vodId },
-                "http://localhost:8096",
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
                 CancellationToken.None);
 
             Assert.Equal(0, second.Updated);
             Assert.Equal(1, second.Unchanged);
+        }
+
+        [Theory]
+        // Option off: the discovery date wins.
+        [InlineData(false, "2026-05-01T00:00:00Z", "2026-01-01T00:00:00Z", "2026-05-01T00:00:00Z")]
+        // Option on: the release date wins.
+        [InlineData(true, "2026-05-01T00:00:00Z", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")]
+        public void DateAddedFor_PicksTheConfiguredSource(
+            bool useReleaseDate, string firstSeen, string published, string expected)
+        {
+            var video = new VideoRecord
+            {
+                Id = "v", SourceUrl = "s", VideoUrl = "u",
+                FirstSeenAt = DateTimeOffset.Parse(firstSeen, null, DateTimeStyles.RoundtripKind),
+                PublishedAt = DateTimeOffset.Parse(published, null, DateTimeStyles.RoundtripKind),
+                SyncedAt = DateTimeOffset.UtcNow
+            };
+
+            Assert.Equal(
+                DateTime.Parse(expected, null, DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal),
+                LibraryPublisher.DateAddedFor(video, useReleaseDate));
+        }
+
+        /// <summary>
+        /// With the option on, a platform reporting no release date falls back to the discovery date.
+        /// </summary>
+        [Fact]
+        public void DateAddedFor_FallsBackToDiscovery_WhenThereIsNoReleaseDate()
+        {
+            var seen = new DateTimeOffset(2026, 6, 6, 0, 0, 0, TimeSpan.Zero);
+            var noPublished = new VideoRecord
+            {
+                Id = "v", SourceUrl = "s", VideoUrl = "u", FirstSeenAt = seen,
+                SyncedAt = new DateTimeOffset(2026, 7, 7, 0, 0, 0, TimeSpan.Zero)
+            };
+
+            Assert.Equal(seen.UtcDateTime, LibraryPublisher.DateAddedFor(noPublished, true));
+        }
+
+        /// <summary>
+        /// SyncedAt is rewritten on every pass — SyncService assigns syncStart to it and TouchVideos
+        /// updates the column for rows it did not re-fetch — so deriving the published date from it
+        /// would move that date every pass and rewrite the item for ever. Only FirstSeenAt and
+        /// PublishedAt are set once, so only they may be read. A row with neither yields null, and
+        /// the item then keeps whatever date it already carries.
+        /// </summary>
+        [Fact]
+        public void DateAddedFor_IgnoresSyncedAt_SoTheValueCannotMoveBetweenPasses()
+        {
+            var video = new VideoRecord
+            {
+                Id = "v", SourceUrl = "s", VideoUrl = "u",
+                SyncedAt = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
+            };
+
+            Assert.Null(LibraryPublisher.DateAddedFor(video, useReleaseDate: false));
+            Assert.Null(LibraryPublisher.DateAddedFor(video, useReleaseDate: true));
+
+            // A later pass moved SyncedAt. The derived date must not have moved with it.
+            video.SyncedAt = new DateTimeOffset(2026, 12, 31, 0, 0, 0, TimeSpan.Zero);
+
+            Assert.Null(LibraryPublisher.DateAddedFor(video, useReleaseDate: false));
+            Assert.Null(LibraryPublisher.DateAddedFor(video, useReleaseDate: true));
+        }
+
+        /// <summary>
+        /// The reversibility the whole design rests on, exercised through real publishing rather than
+        /// through the pure helper: on, off, and back again, with the original values restored and the
+        /// following pass finding nothing left to change.
+        /// </summary>
+        [Fact]
+        public async Task ReconcileAsync_RestoresTheDateAdded_WhenTheOptionIsTurnedBackOff()
+        {
+            var seen = new DateTimeOffset(2026, 9, 1, 0, 0, 0, TimeSpan.Zero);
+            var released = new DateTimeOffset(2019, 3, 3, 0, 0, 0, TimeSpan.Zero);
+
+            var video = VideoWith("3f9a2b1c-0000-0000-0000-000000000080", "Youtube", null);
+            video.FirstSeenAt = seen;
+            video.PublishedAt = released;
+
+            var created = await PublishAsync(video);
+            Assert.Equal(seen.UtcDateTime, created.DateCreated);
+
+            // Jellyfin now holds what the first pass published.
+            _library.GetItemList(Arg.Any<InternalItemsQuery>())
+                .Returns(new List<BaseItem> { created });
+
+            await Republish(video, useReleaseDate: true);
+            Assert.Equal(released.UtcDateTime, created.DateCreated);
+
+            await Republish(video, useReleaseDate: false);
+            Assert.Equal(seen.UtcDateTime, created.DateCreated);
+
+            var stable = await Republish(video, useReleaseDate: false);
+            Assert.Equal(0, stable.Updated);
+            Assert.Equal(1, stable.Unchanged);
+        }
+
+        /// <summary>
+        /// The Series path on a second pass. It carries DateLastMediaAdded, whose column Jellyfin
+        /// stores as null and reads back as MinValue, so it is the field most exposed to the
+        /// permanent-rewrite failure this project has hit repeatedly.
+        /// </summary>
+        [Fact]
+        public async Task ReconcileAsync_LeavesTheSeriesAlone_OnTheSecondPass()
+        {
+            // The real GetNewItemId returns a distinct deterministic id per key. An unconfigured
+            // substitute returns Guid.Empty for every call, which collapses the series, its season and
+            // its episode onto one id and makes re-reading what was published meaningless.
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+
+            var video = VideoWith("3f9a2b1c-0000-0000-0000-000000000081", "Youtube", null);
+            video.FirstSeenAt = new DateTimeOffset(2026, 9, 1, 0, 0, 0, TimeSpan.Zero);
+            video.SeasonNumber = 2026;
+            video.EpisodeNumber = 1;
+
+            var captured = new List<BaseItem>();
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => captured.Add(call.ArgAt<BaseItem>(0)));
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            await ReconcileSeriesAsync(video, useReleaseDate: false);
+
+            var series = Assert.Single(captured.OfType<Series>());
+            var episode = Assert.Single(captured.OfType<Episode>());
+            Assert.NotEqual(default, series.DateLastMediaAdded);
+
+            foreach (var item in captured)
+                _library.GetItemById(item.Id).Returns(item);
+            _library.ClearReceivedCalls();
+            _library.GetItemList(Arg.Any<InternalItemsQuery>())
+                .Returns(new List<BaseItem> { episode });
+
+            var second = await ReconcileSeriesAsync(video, useReleaseDate: false);
+
+            Assert.Equal(0, second.Updated);
+            Assert.Equal(1, second.Unchanged);
+            await _library.DidNotReceive().UpdateItemAsync(
+                series, Arg.Any<BaseItem>(), Arg.Any<ItemUpdateType>(), Arg.Any<CancellationToken>());
+        }
+
+        private static Guid DeterministicId(string key)
+            => new(SHA256.HashData(Encoding.UTF8.GetBytes(key)).AsSpan(0, 16));
+
+        private Task<ReconcileReport> Republish(VideoRecord video, bool useReleaseDate)
+            => _publisher.ReconcileAsync(
+                _studioAnchor, new SourceRecord { Url = "https://example.com/source" },
+                SourceMode.Movies, "Test", new[] { video },
+                new HashSet<string> { video.Id }, "http://localhost:8096",
+                useReleaseDate, CancellationToken.None);
+
+        private Task<ReconcileReport> ReconcileSeriesAsync(VideoRecord video, bool useReleaseDate)
+            => _publisher.ReconcileAsync(
+                _studioAnchor, new SourceRecord { Url = "https://example.com/source" },
+                SourceMode.Series, "Test", new[] { video },
+                new HashSet<string> { video.Id }, "http://localhost:8096",
+                useReleaseDate, CancellationToken.None);
+
+        /// <summary>
+        /// A DateTimeOffset carrying a non-zero offset must resolve to the same instant whichever
+        /// derivation reads it, or the comparison flip-flops and the item is rewritten for ever.
+        /// </summary>
+        [Fact]
+        public void DateAddedFor_NormalisesToUtc()
+        {
+            var video = new VideoRecord
+            {
+                Id = "v", SourceUrl = "s", VideoUrl = "u",
+                FirstSeenAt = new DateTimeOffset(2026, 5, 1, 2, 0, 0, TimeSpan.FromHours(2)),
+                SyncedAt = DateTimeOffset.UtcNow
+            };
+
+            var result = LibraryPublisher.DateAddedFor(video, false);
+
+            Assert.NotNull(result);
+            Assert.Equal(DateTimeKind.Utc, result.Value.Kind);
+            Assert.Equal(new DateTime(2026, 5, 1, 0, 0, 0, DateTimeKind.Utc), result.Value);
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_PublishesTheDiscoveryDateAsDateAdded()
+        {
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000061";
+            var seen = new DateTimeOffset(2026, 4, 4, 0, 0, 0, TimeSpan.Zero);
+
+            var video = VideoWith(vodId, "Youtube", null);
+            video.FirstSeenAt = seen;
+            video.PublishedAt = new DateTimeOffset(2019, 1, 1, 0, 0, 0, TimeSpan.Zero);
+
+            var created = await PublishAsync(video);
+
+            Assert.Equal(seen.UtcDateTime, created.DateCreated);
+        }
+
+        /// <summary>
+        /// The option's path, reachable only because the flag is a parameter: reading it from
+        /// Plugin.Instance would make this state untestable, since that static is null under xUnit.
+        /// </summary>
+        [Fact]
+        public async Task ReconcileAsync_PublishesTheReleaseDateAsDateAdded_WhenTheOptionIsOn()
+        {
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000063";
+            var released = new DateTimeOffset(2019, 1, 1, 0, 0, 0, TimeSpan.Zero);
+
+            var video = VideoWith(vodId, "Youtube", null);
+            video.FirstSeenAt = new DateTimeOffset(2026, 4, 4, 0, 0, 0, TimeSpan.Zero);
+            video.PublishedAt = released;
+
+            var created = await PublishAsync(video, useReleaseDate: true);
+
+            Assert.Equal(released.UtcDateTime, created.DateCreated);
+        }
+
+        /// <summary>
+        /// The regression guard: the second pass must find nothing changed. Feeding the same in-memory
+        /// item back would not prove it, so the item is re-read the way Jellyfin returns it.
+        /// </summary>
+        [Fact]
+        public async Task ReconcileAsync_LeavesTheDateAddedAlone_OnTheSecondPass()
+        {
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000062";
+            var video = VideoWith(vodId, "Youtube", null);
+            video.FirstSeenAt = new DateTimeOffset(2026, 4, 4, 0, 0, 0, TimeSpan.Zero);
+
+            var created = await PublishAsync(video);
+
+            _library.ClearReceivedCalls();
+            _library.GetItemList(Arg.Any<InternalItemsQuery>())
+                .Returns(new List<BaseItem> { created });
+
+            var second = await _publisher.ReconcileAsync(
+                _studioAnchor, new SourceRecord { Url = "https://example.com/source" },
+                SourceMode.Movies, "Test", new[] { video },
+                new HashSet<string> { vodId }, "http://localhost:8096",
+                useReleaseDateAsDateAdded: false, CancellationToken.None);
+
+            Assert.Equal(0, second.Updated);
+            Assert.Equal(1, second.Unchanged);
+        }
+
+        private async Task<BaseItem> PublishAsync(VideoRecord video, bool useReleaseDate = false)
+        {
+            BaseItem? created = null;
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created = call.ArgAt<BaseItem>(0));
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            var report = await _publisher.ReconcileAsync(
+                _studioAnchor, new SourceRecord { Url = "https://example.com/source" },
+                SourceMode.Movies, "Test", new[] { video },
+                new HashSet<string> { video.Id }, "http://localhost:8096",
+                useReleaseDate, CancellationToken.None);
+
+            Assert.Equal(1, report.Created);
+            Assert.NotNull(created);
+            return created;
+        }
+
+        /// <summary>
+        /// A series is "added" when its first video appeared and "last gained content" when its most
+        /// recent one did. DateLastMediaAdded deliberately ignores the option: its meaning is the
+        /// truth about acquisition, whereas DateCreated is the sort key the user steers.
+        /// </summary>
+        [Fact]
+        public async Task ReconcileAsync_RollsUpSeriesDatesFromItsEpisodes()
+        {
+            var oldest = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+            var newest = new DateTimeOffset(2026, 6, 1, 0, 0, 0, TimeSpan.Zero);
+
+            var first = VideoWith("3f9a2b1c-0000-0000-0000-000000000070", "Youtube", null);
+            first.FirstSeenAt = oldest;
+            first.SeasonNumber = 2026;
+            first.EpisodeNumber = 1;
+
+            var second = VideoWith("3f9a2b1c-0000-0000-0000-000000000071", "Youtube", null);
+            second.FirstSeenAt = newest;
+            second.SeasonNumber = 2026;
+            second.EpisodeNumber = 2;
+
+            var series = await PublishSeriesAsync(first, second);
+
+            Assert.Equal(oldest.UtcDateTime, series.DateCreated);
+            Assert.Equal(newest.UtcDateTime, series.DateLastMediaAdded);
+        }
+
+        /// <summary>
+        /// Option on, the series' added date becomes the NEWEST release rather than the oldest
+        /// discovery — that asymmetry is the whole point of the setting, which exists to surface
+        /// series carrying recent videos.
+        /// </summary>
+        [Fact]
+        public async Task ReconcileAsync_UsesTheNewestReleaseAsTheSeriesDateAdded_WhenTheOptionIsOn()
+        {
+            var older = new DateTimeOffset(2019, 1, 1, 0, 0, 0, TimeSpan.Zero);
+            var newer = new DateTimeOffset(2026, 2, 2, 0, 0, 0, TimeSpan.Zero);
+
+            var first = VideoWith("3f9a2b1c-0000-0000-0000-000000000074", "Youtube", null);
+            first.PublishedAt = older;
+            first.FirstSeenAt = new DateTimeOffset(2026, 9, 1, 0, 0, 0, TimeSpan.Zero);
+            first.SeasonNumber = 2019;
+            first.EpisodeNumber = 1;
+
+            var second = VideoWith("3f9a2b1c-0000-0000-0000-000000000075", "Youtube", null);
+            second.PublishedAt = newer;
+            second.FirstSeenAt = new DateTimeOffset(2026, 9, 2, 0, 0, 0, TimeSpan.Zero);
+            second.SeasonNumber = 2026;
+            second.EpisodeNumber = 1;
+
+            var series = await PublishSeriesAsync(useReleaseDate: true, first, second);
+
+            Assert.Equal(newer.UtcDateTime, series.DateCreated);
+            // Unchanged by the option: acquisition truth, the newest discovery.
+            Assert.Equal(
+                new DateTime(2026, 9, 2, 0, 0, 0, DateTimeKind.Utc), series.DateLastMediaAdded);
+        }
+
+        /// <summary>
+        /// Never null: Jellyfin stores a null here and reads it back as MinValue, so assigning null
+        /// would report a change on every pass and rewrite the series for ever.
+        /// </summary>
+        [Fact]
+        public async Task ReconcileAsync_UsesMinValueRatherThanNull_ForAnEmptyRollup()
+        {
+            // No discovery date on the only video, so the rollup has nothing to aggregate. The point
+            // is that it lands on MinValue and not on null: Jellyfin stores a null here and reads it
+            // back as MinValue, so publishing null would report a change on every pass for ever.
+            var video = VideoWith("3f9a2b1c-0000-0000-0000-000000000072", "Youtube", null);
+            video.FirstSeenAt = null;
+            video.SeasonNumber = 2026;
+            video.EpisodeNumber = 1;
+
+            var series = await PublishSeriesAsync(video);
+
+            Assert.NotNull(series.DateLastMediaAdded);
+            Assert.Equal(DateTime.MinValue, series.DateLastMediaAdded!.Value);
+            // And the added date is left alone rather than forced to a poison value.
+            Assert.Null(LibraryPublisher.DateAddedFor(video, useReleaseDate: false));
+        }
+
+        private async Task<Series> PublishSeriesAsync(params VideoRecord[] videos)
+            => await PublishSeriesAsync(useReleaseDate: false, videos);
+
+        private async Task<Series> PublishSeriesAsync(bool useReleaseDate, params VideoRecord[] videos)
+        {
+            var captured = new List<BaseItem>();
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => captured.Add(call.ArgAt<BaseItem>(0)));
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            await _publisher.ReconcileAsync(
+                _studioAnchor, new SourceRecord { Url = "https://example.com/source" },
+                SourceMode.Series, "Test", videos,
+                videos.Select(v => v.Id).ToHashSet(), "http://localhost:8096",
+                useReleaseDate, CancellationToken.None);
+
+            return Assert.Single(captured.OfType<Series>());
+        }
+
+        /// <summary>
+        /// Turning the option on and back off must restore the original dates. This is the guard on the
+        /// trap rejected in the spec: a field written in only one direction is not reversible.
+        /// </summary>
+        [Fact]
+        public void DateAddedFor_RestoresTheOriginalDate_WhenTheOptionIsTurnedBackOff()
+        {
+            var seen = new DateTimeOffset(2026, 4, 4, 0, 0, 0, TimeSpan.Zero);
+            var released = new DateTimeOffset(2019, 1, 1, 0, 0, 0, TimeSpan.Zero);
+
+            var video = VideoWith("3f9a2b1c-0000-0000-0000-000000000073", "Youtube", null);
+            video.FirstSeenAt = seen;
+            video.PublishedAt = released;
+
+            Assert.Equal(seen.UtcDateTime, LibraryPublisher.DateAddedFor(video, useReleaseDate: false));
+            Assert.Equal(released.UtcDateTime, LibraryPublisher.DateAddedFor(video, useReleaseDate: true));
+            Assert.Equal(seen.UtcDateTime, LibraryPublisher.DateAddedFor(video, useReleaseDate: false));
         }
 
         private static VideoRecord VideoWith(string vodId, string? extractorKey, string? channelsJson)
@@ -429,7 +819,11 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 Title = "Studio subject",
                 DurationSeconds = 120,
                 ExtractorKey = extractorKey,
-                Channels = channelsJson
+                Channels = channelsJson,
+                // Always set in production (SyncService assigns syncStart), and it must be here too:
+                // a default DateTimeOffset derives a MinValue date added, which AddChild then treats
+                // as unset and replaces — the item would differ on every pass for ever.
+                SyncedAt = new DateTimeOffset(2026, 9, 28, 0, 0, 0, TimeSpan.Zero)
             };
 
         /// <summary>
@@ -463,7 +857,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 SourceMode.Movies, "Test",
                 new[] { VideoWith(vodId, "ArteTV", null) },
                 new HashSet<string> { vodId },
-                "http://localhost:8096",
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
                 CancellationToken.None);
 
             Assert.Equal(0, second.Updated);
@@ -494,7 +888,8 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             var first = await _publisher.ReconcileAsync(
                 _studioAnchor, new SourceRecord { Url = "https://example.com/source" },
                 SourceMode.Movies, "Test", new[] { video },
-                new HashSet<string> { vodId }, "http://localhost:8096", CancellationToken.None);
+                new HashSet<string> { vodId }, "http://localhost:8096",
+                useReleaseDateAsDateAdded: false, CancellationToken.None);
 
             Assert.Equal(1, first.Created);
             Assert.NotNull(created);
@@ -507,7 +902,8 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             var second = await _publisher.ReconcileAsync(
                 _studioAnchor, new SourceRecord { Url = "https://example.com/source" },
                 SourceMode.Movies, "Test", new[] { video },
-                new HashSet<string> { vodId }, "http://localhost:8096", CancellationToken.None);
+                new HashSet<string> { vodId }, "http://localhost:8096",
+                useReleaseDateAsDateAdded: false, CancellationToken.None);
 
             Assert.Equal(0, second.Updated);
             Assert.Equal(1, second.Unchanged);
@@ -585,7 +981,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 SourceMode.Movies, "Test",
                 new[] { VideoWith(vodId, extractorKey, channelsJson) },
                 new HashSet<string> { vodId },
-                "http://localhost:8096",
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
                 CancellationToken.None);
 
             Assert.Equal(1, report.Created);
