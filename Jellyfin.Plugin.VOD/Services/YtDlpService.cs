@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Plugin.VOD.Services.Sync;
 using Jellyfin.Plugin.VOD.Services.Sync.Dto;
 using Microsoft.Extensions.Logging;
 
@@ -165,6 +166,43 @@ namespace Jellyfin.Plugin.VOD.Services
             if (meta is null)
                 LogParseFailed(url, "video metadata");
             return meta;
+        }
+
+        /// <summary>
+        /// Probes a candidate source URL and reports what the configuration page needs to show.
+        /// </summary>
+        /// <remarks>
+        /// Enumerates a single entry: enough to prove yt-dlp can read the source and to pick up its
+        /// title, description and artwork, without paying for a full channel listing every time an
+        /// administrator pastes a URL.
+        ///
+        /// Note for the caller: this inherits GetPlaylistEntriesAsync's ten-minute PlaylistTimeout.
+        /// A cold channel behind a JS runtime can genuinely take minutes, so a UI must not block on
+        /// it behind a modal with no way out.
+        /// </remarks>
+        /// <param name="url">The channel, playlist or video URL to inspect.</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        /// <returns>
+        /// The source description, or <see langword="null"/> when yt-dlp could not read the URL.
+        /// </returns>
+        public async Task<SourceInfo?> GetSourceInfoAsync(
+            string url,
+            CancellationToken cancellationToken)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(url);
+
+            var playlist = await GetPlaylistEntriesAsync(url, 1, null, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (playlist is null)
+                return null;
+
+            return new SourceInfo(
+                SeriesNaming.Resolve(url, playlist),
+                playlist.Description,
+                playlist.ThumbnailUrl,
+                SourceTypeDetector.Detect(url).ToString(),
+                playlist.Entries.Count > 0);
         }
 
         private static ProcessStartInfo BuildBaseStartInfo() => new()

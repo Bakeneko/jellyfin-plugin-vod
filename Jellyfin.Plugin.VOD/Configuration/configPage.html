@@ -7,7 +7,7 @@
 <body>
     <div id="configurationPage" data-role="page"
          class="page type-interior pluginConfigurationPage"
-         data-require="emby-input,emby-button">
+         data-require="emby-input,emby-button,emby-select">
         <div data-role="content">
             <div class="content-primary">
                 <h1>VOD</h1>
@@ -62,12 +62,15 @@
 
                     <div class="inputContainer">
                         <label class="inputLabel inputLabelUnfocused" for="libraryName">Library name</label>
-                        <input id="libraryName" name="LibraryName" type="text"
-                               is="emby-input" class="emby-input"
-                               placeholder="VOD" />
+                        <select id="libraryName" name="LibraryName"
+                                is="emby-select" class="emby-select">
+                        </select>
                         <div class="fieldDescription">
-                            Name of the Jellyfin library to publish VOD items into.
-                            The library must exist and have been scanned at least once.
+                            Name of the Jellyfin library to publish VOD items into. The library must
+                            exist, but it does not need to have been scanned. A small
+                            <code>.keep</code> file is written into its folder, because Jellyfin
+                            skips a library folder that holds no files at all. Prefer a library of
+                            its own over one that already holds your media.
                         </div>
                     </div>
 
@@ -129,6 +132,41 @@
                         </div>
                     </div>
 
+                    <div id="libraryAlert"
+                         style="display:none;margin:1em 0;padding:8px 12px;border-radius:4px;
+                                background:#7a1f1f;color:#fff"></div>
+
+                    <h2>Sources</h2>
+                    <p class="fieldDescription">
+                        One row per channel, playlist or single-video URL. Removing a row retires
+                        the source: its videos and its series are deleted from the library on the
+                        next sync. To stop syncing a source without deleting anything, clear its
+                        checkbox instead.
+                    </p>
+
+                    <table id="sourcesTable" style="width:100%;border-collapse:collapse;margin-bottom:1em">
+                        <thead>
+                            <tr>
+                                <th style="text-align:left;padding:4px 8px">URL</th>
+                                <th style="text-align:left;padding:4px 8px">Name</th>
+                                <th style="text-align:left;padding:4px 8px">Mode</th>
+                                <th style="text-align:center;padding:4px 8px">Enabled</th>
+                                <th style="text-align:left;padding:4px 8px">Retention (days)</th>
+                                <th style="text-align:left;padding:4px 8px">Max videos</th>
+                                <th style="text-align:left;padding:4px 8px">Interval (min)</th>
+                                <th style="text-align:left;padding:4px 8px">Description</th>
+                                <th style="text-align:left;padding:4px 8px">Status</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody id="sourcesBody"></tbody>
+                    </table>
+
+                    <button type="button" is="emby-button" class="raised emby-button"
+                            id="addSourceButton">
+                        + Add source
+                    </button>
+
                     <div>
                         <button is="emby-button" type="submit"
                                 class="raised button-submit block emby-button">
@@ -143,6 +181,265 @@
         <script type="text/javascript">
             var PluginConfig = { pluginUniqueId: '16bb0693-4248-478b-a1e5-a4508326245c' };
 
+            function escAttr(value) {
+                // The title and description come from yt-dlp, i.e. from a remote platform, and are
+                // written straight into markup below. Without this, a channel named
+                // '"><img src=x onerror=alert(1)>' runs script in the dashboard.
+                return String(value == null ? '' : value)
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
+                    .replace(/"/g, '&quot;')
+                    .replace(/'/g, '&#39;');
+            }
+
+            function addSourceRow(source) {
+                var s = source || {};
+                var tr = document.createElement('tr');
+                tr.innerHTML = [
+                    '<td style="padding:4px 8px">',
+                    '  <input class="src-url emby-input" type="text" style="width:600px"',
+                    '         placeholder="https://www.youtube.com/@channel"',
+                    '         value="' + escAttr(s.Url) + '" /></td>',
+                    '<td style="padding:4px 8px">',
+                    '  <input class="src-name emby-input" type="text" style="width:260px"',
+                    '         placeholder="(from platform)" value="' + escAttr(s.Name) + '" /></td>',
+                    '<td style="padding:4px 8px">',
+                    '  <select class="src-mode emby-select" style="width:120px">',
+                    '    <option value="Series"' + (s.Mode === 'Movies' ? '' : ' selected') + '>Series</option>',
+                    '    <option value="Movies"' + (s.Mode === 'Movies' ? ' selected' : '') + '>Movies</option>',
+                    '  </select></td>',
+                    '<td style="text-align:center;padding:4px 8px">',
+                    '  <input class="src-enabled" type="checkbox"' + (s.Enabled === false ? '' : ' checked') + ' /></td>',
+                    '<td style="padding:4px 8px">',
+                    '  <input class="src-retention emby-input" type="number" min="0" style="width:64px"',
+                    '         value="' + (s.RetentionDays || 0) + '" /></td>',
+                    '<td style="padding:4px 8px">',
+                    '  <input class="src-maxvideos emby-input" type="number" min="0" style="width:64px"',
+                    '         value="' + (s.MaxVideosPerSource || 0) + '" /></td>',
+                    '<td style="padding:4px 8px">',
+                    '  <input class="src-interval emby-input" type="number" min="0" style="width:64px"',
+                    '         value="' + (s.SyncIntervalMinutes == null ? 720 : s.SyncIntervalMinutes) + '" /></td>',
+                    '<td style="padding:4px 8px">',
+                    '  <input class="src-description emby-input" type="text" style="width:150px"',
+                    '         value="' + escAttr(s.Description) + '" /></td>',
+                    '<td class="src-status" style="padding:4px 8px;font-size:90%"></td>',
+                    '<td style="padding:4px 8px;white-space:nowrap">',
+                    '  <button type="button" is="emby-button" class="raised emby-button src-info">Info</button>',
+                    '  <button type="button" is="emby-button" class="raised emby-button src-remove"',
+                    '          style="margin-left:4px">&#10005;</button></td>'
+                ].join('');
+
+                tr.querySelector('.src-info').addEventListener('click', function () {
+                    fetchSourceInfo(tr);
+                });
+                tr.querySelector('.src-remove').addEventListener('click', function () {
+                    // Removing a row retires the source: the next sync deletes its episodes, its
+                    // series, and the watch history attached to them, which re-adding the row
+                    // does not bring back. Worth one click of friction.
+                    var url = tr.querySelector('.src-url').value.trim();
+                    if (url && !confirm('Remove ' + url
+                            + '?\n\nOn the next sync its videos, its series and their watch '
+                            + 'history will be deleted. This cannot be undone.')) {
+                        return;
+                    }
+                    tr.remove();
+                });
+
+                // A row added by hand has no status yet, and only a reload would fill it.
+                tr.querySelector('.src-status').textContent = 'never synced';
+
+                document.getElementById('sourcesBody').appendChild(tr);
+            }
+
+            function fetchSourceInfo(tr) {
+                var url = tr.querySelector('.src-url').value.trim();
+                if (!url) {
+                    Dashboard.alert('Enter a URL first.');
+                    return;
+                }
+
+                var btn = tr.querySelector('.src-info');
+                btn.disabled = true;
+                Dashboard.showLoadingMsg();
+                ApiClient.ajax({
+                    url: ApiClient.getUrl('VOD/source-info', { url: url }),
+                    type: 'GET',
+                    dataType: 'json'
+                }).then(function (info) {
+                    btn.disabled = false;
+                    Dashboard.hideLoadingMsg();
+                    var nameInput = tr.querySelector('.src-name');
+                    if (!nameInput.value) { nameInput.value = info.Name || ''; }
+                    var descInput = tr.querySelector('.src-description');
+                    if (!descInput.value && info.Description) {
+                        descInput.value = info.Description.split('\n')[0];
+                    }
+                    if (!info.HasEntries) {
+                        Dashboard.alert('yt-dlp read this URL (' + info.DetectedType
+                            + ') but found no videos to sync.');
+                    }
+                }).catch(function () {
+                    btn.disabled = false;
+                    Dashboard.hideLoadingMsg();
+                    Dashboard.alert('yt-dlp could not read this URL. Check it, and check the plugin logs.');
+                });
+            }
+
+            function intervalOf(tr) {
+                var parsed = parseInt(tr.querySelector('.src-interval').value, 10);
+                return isNaN(parsed) ? 720 : Math.max(0, parsed);
+            }
+
+            function collectSources() {
+                return Array.prototype.map.call(
+                    document.querySelectorAll('#sourcesBody tr'),
+                    function (tr) {
+                        return {
+                            Url: tr.querySelector('.src-url').value.trim(),
+                            Name: tr.querySelector('.src-name').value.trim(),
+                            Mode: tr.querySelector('.src-mode').value,
+                            Enabled: tr.querySelector('.src-enabled').checked,
+                            RetentionDays: Math.max(0, parseInt(tr.querySelector('.src-retention').value, 10) || 0),
+                            MaxVideosPerSource: Math.max(0, parseInt(tr.querySelector('.src-maxvideos').value, 10) || 0),
+                            // NOT `|| 0` like its two neighbours: there 0 means "unlimited", but
+                            // here 0 means "no throttle — re-enumerate every playlist on every
+                            // task run, hourly". An emptied field must fall back to the 720
+                            // default, not silently disable the throttle.
+                            SyncIntervalMinutes: intervalOf(tr),
+                            Description: tr.querySelector('.src-description').value.trim()
+                        };
+                    }
+                ).filter(function (s) { return s.Url.length > 0; });
+            }
+
+            function findDuplicateUrl(sources) {
+                // The database keys sources by URL, so a second row with the same one silently
+                // overwrites the first while both stay on screen.
+                var seen = Object.create(null);
+                for (var i = 0; i < sources.length; i++) {
+                    var key = sources[i].Url.toLowerCase();
+                    if (seen[key]) { return sources[i].Url; }
+                    seen[key] = true;
+                }
+                return null;
+            }
+
+            function applyStatus(status) {
+                var alert = document.getElementById('libraryAlert');
+                if (status.LibraryError) {
+                    // Set through textContent, not innerHTML: the message carries a library name
+                    // the administrator typed.
+                    alert.textContent = 'Library "' + status.LibraryName + '" cannot be used: '
+                        + status.LibraryError
+                        + ' No source can sync until this is fixed.';
+                    alert.style.display = '';
+                } else {
+                    alert.style.display = 'none';
+                }
+
+                // Object.create(null): a bare literal inherits truthy __proto__ and
+                // constructor keys, which a lookup by URL would read as real rows.
+                var byUrl = Object.create(null);
+                (status.Sources || []).forEach(function (s) {
+                    byUrl[s.Url.toLowerCase()] = s;
+                });
+
+                Array.prototype.forEach.call(
+                    document.querySelectorAll('#sourcesBody tr'),
+                    function (tr) {
+                        var cell = tr.querySelector('.src-status');
+                        var row = byUrl[tr.querySelector('.src-url').value.trim().toLowerCase()];
+
+                        if (!row) {
+                            cell.textContent = 'never synced';
+                            cell.style.color = '';
+                            cell.title = '';
+                            return;
+                        }
+                        if (row.LastError) {
+                            // yt-dlp errors run to several hundred characters and would wreck a
+                            // ten-column table; the full text stays reachable on hover.
+                            cell.textContent = row.LastError.length > 80
+                                ? row.LastError.slice(0, 77) + '...'
+                                : row.LastError;
+                            cell.title = row.LastError;
+                            cell.style.color = '#ff8a80';
+                            return;
+                        }
+                        cell.style.color = '';
+                        cell.title = '';
+                        cell.textContent = row.LastSyncedAt
+                            ? row.VideoCount + ' videos, ' + new Date(row.LastSyncedAt).toLocaleString()
+                            : 'never synced';
+                    }
+                );
+            }
+
+            function refreshStatus() {
+                return ApiClient.ajax({
+                    url: ApiClient.getUrl('VOD/sources/status'),
+                    type: 'GET',
+                    dataType: 'json'
+                }).then(applyStatus).catch(function () {
+                    // A status read that fails must not keep the page from loading: the settings
+                    // above it are still editable, and hiding them would be worse than showing
+                    // nothing here.
+                });
+            }
+
+            function selectOnly(select, name, suffix) {
+                var option = document.createElement('option');
+                option.value = name;
+                option.textContent = name + (suffix || '');
+                option.selected = true;
+                select.appendChild(option);
+            }
+
+            function populateLibraries(configuredName) {
+                var select = document.getElementById('libraryName');
+                return ApiClient.ajax({
+                    url: ApiClient.getUrl('VOD/libraries'),
+                    type: 'GET',
+                    dataType: 'json'
+                }).then(function (names) {
+                    select.innerHTML = '';
+                    var wanted = configuredName || 'VOD';
+                    var matched = false;
+
+                    (names || []).forEach(function (name) {
+                        var option = document.createElement('option');
+                        option.value = name;
+                        option.textContent = name;
+                        if (name === wanted) { option.selected = true; matched = true; }
+                        select.appendChild(option);
+                    });
+
+                    if (!matched) {
+                        // The configured library was renamed or deleted. Showing it as a marked
+                        // option keeps the mistake visible; dropping it would silently republish
+                        // the whole library somewhere else on the next save.
+                        var stale = document.createElement('option');
+                        stale.value = wanted;
+                        stale.textContent = wanted + ' (not found)';
+                        stale.selected = true;
+                        select.insertBefore(stale, select.firstChild);
+                    }
+                }).catch(function () {
+                    // Leaving the select empty would be destructive, not merely unhelpful: the
+                    // submit handler reads .value unconditionally, so an empty select writes
+                    // LibraryName = "", and both SyncSourceAsync and RetireRemovedSourcesAsync
+                    // bail on a blank name — one failed page load plus one Save switches the
+                    // plugin off. Keeping the configured name as the sole option makes Save a
+                    // no-op instead. Resolves rather than rethrows, so the chain still reaches
+                    // hideLoadingMsg.
+                    select.innerHTML = '';
+                    selectOnly(select, configuredName || 'VOD', ' (library list unavailable)');
+                    Dashboard.alert('Could not list libraries. The configured value is kept; '
+                        + 'check that you are signed in as an administrator.');
+                });
+            }
+
             document.querySelector('#configurationPage')
                 .addEventListener('pageshow', function () {
                     Dashboard.showLoadingMsg();
@@ -152,7 +449,6 @@
                             document.querySelector('#jsRuntime').value         = config.JsRuntime || '';
                             document.querySelector('#ffmpegPath').value        = config.FfmpegPath || '';
                             document.querySelector('#cookiesPath').value       = config.CookiesPath || '';
-                            document.querySelector('#libraryName').value        = config.LibraryName       || 'VOD';
                             document.querySelector('#localBaseUrl').value      = config.LocalBaseUrl || 'http://localhost:8096';
                             document.querySelector('#cacheMinutes').value      = config.CacheMinutes || 5;
                             document.querySelector('#maxHeight').value         = config.MaxHeight || 1080;
@@ -160,9 +456,19 @@
                                 (config.PreferredAudioLanguages || []).join(', ');
                             document.querySelector('#preferredSubtitleLanguages').value =
                                 (config.PreferredSubtitleLanguages || []).join(', ');
+                            document.getElementById('sourcesBody').innerHTML = '';
+                            (config.Sources || []).forEach(addSourceRow);
+                            return populateLibraries(config.LibraryName)
+                                .then(refreshStatus)
+                                .then(function () { Dashboard.hideLoadingMsg(); });
+                        })
+                        .catch(function () {
                             Dashboard.hideLoadingMsg();
                         });
                 });
+
+            document.getElementById('addSourceButton')
+                .addEventListener('click', function () { addSourceRow(null); });
 
             document.querySelector('#configurationForm')
                 .addEventListener('submit', function (e) {
@@ -182,10 +488,29 @@
                                 .split(',').map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; });
                             config.PreferredSubtitleLanguages = document.querySelector('#preferredSubtitleLanguages').value
                                 .split(',').map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; });
+                            var sources = collectSources();
+                            var duplicate = findDuplicateUrl(sources);
+                            if (duplicate) {
+                                Dashboard.hideLoadingMsg();
+                                Dashboard.alert('Two rows share the same URL: ' + duplicate
+                                    + '. Remove one before saving.');
+                                // Throw, never a bare return: returning RESOLVES the chain, so the
+                                // existing .then would toast "Settings saved" over a form that was
+                                // never sent. The terminal .catch added below swallows this.
+                                throw new Error('vod:duplicate-source');
+                            }
+                            config.Sources = sources;
                             return ApiClient.updatePluginConfiguration(PluginConfig.pluginUniqueId, config);
                         })
                         .then(function (result) {
                             Dashboard.processPluginConfigurationUpdateResult(result);
+                            return refreshStatus();
+                        })
+                        .catch(function (err) {
+                            Dashboard.hideLoadingMsg();
+                            if (!err || err.message !== 'vod:duplicate-source') {
+                                Dashboard.alert('Saving failed. Check the plugin logs for details.');
+                            }
                         });
                 });
         </script>

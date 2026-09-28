@@ -372,7 +372,99 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
             using var cmd = conn.CreateCommand();
             cmd.CommandText = "PRAGMA user_version";
 
-            Assert.Equal(1L, (long)cmd.ExecuteScalar()!);
+            Assert.Equal(2L, (long)cmd.ExecuteScalar()!);
+        }
+
+        /// <summary>
+        /// The v2 column has to survive a round trip on a database built by replaying every
+        /// migration step, which is what a fresh install does: step 1 creates the table without it
+        /// and step 2 adds it.
+        /// </summary>
+        [Fact]
+        public void Channels_RoundTripThroughTheV2Column()
+        {
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/c" });
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = "uuid-channels",
+                SourceUrl = "https://example.test/c",
+                VideoUrl = "https://example.test/v",
+                ExtractorKey = "Youtube",
+                Channels = """["Terrapodia"]""",
+                SyncedAt = DateTimeOffset.UtcNow
+            });
+
+            var retrieved = _db.GetVideoByUuid("uuid-channels");
+
+            Assert.NotNull(retrieved);
+            Assert.Equal("""["Terrapodia"]""", retrieved.Channels);
+        }
+
+        /// <summary>
+        /// The upgrade path, as opposed to a fresh install: a database already stamped v1 has to gain
+        /// the v2 column when it is opened, and end up with the same columns as one that replayed both
+        /// steps. This is the path every existing installation takes, and no other test covers it.
+        /// </summary>
+        [Fact]
+        public void EnsureCreated_UpgradesAV1DatabaseToV2()
+        {
+            var upgradedPath = Path.GetTempFileName();
+            try
+            {
+                // Build a v1 database by hand: the v1 videos table, without the channels column.
+                using (var seed = new SqliteConnection($"Data Source={upgradedPath}"))
+                {
+                    seed.Open();
+                    using var cmd = seed.CreateCommand();
+                    cmd.CommandText = """
+                        CREATE TABLE sources (url TEXT PRIMARY KEY, name TEXT);
+                        CREATE TABLE videos (
+                            id         TEXT PRIMARY KEY,
+                            source_url TEXT NOT NULL,
+                            video_url  TEXT NOT NULL,
+                            synced_at  TEXT NOT NULL
+                        );
+                        PRAGMA user_version = 1;
+                        """;
+                    cmd.ExecuteNonQuery();
+                }
+
+                using var upgraded = new VodDatabase(upgradedPath, NullLogger<VodDatabase>.Instance);
+                upgraded.EnsureCreated();
+
+                using var conn = new SqliteConnection($"Data Source={upgradedPath}");
+                conn.Open();
+
+                using var version = conn.CreateCommand();
+                version.CommandText = "PRAGMA user_version";
+                Assert.Equal(2L, (long)version.ExecuteScalar()!);
+
+                using var columns = conn.CreateCommand();
+                columns.CommandText = "SELECT name FROM pragma_table_info('videos') WHERE name = 'channels'";
+                Assert.Equal("channels", columns.ExecuteScalar());
+            }
+            finally
+            {
+                if (File.Exists(upgradedPath))
+                {
+                    File.Delete(upgradedPath);
+                }
+            }
+        }
+
+        [Fact]
+        public void Channels_DefaultToNullWhenNotSet()
+        {
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/d" });
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = "uuid-no-channels",
+                SourceUrl = "https://example.test/d",
+                VideoUrl = "https://example.test/v",
+                SyncedAt = DateTimeOffset.UtcNow
+            });
+
+            Assert.Null(_db.GetVideoByUuid("uuid-no-channels")!.Channels);
         }
     }
 }

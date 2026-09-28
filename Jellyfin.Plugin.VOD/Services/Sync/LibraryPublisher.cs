@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
@@ -69,6 +70,27 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// <summary>The key a video's item id is derived from. Never contains a path.</summary>
         public string ItemKeyFor(string videoUuid) => $"vod:{videoUuid}";
 
+        /// <summary>The marker that keeps a library location from reading as empty.</summary>
+        private const string KeepMarkerName = ".keep";
+
+        private const string KeepMarkerContent =
+            "Prevent Jellyfin from skipping empty library folders needed for virtual libraries";
+
+        /// <summary>
+        /// Returns the library's first location. Resolves against the configuration only, so it
+        /// answers whether the library exists without asking whether Jellyfin has indexed it.
+        /// </summary>
+        private string ResolveLocation(string libraryName)
+        {
+            var virtualFolder = _libraryManager.GetVirtualFolders()
+                .Find(v => string.Equals(v.Name, libraryName, StringComparison.OrdinalIgnoreCase))
+                ?? throw new InvalidOperationException($"No library named '{libraryName}'.");
+
+            return virtualFolder.Locations.Length > 0
+                ? virtualFolder.Locations[0]
+                : throw new InvalidOperationException($"Library '{libraryName}' has no location.");
+        }
+
         /// <summary>
         /// Returns the folder new items must hang off: the library's physical folder.
         /// </summary>
@@ -78,13 +100,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// </exception>
         public Folder ResolveAnchor(string libraryName)
         {
-            var virtualFolder = _libraryManager.GetVirtualFolders()
-                .Find(v => string.Equals(v.Name, libraryName, StringComparison.OrdinalIgnoreCase))
-                ?? throw new InvalidOperationException($"No library named '{libraryName}'.");
-
-            var location = virtualFolder.Locations.Length > 0 ? virtualFolder.Locations[0] : null;
-            if (location is null)
-                throw new InvalidOperationException($"Library '{libraryName}' has no location.");
+            var location = ResolveLocation(libraryName);
 
             if (_libraryManager.FindByPath(location, true) is not Folder anchor)
             {
@@ -94,6 +110,64 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             }
 
             return anchor;
+        }
+
+        /// <summary>
+        /// Resolves the anchor, letting Jellyfin index the library location first when it never has.
+        /// </summary>
+        /// <remarks>
+        /// A scan skips a library folder that holds no filesystem entries: the check it gates on,
+        /// <c>DirectoryService.IsAccessible</c>, is an emptiness test rather than an access test, and
+        /// the early return it triggers means the folder item <see cref="ResolveAnchor"/> needs is
+        /// never created. A library holding only virtual items therefore stays unusable however many
+        /// times it is scanned — the failure looks like a scan that did not take. Writing a marker
+        /// makes the directory non-empty, after which re-validating the top-level folders indexes it.
+        /// <para>
+        /// The marker is written whenever it is absent, before the lookup rather than only after the
+        /// lookup fails, because a library can return to the empty case after it has worked: an
+        /// indexed folder survives a full re-validation on the strength of its published children,
+        /// so retiring every source strands it again. Re-validating the top-level folders is the
+        /// expensive half and stays on the miss path.
+        /// </para>
+        /// </remarks>
+        /// <param name="libraryName">The configured library name.</param>
+        /// <param name="cancellationToken">A token to cancel the operation.</param>
+        /// <returns>The folder new items must hang off.</returns>
+        /// <exception cref="InvalidOperationException">
+        /// Thrown when the library is missing, has no location, or could not be indexed.
+        /// </exception>
+        public async Task<Folder> PrepareAnchorAsync(string libraryName, CancellationToken cancellationToken)
+        {
+            var location = ResolveLocation(libraryName);
+
+            EnsureKeepMarker(location);
+
+            if (_libraryManager.FindByPath(location, true) is Folder indexed)
+                return indexed;
+
+            LogIndexingLibrary(libraryName, location);
+            await _libraryManager.ValidateTopLibraryFolders(cancellationToken).ConfigureAwait(false);
+
+            // Reuses the "has no indexed folder" message when the validation still produced nothing.
+            return ResolveAnchor(libraryName);
+        }
+
+        private static void EnsureKeepMarker(string location)
+        {
+            var marker = Path.Combine(location, KeepMarkerName);
+            try
+            {
+                if (!File.Exists(marker))
+                {
+                    File.WriteAllText(marker, KeepMarkerContent + Environment.NewLine);
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                throw new InvalidOperationException(
+                    $"Could not write {marker}, so Jellyfin cannot index the library folder: {ex.Message}",
+                    ex);
+            }
         }
 
         /// <summary>
@@ -115,6 +189,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             ArgumentNullException.ThrowIfNull(allKnownVideoIds);
 
             var published = ExistingByVodId(anchor);
+            var studios = EnsureStudioEntities(expected);
 
             Series? series = null;
             Season? currentSeason = null;
@@ -136,7 +211,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 {
                     series ??= await EnsureSeriesAsync(
                         anchor, source, seriesName, FirstAvailableThumbnail(expected),
-                        OldestPublishedAt(expected), cancellationToken)
+                        OldestPublishedAt(expected), studios, cancellationToken)
                         .ConfigureAwait(false);
                     currentSeason = await EnsureSeasonAsync(series, video.SeasonNumber, currentSeason, cancellationToken).ConfigureAwait(false);
 
@@ -335,7 +410,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
             var overview = BuildVideoOverview(video);
             var premiereDate = video.PublishedAt?.UtcDateTime;
-            var productionYear = video.PublishedAt?.Year;
+            var productionYear = video.PublishedAt?.UtcDateTime.Year;
             var runTimeTicks = RunTimeTicks(video);
 
             var changed = isNew
@@ -356,6 +431,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             movie.RunTimeTicks = runTimeTicks;
             changed |= ApplyVideoIds(movie, video);
             changed |= ApplyTags(movie, video.Tags, video.Categories);
+            changed |= ApplyStudios(movie, StudiosFor(video));
 
             var presentationKey = movie.CreatePresentationUniqueKey();
             changed |= !string.Equals(movie.PresentationUniqueKey, presentationKey, StringComparison.Ordinal);
@@ -405,6 +481,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
             var overview = BuildVideoOverview(video);
             var premiereDate = video.PublishedAt?.UtcDateTime;
+            var productionYear = video.PublishedAt?.UtcDateTime.Year;
             var runTimeTicks = RunTimeTicks(video);
             // Queries tie an episode to its series through this field, not through ParentId.
             var seriesKey = series.GetPresentationUniqueKey();
@@ -417,6 +494,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 || episode.IndexNumber != video.EpisodeNumber
                 || episode.ParentIndexNumber != season.IndexNumber
                 || episode.PremiereDate != premiereDate
+                || episode.ProductionYear != productionYear
                 || episode.RunTimeTicks != runTimeTicks
                 || episode.SeasonId != season.Id
                 || !string.Equals(episode.SeasonName, season.Name, StringComparison.Ordinal)
@@ -431,6 +509,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             episode.IndexNumber = video.EpisodeNumber;
             episode.ParentIndexNumber = season.IndexNumber;
             episode.PremiereDate = premiereDate;
+            episode.ProductionYear = productionYear;
             episode.RunTimeTicks = runTimeTicks;
             episode.SeasonId = season.Id;
             episode.SeasonName = season.Name;
@@ -439,6 +518,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             episode.SeriesPresentationUniqueKey = seriesKey;
             changed |= ApplyVideoIds(episode, video);
             changed |= ApplyTags(episode, video.Tags, video.Categories);
+            changed |= ApplyStudios(episode, StudiosFor(video));
 
             var presentationKey = episode.CreatePresentationUniqueKey();
             changed |= !string.Equals(episode.PresentationUniqueKey, presentationKey, StringComparison.Ordinal);
@@ -480,6 +560,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             string seriesName,
             string? fallbackImageUrl,
             DateTimeOffset? oldestPublishedAt,
+            string[] studios,
             CancellationToken cancellationToken)
         {
             var key = VodNativeId.ForSource(source.Url) ?? source.Url;
@@ -489,7 +570,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
             var overview = BuildSeriesOverview(source);
             var premiereDate = oldestPublishedAt?.UtcDateTime;
-            var productionYear = oldestPublishedAt?.Year;
+            var productionYear = oldestPublishedAt?.UtcDateTime.Year;
 
             var changed = existing is null
                 || !string.Equals(series.Name, seriesName, StringComparison.Ordinal)
@@ -505,6 +586,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             series.ProductionYear = productionYear;
             changed |= ApplySourceIds(series, key);
             changed |= ApplyTags(series, source.Tags, null);
+            changed |= ApplyStudios(series, studios);
 
             // Jellyfin only fills PresentationUniqueKey in MetadataService.BeforeSaveInternal, which
             // never runs on an item we create through the API. Leaving it null is not harmless:
@@ -764,8 +846,8 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// </remarks>
         private static bool ApplyTags(BaseItem item, string? tagsJson, string? categoriesJson)
         {
-            var tags = DeserialiseStrings(tagsJson);
-            var genres = DeserialiseStrings(categoriesJson);
+            var tags = AsJellyfinStores(DeserialiseStrings(tagsJson));
+            var genres = AsJellyfinStores(DeserialiseStrings(categoriesJson));
 
             var changed = !item.Tags.SequenceEqual(tags, StringComparer.Ordinal)
                 || !item.Genres.SequenceEqual(genres, StringComparer.Ordinal);
@@ -774,6 +856,133 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             item.Genres = genres;
 
             return changed;
+        }
+
+        /// <summary>
+        /// Puts a list into the shape Jellyfin will store it in, so that what comes back on the next
+        /// pass can compare equal to what was written.
+        /// </summary>
+        /// <remarks>
+        /// Tags, genres and studios are each persisted as one <c>'|'</c>-joined column, with
+        /// <c>Distinct(OrdinalIgnoreCase)</c> applied on write (<c>BaseItemMapper.cs:306</c>,
+        /// <c>:333</c>, <c>:334</c>). So a value carrying a <c>'|'</c> comes back split in two, and two
+        /// values differing only in case come back as one. Either way the item never compares equal to
+        /// what was written, and is rewritten on every pass for ever — the counter reads
+        /// <c>1 updated</c> on a source that has not changed in days. Seen live on a channel whose
+        /// yt-dlp tags held both "Le monde de Jamy" and "Le Monde de Jamy".
+        /// <para>
+        /// Normalising here rather than where the metadata is parsed fixes rows already stored, which
+        /// are never re-fetched: full metadata is only pulled for new playlist entries.
+        /// </para>
+        /// </remarks>
+        private static string[] AsJellyfinStores(string[] values)
+        {
+            if (values.Length == 0)
+                return values;
+
+            var kept = new List<string>(values.Length);
+            foreach (var value in values)
+            {
+                var cleaned = value.Replace('|', '/');
+                if (!string.IsNullOrEmpty(cleaned)
+                    && !kept.Contains(cleaned, StringComparer.OrdinalIgnoreCase))
+                {
+                    kept.Add(cleaned);
+                }
+            }
+
+            return [.. kept];
+        }
+
+        /// <summary>
+        /// Publishes channels as Jellyfin studios, each qualified with the platform it came from.
+        /// </summary>
+        /// <remarks>
+        /// The platform suffix is what stops two same-named channels on different platforms from
+        /// collapsing into one studio. <see cref="VideoRecord.Channels"/> holds the bare names so
+        /// the label can be rebuilt without migrating stored rows — but changing its format is not
+        /// free: every label already published has a Studio item behind it, <c>Studio.CanDelete</c>
+        /// is false, and nothing reaps the old ones. A relabel, like an upstream channel rename,
+        /// therefore strands them permanently (under Jellyfin's metadata path, not the media tree).
+        /// <para>
+        /// Returns a flag rather than assigning blindly, for the reason given on
+        /// <see cref="ApplyTags"/>.
+        /// </para>
+        /// </remarks>
+        private static bool ApplyStudios(BaseItem item, string[] studios)
+        {
+            // Empty entries are dropped before comparing because Jellyfin cannot store an empty
+            // studio list faithfully: it writes one as "" and reads it back as [""], splitting the
+            // column without the IsNullOrWhiteSpace guard it applies to Genres and Tags
+            // (BaseItemMapper.cs:147 against :115 and :148). Comparing raw would report a change on
+            // every pass for every item with no studio — Arte publishes none — and rewrite it hourly.
+            var current = item.Studios.Where(s => !string.IsNullOrEmpty(s));
+            var changed = !current.SequenceEqual(studios, StringComparer.Ordinal);
+            item.Studios = studios;
+
+            return changed;
+        }
+
+        /// <summary>
+        /// Qualifies one video's channels with its platform. Falls back to the bare names when the
+        /// extractor is unknown: there is then no platform to disambiguate against anyway.
+        /// </summary>
+        private static string[] StudiosFor(VideoRecord video)
+        {
+            var channels = DeserialiseStrings(video.Channels);
+            if (channels.Length == 0)
+                return channels;
+
+            var qualified = new string[channels.Length];
+            for (var i = 0; i < channels.Length; i++)
+            {
+                qualified[i] = string.IsNullOrWhiteSpace(video.ExtractorKey)
+                    ? channels[i]
+                    : $"{channels[i]} ({video.ExtractorKey})";
+            }
+
+            return AsJellyfinStores(qualified);
+        }
+
+        /// <summary>
+        /// Returns the studios for a source's videos, having made sure each one exists as a Studio
+        /// item rather than a name no query can resolve.
+        /// </summary>
+        /// <remarks>
+        /// Jellyfin materialises Studio items in a post-scan validator, which never runs for items
+        /// published outside a scan. Until a library scan happens, a studio on a freshly published
+        /// item is a dead link: the client navigates to its id, finds nothing, and sits on a loading
+        /// spinner. <c>GetStudio</c> is the same call that validator makes — it returns the existing
+        /// item when there is one, and otherwise creates it, writing a single directory under
+        /// Jellyfin's own metadata path rather than into the media tree.
+        /// </remarks>
+        private string[] EnsureStudioEntities(IReadOnlyList<VideoRecord> videos)
+        {
+            var studios = DistinctStudios(videos);
+            foreach (var studio in studios)
+                _libraryManager.GetStudio(studio);
+
+            return studios;
+        }
+
+        /// <summary>
+        /// The studios across a source's videos, in first-seen order. A channel source yields a
+        /// single one, but a playlist can gather videos from several uploaders.
+        /// </summary>
+        private static string[] DistinctStudios(IReadOnlyList<VideoRecord> videos)
+        {
+            var studios = new List<string>();
+            foreach (var video in videos)
+            {
+                foreach (var studio in StudiosFor(video))
+                {
+                    // Each list is already deduplicated; this folds across videos, on the same terms.
+                    if (!studios.Contains(studio, StringComparer.OrdinalIgnoreCase))
+                        studios.Add(studio);
+                }
+            }
+
+            return [.. studios];
         }
 
         private static string[] DeserialiseStrings(string? json)
@@ -817,5 +1026,9 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             Message = "Reconciled {SourceUrl}: {Created} created, {Updated} updated, {Removed} removed, {Unchanged} unchanged")]
         private partial void LogReconciled(
             string sourceUrl, int created, int updated, int removed, int unchanged);
+
+        [LoggerMessage(EventId = 2, Level = LogLevel.Information,
+            Message = "Library {LibraryName} has no indexed folder at {Location}; re-validating the top-level folders so Jellyfin indexes it")]
+        private partial void LogIndexingLibrary(string libraryName, string location);
     }
 }

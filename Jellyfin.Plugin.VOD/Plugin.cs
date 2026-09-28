@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using Jellyfin.Plugin.VOD.Configuration;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Common.Plugins;
@@ -37,6 +38,24 @@ namespace Jellyfin.Plugin.VOD
         /// Gets the current plugin instance.
         /// </summary>
         public static Plugin? Instance { get; private set; }
+
+        /// <summary>
+        /// Returns the plugin's data folder, creating it when it does not exist.
+        /// </summary>
+        /// <remarks>
+        /// Jellyfin assigns <see cref="BasePlugin.DataFolderPath"/> but never creates the directory,
+        /// so on a fresh install nothing is on disk and the first write fails. Every write into the
+        /// data folder must therefore go through here rather than reading
+        /// <see cref="BasePlugin.DataFolderPath"/> directly. Reading the property to compose a path
+        /// stays fine — only writes need the guarantee. The call is a cheap syscall on an existing
+        /// directory, and repeating it per write also recovers a folder removed while the server runs.
+        /// </remarks>
+        /// <returns>The absolute path to the plugin's data folder.</returns>
+        public string EnsureDataFolder()
+        {
+            Directory.CreateDirectory(DataFolderPath);
+            return DataFolderPath;
+        }
 
         /// <inheritdoc />
         public IEnumerable<PluginPageInfo> GetPages()

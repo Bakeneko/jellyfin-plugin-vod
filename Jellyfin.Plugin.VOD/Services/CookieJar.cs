@@ -80,7 +80,7 @@ namespace Jellyfin.Plugin.VOD.Services
 
             if (!File.Exists(WorkingPath) || !string.Equals(stamp, seeded, StringComparison.Ordinal))
             {
-                Directory.CreateDirectory(Plugin.Instance!.DataFolderPath);
+                Plugin.Instance!.EnsureDataFolder();
                 File.Copy(seed, WorkingPath, overwrite: true);
                 File.WriteAllText(SeedStampPath, stamp);
                 RestrictPermissions(WorkingPath);

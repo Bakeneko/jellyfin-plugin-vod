@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Text.Json;
 
@@ -191,10 +192,18 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
             if (string.IsNullOrWhiteSpace(url) && el.TryGetProperty("url", out var u) && u.ValueKind == JsonValueKind.String)
                 url = u.GetString();
 
-            if (string.IsNullOrWhiteSpace(url) || !el.TryGetProperty("id", out var idEl))
+            if (string.IsNullOrWhiteSpace(url))
                 return null;
 
-            var id = idEl.GetString();
+            // Read through ReadString rather than GetString: the latter throws
+            // InvalidOperationException on a non-string element, which the caller's
+            // catch (JsonException) does not catch, so an extractor emitting a numeric id would fail
+            // the whole source sync instead of dropping the one entry like every other parse failure.
+            var ieKey = ReadString(el, "ie_key") ?? string.Empty;
+
+            var id = ReadString(el, "id");
+            if (string.IsNullOrWhiteSpace(id))
+                id = DeriveIdFromUrl(url, ieKey);
             if (string.IsNullOrWhiteSpace(id))
                 return null;
 
@@ -206,10 +215,47 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
             {
                 Id = id,
                 VideoUrl = url,
-                Title = el.TryGetProperty("title", out var title) ? title.GetString() : null,
-                IeKey = el.TryGetProperty("ie_key", out var iek) ? (iek.GetString() ?? string.Empty) : string.Empty,
+                Title = ReadString(el, "title"),
+                IeKey = ieKey,
                 Duration = duration
             };
+        }
+
+        /// <summary>
+        /// Recovers a video id from its page URL, for the extractors that omit <c>id</c> from a
+        /// flat-playlist dump. Returns <see langword="null"/> when the id cannot be recovered.
+        /// </summary>
+        /// <remarks>
+        /// Arte lists its entries as bare <c>url</c> references carrying nothing but <c>ie_key</c>,
+        /// so without this every entry is dropped and the source publishes no videos at all — while
+        /// the warning blames a transient enumeration failure. yt-dlp derives the id from the same
+        /// path segment, which is why the value recovered here matches the <c>id</c> a full metadata
+        /// fetch reports; that equality is what lets a synced row be matched again on the next pass.
+        /// <para>
+        /// Deliberately keyed on the extractor rather than applied to every entry missing an id.
+        /// Guessing for an extractor whose canonical id is not the URL segment would break that
+        /// matching silently, and every pass would republish the whole source rather than fail where
+        /// it can be seen.
+        /// </para>
+        /// </remarks>
+        internal static string? DeriveIdFromUrl(string url, string ieKey)
+        {
+            if (!string.Equals(ieKey, "ArteTV", StringComparison.OrdinalIgnoreCase)
+                || !Uri.TryCreate(url, UriKind.Absolute, out var uri))
+            {
+                return null;
+            }
+
+            // https://www.arte.tv/fr/videos/130515-005-A/pourquoi-eclate-t-on-en-sanglots/
+            //                              ^^^^^^^^^^^^
+            var segments = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            for (var i = 0; i < segments.Length - 1; i++)
+            {
+                if (string.Equals(segments[i], "videos", StringComparison.OrdinalIgnoreCase))
+                    return segments[i + 1];
+            }
+
+            return null;
         }
     }
 }

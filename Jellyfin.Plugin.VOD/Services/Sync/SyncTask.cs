@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.VOD.Data;
+using Jellyfin.Plugin.VOD.Data.Models;
 using MediaBrowser.Model.Tasks;
 using Microsoft.Extensions.Logging;
 
@@ -59,13 +60,37 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             if (config is null)
                 return;
 
-            // First, and before the early return below: a source removed from the configuration is
-            // never visited by the loop that follows, since that loop only ever reads the
-            // configuration. Retiring has to be driven from the database instead — and emptying the
-            // source list entirely is exactly the case where it matters most.
+            var sources = config.Sources.FindAll(s => s.Enabled);
+
+            // Before retirement and before the loop, because both need the anchor and neither can do
+            // anything without it. Failing here rather than inside the loop is what keeps a broken
+            // library from costing one yt-dlp enumeration per source on every single wake-up.
+            try
+            {
+                await _syncService.PrepareLibraryAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (InvalidOperationException ex)
+            {
+                LogLibraryUnavailable(config.LibraryName, ex.Message);
+
+                // Recorded against each source so the configuration page can show why nothing synced.
+                foreach (var source in sources)
+                {
+                    var record = _db.GetSource(source.Url) ?? new SourceRecord { Url = source.Url };
+                    record.LastError = ex.Message;
+                    _db.UpsertSource(record);
+                }
+
+                progress.Report(100);
+                return;
+            }
+
+            // Before the early return below: a source removed from the configuration is never visited
+            // by the loop that follows, since that loop only ever reads the configuration. Retiring
+            // has to be driven from the database instead — and emptying the source list entirely is
+            // exactly the case where it matters most.
             await _syncService.RetireRemovedSourcesAsync(cancellationToken).ConfigureAwait(false);
 
-            var sources = config.Sources.FindAll(s => s.Enabled);
             if (sources.Count == 0)
             {
                 progress.Report(100);
@@ -102,5 +127,9 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         [LoggerMessage(EventId = 2, Level = LogLevel.Debug,
             Message = "SyncTask: skipping source {Url} — last synced {LastSyncedAt}, interval {IntervalMinutes} min")]
         private partial void LogSkippingSource(string url, DateTimeOffset lastSyncedAt, int intervalMinutes);
+
+        [LoggerMessage(EventId = 3, Level = LogLevel.Error,
+            Message = "SyncTask: nothing synced — library {LibraryName} cannot hold published items: {Reason}")]
+        private partial void LogLibraryUnavailable(string libraryName, string reason);
     }
 }

@@ -10,6 +10,18 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
         /// <summary>Gets the native video ID.</summary>
         public string Id { get; init; } = string.Empty;
 
+        /// <summary>
+        /// Gets the channels that own or uploaded the video, deduplicated, in reporting order.
+        /// </summary>
+        /// <remarks>
+        /// yt-dlp reports <c>channel</c> and <c>uploader</c> as separate scalars. On YouTube they
+        /// usually hold the same name and collapse to one entry, but they diverge on auto-generated
+        /// "Topic" channels, where the uploader is the artist behind the channel. A platform that
+        /// reports neither — Arte among them — yields an empty list, and the video is published with
+        /// no studio rather than a made-up one.
+        /// </remarks>
+        public IReadOnlyList<string> Channels { get; init; } = [];
+
         /// <summary>Gets the primary title. For Arte episodes this is often the series name.</summary>
         public string? Title { get; init; }
 
@@ -176,13 +188,39 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
                     AudioLanguages = [.. audioLangs],
                     SubtitleLanguages = subLangs,
                     Tags = JsonArrays.ReadStrings(root, "tags", MaxTags),
-                    Categories = JsonArrays.ReadStrings(root, "categories", MaxTags)
+                    Categories = JsonArrays.ReadStrings(root, "categories", MaxTags),
+                    Channels = ReadChannels(root)
                 };
             }
             catch (JsonException)
             {
                 return null;
             }
+        }
+
+        /// <summary>
+        /// The scalar properties holding a channel name, in the order they are preferred.
+        /// </summary>
+        private static readonly string[] ChannelProperties = ["channel", "uploader"];
+
+        private static List<string> ReadChannels(JsonElement root)
+        {
+            var channels = new List<string>(ChannelProperties.Length);
+
+            foreach (var property in ChannelProperties)
+            {
+                if (!root.TryGetProperty(property, out var el) || el.ValueKind != JsonValueKind.String)
+                    continue;
+
+                var name = el.GetString()?.Trim();
+                if (string.IsNullOrEmpty(name))
+                    continue;
+
+                if (!channels.Exists(c => string.Equals(c, name, StringComparison.OrdinalIgnoreCase)))
+                    channels.Add(name);
+            }
+
+            return channels;
         }
     }
 }

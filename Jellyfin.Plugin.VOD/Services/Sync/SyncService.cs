@@ -44,12 +44,38 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         }
 
         /// <summary>
+        /// Makes sure the configured library can anchor published items, letting Jellyfin index its
+        /// location the first time. Does nothing while the plugin has no library configured.
+        /// </summary>
+        /// <remarks>
+        /// Belongs before anything reaches the network. Resolving the anchor per source instead costs
+        /// a yt-dlp enumeration for each one before they all fail on the same error, and because a
+        /// failed sync leaves <see cref="SourceRecord.LastSyncedAt"/> untouched, the per-source
+        /// throttle never engages and that cost repeats on every wake-up.
+        /// </remarks>
+        /// <param name="cancellationToken">A token to cancel the operation.</param>
+        /// <returns>A task that completes once the library is ready to publish into.</returns>
+        /// <exception cref="InvalidOperationException">
+        /// Thrown when the library cannot be resolved or indexed.
+        /// </exception>
+        public async Task PrepareLibraryAsync(CancellationToken cancellationToken)
+        {
+            var config = Plugin.Instance?.Configuration;
+            if (config is null || string.IsNullOrWhiteSpace(config.LibraryName))
+                return;
+
+            await _publisher.PrepareAnchorAsync(config.LibraryName, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        /// <summary>
         /// Removes every trace of the sources the configuration no longer lists: their library
         /// items, the containers holding them, and their rows.
         /// </summary>
         /// <remarks>
-        /// Runs first in a sync pass, because the rest of the sync only ever reads the configuration
-        /// and would never look at a source that is no longer in it. A source with
+        /// Runs ahead of the per-source loop, because that loop only ever reads the configuration and
+        /// would never look at a source no longer in it. <see cref="PrepareLibraryAsync"/> runs
+        /// earlier still, so the anchor is known to resolve by the time this is reached. A source with
         /// <c>Enabled = false</c> is NOT retired — it is paused, and its items stay: deletion cascades
         /// to the user's watch history, which recreating the item does not bring back, so a cleared
         /// checkbox must not destroy data.
@@ -77,7 +103,21 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             if (retired.Count == 0)
                 return 0;
 
-            var anchor = _publisher.ResolveAnchor(config.LibraryName);
+            // Unreachable on the scheduled path, where PrepareLibraryAsync has already resolved this
+            // same anchor and returned before the task got here. Kept because it is free and this
+            // method is public: a caller that skips that preparation, or a library deleted between
+            // the two calls, must skip retirement rather than throw. Throwing would escape
+            // SyncTask.ExecuteAsync, which catches nothing, and kill the whole scheduled task.
+            Folder anchor;
+            try
+            {
+                anchor = _publisher.ResolveAnchor(config.LibraryName);
+            }
+            catch (InvalidOperationException ex)
+            {
+                LogRetirementSkipped(config.LibraryName, ex.Message);
+                return 0;
+            }
 
             foreach (var record in retired)
             {
@@ -392,12 +432,14 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
                 record.Title = effectiveTitle;
                 // Upcoming streams: prepend scheduled broadcast date to description
-                // The localized prefix is resolved via ILocalizationManager (see Task 1b)
+                // The localized prefix is resolved via IVodLocalizer
                 record.Description = BuildDescription(meta, publishedAt, _localizer);
                 record.ThumbnailUrl = meta.Thumbnail;
                 record.Tags = meta.Tags.Count > 0 ? JsonSerializer.Serialize(meta.Tags) : null;
                 record.Categories = meta.Categories.Count > 0
                     ? JsonSerializer.Serialize(meta.Categories) : null;
+                record.Channels = meta.Channels.Count > 0
+                    ? JsonSerializer.Serialize(meta.Channels) : null;
                 record.DurationSeconds = meta.Duration.HasValue ? (int)meta.Duration.Value : null;
                 record.AudioLangs = meta.AudioLanguages.Count > 0
                     ? JsonSerializer.Serialize(meta.AudioLanguages) : null;
@@ -507,27 +549,14 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// Picks the name a source's series carries.
         /// </summary>
         /// <remarks>
-        /// yt-dlp names a channel's playlist after the TAB rather than the channel — "Le Fossoyeur
-        /// de Films - Videos", "… - Live", "… - Shorts" — so a channel takes its <c>channel</c>
-        /// field instead. A playlist reports that field too, but there it holds the playlist's
-        /// OWNER, which would rename "WORLDS 2025" to "OTP - VODs"; hence the channel-only test.
-        /// This also settles a name that used to flip: two tabs of one channel resolve to the same
-        /// source key, so they share one series, and whichever synced last decided what it was
-        /// called.
+        /// When <c>source.Name</c> is not set, delegates the platform-specific rule to
+        /// <see cref="SeriesNaming.Resolve"/>, where the channel-vs-playlist distinction and its
+        /// rationale are documented.
         /// </remarks>
         private static string ResolveSeriesName(SourceDefinition source, PlaylistInfo playlist)
-        {
-            if (!string.IsNullOrWhiteSpace(source.Name))
-                return source.Name;
-
-            if (VodNativeId.IsChannel(VodNativeId.ForSource(source.Url))
-                && !string.IsNullOrWhiteSpace(playlist.ChannelName))
-            {
-                return playlist.ChannelName;
-            }
-
-            return playlist.Title ?? source.Url;
-        }
+            => !string.IsNullOrWhiteSpace(source.Name)
+                ? source.Name
+                : SeriesNaming.Resolve(source.Url, playlist);
 
         private static string? BuildDescription(
             VideoMetadata meta,
@@ -605,5 +634,9 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         [LoggerMessage(EventId = 10, Level = LogLevel.Information,
             Message = "Retired {SourceUrl}: no longer in the configuration, its items and rows are gone")]
         private partial void LogRetiredSource(string sourceUrl);
+
+        [LoggerMessage(EventId = 12, Level = LogLevel.Error,
+            Message = "Sync: cannot retire removed sources — library '{LibraryName}' is unavailable: {Reason}")]
+        private partial void LogRetirementSkipped(string libraryName, string reason);
     }
 }

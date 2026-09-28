@@ -43,7 +43,7 @@ namespace Jellyfin.Plugin.VOD.Data
         /// Schema version this build expects, tracked in SQLite's <c>user_version</c>.
         /// Bump it and add the matching case to <see cref="Migrate"/> whenever the schema changes.
         /// </summary>
-        private const int SchemaVersion = 1;
+        private const int SchemaVersion = 2;
 
         /// <inheritdoc />
         public void EnsureCreated()
@@ -124,6 +124,14 @@ namespace Jellyfin.Plugin.VOD.Data
                         INSERT OR IGNORE INTO sources (url, name) VALUES ('__debug__', 'Debug (internal)');
 
                         PRAGMA user_version = 1;
+                        """;
+                    break;
+
+                case 2:
+                    cmd.CommandText = """
+                        ALTER TABLE videos ADD COLUMN channels TEXT;
+
+                        PRAGMA user_version = 2;
                         """;
                     break;
 
@@ -220,14 +228,14 @@ namespace Jellyfin.Plugin.VOD.Data
                         (id, source_url, extractor_key, native_id, video_url, title,
                          published_at, duration_seconds,
                          season_number, episode_number, synced_at,
-                         audio_langs, subtitle_langs, thumbnail_url, tags, categories, description,
-                         is_live)
+                         audio_langs, subtitle_langs, thumbnail_url, tags, categories, channels,
+                         description, is_live)
                     VALUES
                         ($id, $sourceUrl, $extractorKey, $nativeId, $videoUrl, $title,
                          $publishedAt, $durationSeconds,
                          $seasonNumber, $episodeNumber, $syncedAt,
-                         $audioLangs, $subtitleLangs, $thumbnailUrl, $tags, $categories, $description,
-                         $isLive)
+                         $audioLangs, $subtitleLangs, $thumbnailUrl, $tags, $categories, $channels,
+                         $description, $isLive)
                     ON CONFLICT(id) DO UPDATE SET
                         source_url       = excluded.source_url,
                         extractor_key    = excluded.extractor_key,
@@ -244,6 +252,7 @@ namespace Jellyfin.Plugin.VOD.Data
                         thumbnail_url    = excluded.thumbnail_url,
                         tags             = excluded.tags,
                         categories       = excluded.categories,
+                        channels         = excluded.channels,
                         description      = excluded.description,
                         is_live          = excluded.is_live;
                     """;
@@ -458,6 +467,7 @@ namespace Jellyfin.Plugin.VOD.Data
             cmd.Parameters.AddWithValue("$thumbnailUrl", (object?)v.ThumbnailUrl ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$tags", (object?)v.Tags ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$categories", (object?)v.Categories ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$channels", (object?)v.Channels ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$description", (object?)v.Description ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$isLive", v.IsLive ? 1 : 0);
         }
@@ -532,6 +542,7 @@ namespace Jellyfin.Plugin.VOD.Data
                 ThumbnailUrl = S("thumbnail_url"),
                 Tags = S("tags"),
                 Categories = S("categories"),
+                Channels = S("channels"),
                 PublishedImageUrl = S("published_image_url"),
                 Description = S("description"),
                 IsLive = r.GetInt32(r.GetOrdinal("is_live")) != 0

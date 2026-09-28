@@ -24,7 +24,8 @@ namespace Jellyfin.Plugin.VOD
             serviceCollection.AddSingleton<IVodDatabase>(sp =>
             {
                 var logger = sp.GetRequiredService<ILogger<VodDatabase>>();
-                var dbPath = Path.Combine(Plugin.Instance!.DataFolderPath, "vod.db");
+
+                var dbPath = Path.Combine(Plugin.Instance!.EnsureDataFolder(), "vod.db");
                 var db = new VodDatabase(dbPath, logger);
                 db.EnsureCreated();
                 return db;
@@ -41,7 +42,7 @@ namespace Jellyfin.Plugin.VOD
 
             // Generated artwork, written next to the plugin's database
             serviceCollection.AddSingleton(
-                _ => new ArtworkStore(Plugin.Instance!.DataFolderPath));
+                _ => new ArtworkStore(Plugin.Instance!.EnsureDataFolder()));
 
             // Sync services
             serviceCollection.AddSingleton<LibraryPublisher>();

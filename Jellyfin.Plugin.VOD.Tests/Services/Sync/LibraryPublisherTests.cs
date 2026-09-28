@@ -344,5 +344,253 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 created, Arg.Any<BaseItem>(), ItemUpdateType.MetadataEdit,
                 Arg.Any<CancellationToken>());
         }
+
+        [Fact]
+        public async Task ReconcileAsync_PublishesChannelsAsStudios_QualifiedWithThePlatform()
+        {
+            // The platform suffix is what keeps two same-named channels on different platforms from
+            // collapsing into one studio.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000050";
+            var created = await PublishOneMovieAsync(vodId, "Youtube", """["Terrapodia"]""");
+
+            Assert.Equal(["Terrapodia (Youtube)"], created.Studios);
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_PublishesEveryReportedChannel()
+        {
+            // yt-dlp reports channel and uploader separately; they diverge on auto-generated
+            // "Topic" channels, where the uploader is the artist behind the channel.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000051";
+            var created = await PublishOneMovieAsync(
+                vodId, "Youtube", """["Some Artist - Topic","Some Artist"]""");
+
+            Assert.Equal(
+                ["Some Artist - Topic (Youtube)", "Some Artist (Youtube)"],
+                created.Studios);
+        }
+
+        /// <summary>
+        /// Arte reports neither channel nor uploader. Publishing no studio is deliberate: the
+        /// alternative is inventing one.
+        /// </summary>
+        [Fact]
+        public async Task ReconcileAsync_PublishesNoStudio_WhenThePlatformReportsNoChannel()
+        {
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000052";
+            var created = await PublishOneMovieAsync(vodId, "ArteTV", channelsJson: null);
+
+            Assert.Empty(created.Studios);
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_FallsBackToBareChannelNames_WhenTheExtractorIsUnknown()
+        {
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000053";
+            var created = await PublishOneMovieAsync(vodId, null, """["Somewhere"]""");
+
+            Assert.Equal(["Somewhere"], created.Studios);
+        }
+
+        /// <summary>
+        /// Guards the reconciliation rule that a field written without being compared is recomputed
+        /// and thrown away on every pass: if the studios were not part of the change detection, the
+        /// second pass would report an update instead of leaving the item alone.
+        /// </summary>
+        [Fact]
+        public async Task ReconcileAsync_LeavesStudiosAlone_OnTheSecondPass()
+        {
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000054";
+            var created = await PublishOneMovieAsync(vodId, "Youtube", """["Terrapodia"]""");
+
+            _library.ClearReceivedCalls();
+            _library.GetItemList(Arg.Any<InternalItemsQuery>())
+                .Returns(new List<BaseItem> { created });
+
+            var second = await _publisher.ReconcileAsync(
+                _studioAnchor,
+                new SourceRecord { Url = "https://example.com/source" },
+                SourceMode.Movies, "Test",
+                new[] { VideoWith(vodId, "Youtube", """["Terrapodia"]""") },
+                new HashSet<string> { vodId },
+                "http://localhost:8096",
+                CancellationToken.None);
+
+            Assert.Equal(0, second.Updated);
+            Assert.Equal(1, second.Unchanged);
+        }
+
+        private static VideoRecord VideoWith(string vodId, string? extractorKey, string? channelsJson)
+            => new()
+            {
+                Id = vodId,
+                SourceUrl = "https://example.com/source",
+                VideoUrl = "https://example.com/watch/" + vodId,
+                Title = "Studio subject",
+                DurationSeconds = 120,
+                ExtractorKey = extractorKey,
+                Channels = channelsJson
+            };
+
+        /// <summary>
+        /// Jellyfin cannot store an empty studio list faithfully: it writes one as <c>""</c> and reads
+        /// it back as <c>[""]</c>, because BaseItemMapper splits that column without the
+        /// IsNullOrWhiteSpace guard it applies to Genres and Tags. An item with no studio — every Arte
+        /// item — therefore came back differing from what was written and was rewritten on every pass,
+        /// for ever, defeating the rule that an unchanged item is left alone.
+        /// <para>
+        /// Feeding the same in-memory item back, as the pass-two test above does, cannot catch this:
+        /// nothing round-trips through the mapper. The stored shape is simulated explicitly instead.
+        /// </para>
+        /// </summary>
+        [Fact]
+        public async Task ReconcileAsync_LeavesAStudiolessItemAlone_WhenJellyfinReadsItBackAsOneEmptyEntry()
+        {
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000057";
+            var created = await PublishOneMovieAsync(vodId, "ArteTV", channelsJson: null);
+            Assert.Empty(created.Studios);
+
+            // What Jellyfin hands back for the row it just wrote.
+            created.Studios = [string.Empty];
+
+            _library.ClearReceivedCalls();
+            _library.GetItemList(Arg.Any<InternalItemsQuery>())
+                .Returns(new List<BaseItem> { created });
+
+            var second = await _publisher.ReconcileAsync(
+                _studioAnchor,
+                new SourceRecord { Url = "https://example.com/source" },
+                SourceMode.Movies, "Test",
+                new[] { VideoWith(vodId, "ArteTV", null) },
+                new HashSet<string> { vodId },
+                "http://localhost:8096",
+                CancellationToken.None);
+
+            Assert.Equal(0, second.Updated);
+            Assert.Equal(1, second.Unchanged);
+            await _library.DidNotReceive().UpdateItemAsync(
+                Arg.Any<BaseItem>(), Arg.Any<BaseItem>(), Arg.Any<ItemUpdateType>(),
+                Arg.Any<CancellationToken>());
+        }
+
+        /// <summary>
+        /// Observed live: one video of a real channel carried both "Le monde de Jamy" and
+        /// "Le Monde de Jamy" in its yt-dlp tags. Jellyfin deduplicates the column case-insensitively
+        /// on write, so it stored fewer tags than were written and that single item reported
+        /// <c>1 updated</c> on every pass, indefinitely, on a source that had not changed.
+        /// </summary>
+        [Fact]
+        public async Task ReconcileAsync_LeavesAnItemAlone_WhenItsTagsDifferOnlyByCase()
+        {
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000060";
+            var video = VideoWith(vodId, "Youtube", null);
+            video.Tags = """["Le monde de Jamy","Le Monde de Jamy","Sciences"]""";
+
+            BaseItem? created = null;
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created = call.ArgAt<BaseItem>(0));
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            var first = await _publisher.ReconcileAsync(
+                _studioAnchor, new SourceRecord { Url = "https://example.com/source" },
+                SourceMode.Movies, "Test", new[] { video },
+                new HashSet<string> { vodId }, "http://localhost:8096", CancellationToken.None);
+
+            Assert.Equal(1, first.Created);
+            Assert.NotNull(created);
+            Assert.Equal(["Le monde de Jamy", "Sciences"], created.Tags);
+
+            _library.ClearReceivedCalls();
+            _library.GetItemList(Arg.Any<InternalItemsQuery>())
+                .Returns(new List<BaseItem> { created });
+
+            var second = await _publisher.ReconcileAsync(
+                _studioAnchor, new SourceRecord { Url = "https://example.com/source" },
+                SourceMode.Movies, "Test", new[] { video },
+                new HashSet<string> { vodId }, "http://localhost:8096", CancellationToken.None);
+
+            Assert.Equal(0, second.Updated);
+            Assert.Equal(1, second.Unchanged);
+        }
+
+        /// <summary>
+        /// '|' is how Jellyfin joins the stored column, so a channel carrying one would be read back
+        /// as two studios and never match what was written.
+        /// </summary>
+        [Fact]
+        public async Task ReconcileAsync_KeepsTheSeparatorOutOfStudioNames()
+        {
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000058";
+            var created = await PublishOneMovieAsync(
+                vodId, "Youtube", """["Hardware | Software"]""");
+
+            Assert.Equal(["Hardware / Software (Youtube)"], created.Studios);
+            Assert.DoesNotContain('|', Assert.Single(created.Studios));
+        }
+
+        /// <summary>
+        /// Jellyfin applies Distinct(OrdinalIgnoreCase) when writing the column, so keeping two case
+        /// variants would mean reading back fewer studios than were written — on every pass.
+        /// </summary>
+        [Fact]
+        public async Task ReconcileAsync_DeduplicatesStudiosCaseInsensitively()
+        {
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000059";
+            var created = await PublishOneMovieAsync(
+                vodId, "Youtube", """["Terrapodia","TERRAPODIA"]""");
+
+            Assert.Equal(["Terrapodia (Youtube)"], created.Studios);
+        }
+
+        /// <summary>
+        /// Jellyfin materialises Studio items in a post-scan validator, which never runs for items
+        /// published outside a scan. Without this call the studio is a name no query resolves, and
+        /// its page in the client sits on a loading spinner until the next library scan.
+        /// </summary>
+        [Fact]
+        public async Task ReconcileAsync_CreatesTheStudioEntity()
+        {
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000055";
+            await PublishOneMovieAsync(vodId, "Youtube", """["Terrapodia"]""");
+
+            _library.Received(1).GetStudio("Terrapodia (Youtube)");
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_CreatesNoStudioEntity_WhenThePlatformReportsNoChannel()
+        {
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000056";
+            await PublishOneMovieAsync(vodId, "ArteTV", channelsJson: null);
+
+            _library.DidNotReceive().GetStudio(Arg.Any<string>());
+        }
+
+        /// <summary>
+        /// Shared across both passes of the idempotence test: a fresh anchor would give the item a
+        /// different ParentId and report an update for that reason rather than for its studios.
+        /// </summary>
+        private readonly Folder _studioAnchor = new() { Id = Guid.NewGuid(), Path = "/media/Vods" };
+
+        private async Task<BaseItem> PublishOneMovieAsync(
+            string vodId, string? extractorKey, string? channelsJson)
+        {
+            BaseItem? created = null;
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created = call.ArgAt<BaseItem>(0));
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            var report = await _publisher.ReconcileAsync(
+                _studioAnchor,
+                new SourceRecord { Url = "https://example.com/source" },
+                SourceMode.Movies, "Test",
+                new[] { VideoWith(vodId, extractorKey, channelsJson) },
+                new HashSet<string> { vodId },
+                "http://localhost:8096",
+                CancellationToken.None);
+
+            Assert.Equal(1, report.Created);
+            Assert.NotNull(created);
+            return created;
+        }
     }
 }

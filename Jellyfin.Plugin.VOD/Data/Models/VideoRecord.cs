@@ -59,6 +59,17 @@ namespace Jellyfin.Plugin.VOD.Data.Models
         public string? Categories { get; set; }
 
         /// <summary>
+        /// The channels that own or uploaded the video, as a JSON array. Published as Jellyfin
+        /// studios, qualified with the platform at publish time.
+        /// </summary>
+        /// <remarks>
+        /// Holds the bare names yt-dlp reported, not the qualified studio strings. Keeping the
+        /// platform suffix out of storage leaves the labelling free to change without a migration,
+        /// and <see cref="ExtractorKey"/> already carries what the suffix is built from.
+        /// </remarks>
+        public string? Channels { get; set; }
+
+        /// <summary>
         /// The remote URL for the video thumbnail that was last published to Jellyfin. Compared against the
         /// current URL to decide whether the artwork must be re-pointed; Jellyfin caches the image
         /// locally and keeps no record of its origin.
