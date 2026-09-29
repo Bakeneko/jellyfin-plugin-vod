@@ -5,6 +5,7 @@ using System.Net.Http;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Plugin.VOD.Configuration;
 using Jellyfin.Plugin.VOD.Data;
 using Jellyfin.Plugin.VOD.Data.Models;
 using Jellyfin.Plugin.VOD.Services;
@@ -256,13 +257,13 @@ namespace Jellyfin.Plugin.VOD.Controllers
         /// <returns>Library names, sorted for display.</returns>
         /// <remarks>
         /// The configuration page offers these instead of a free-text field: a name that does not
-        /// match a library exactly makes every sync fail in ResolveAnchor, and the error only
+        /// match a library exactly makes every sync fail in ResolveTarget, and the error only
         /// surfaces when the scheduled task next runs.
         /// </remarks>
         [HttpGet("libraries")]
         [Authorize(Policy = Policies.RequiresElevation)]
-        public ActionResult<IReadOnlyList<string>> GetLibraries()
-            => Ok(ProjectLibraryNames(_libraryManager.GetVirtualFolders()));
+        public ActionResult<IReadOnlyList<LibraryOption>> GetLibraries()
+            => Ok(ProjectLibraryOptions(_libraryManager.GetVirtualFolders()));
 
         /// <summary>
         /// Returns whether a caller-supplied URL is safe to hand to yt-dlp.
@@ -280,16 +281,24 @@ namespace Jellyfin.Plugin.VOD.Controllers
                && (parsed.Scheme == Uri.UriSchemeHttp || parsed.Scheme == Uri.UriSchemeHttps);
 
         /// <summary>
-        /// Reduces Jellyfin's virtual folders to the names the configuration page offers.
+        /// Reduces Jellyfin's virtual folders to the options the configuration page offers.
         /// </summary>
         /// <param name="folders">The libraries Jellyfin knows about.</param>
-        /// <returns>Usable library names, sorted for display; never null.</returns>
-        internal static IReadOnlyList<string> ProjectLibraryNames(
+        /// <returns>Usable libraries, sorted for display; never null.</returns>
+        /// <remarks>
+        /// The acceptance flags are computed here rather than in the page, so the rule deciding which
+        /// library may hold what lives in one place and can be tested.
+        /// </remarks>
+        internal static IReadOnlyList<LibraryOption> ProjectLibraryOptions(
             IEnumerable<VirtualFolderInfo> folders)
             => folders
-                .Select(folder => folder.Name)
-                .Where(name => !string.IsNullOrWhiteSpace(name))
-                .OrderBy(name => name, StringComparer.CurrentCultureIgnoreCase)
+                .Where(folder => !string.IsNullOrWhiteSpace(folder.Name))
+                .OrderBy(folder => folder.Name, StringComparer.CurrentCultureIgnoreCase)
+                .Select(folder => new LibraryOption(
+                    folder.Name,
+                    folder.CollectionType?.ToString(),
+                    LibraryTypeRules.AcceptsMovies(folder.CollectionType),
+                    LibraryTypeRules.AcceptsSeries(folder.CollectionType)))
                 .ToList();
 
         /// <summary>
@@ -303,31 +312,74 @@ namespace Jellyfin.Plugin.VOD.Controllers
         /// </remarks>
         [HttpGet("sources/status")]
         [Authorize(Policy = Policies.RequiresElevation)]
-        public ActionResult<SourcesStatus> GetSourcesStatus()
+        public async Task<ActionResult<SourcesStatus>> GetSourcesStatus(CancellationToken cancellationToken)
         {
-            var libraryName = Plugin.Instance?.Configuration.LibraryName ?? string.Empty;
-            string? libraryError = null;
-
-            if (string.IsNullOrWhiteSpace(libraryName))
+            var config = Plugin.Instance?.Configuration;
+            IReadOnlyList<LibraryStatus> libraries;
+            if (config is null)
             {
-                libraryError = "No library is configured.";
+                libraries = [];
             }
             else
             {
-                try
-                {
-                    _publisher.ResolveAnchor(libraryName);
-                }
-                catch (InvalidOperationException ex)
-                {
-                    libraryError = ex.Message;
-                }
+                libraries =
+                [
+                    await ResolveLibraryStatusAsync(config, SourceMode.Movies, cancellationToken).ConfigureAwait(false),
+                    await ResolveLibraryStatusAsync(config, SourceMode.Series, cancellationToken).ConfigureAwait(false),
+                ];
             }
 
-            return Ok(new SourcesStatus(
-                libraryName,
-                libraryError,
-                ProjectSourceStatus(_db.GetAllSources())));
+            return Ok(new SourcesStatus(libraries, ProjectSourceStatus(_db.GetAllSources())));
+        }
+
+        /// <summary>Resolves one library role live and reduces it to what the page shows.</summary>
+        private async Task<LibraryStatus> ResolveLibraryStatusAsync(
+            PluginConfiguration config, SourceMode mode, CancellationToken cancellationToken)
+        {
+            var role = LibraryRouting.RoleFor(mode);
+            var name = LibraryRouting.NameFor(config, mode);
+            var needed = LibraryRouting.IsNeeded(config, mode);
+
+            if (string.IsNullOrWhiteSpace(name))
+                return ProjectLibraryStatus(role, name, needed, null, $"No {role} library is configured.");
+
+            try
+            {
+                var target = await _publisher.PrepareTargetAsync(name, cancellationToken).ConfigureAwait(false);
+                return ProjectLibraryStatus(role, name, needed, target.CollectionType, null);
+            }
+            catch (InvalidOperationException ex)
+            {
+                return ProjectLibraryStatus(role, name, needed, null, ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Reduces one resolved library role to the row the configuration page shows.
+        /// </summary>
+        /// <param name="role">The setting this row describes.</param>
+        /// <param name="name">The configured name.</param>
+        /// <param name="needed">Whether an enabled source publishes into it.</param>
+        /// <param name="collectionType">Its collection type, or null when it did not resolve.</param>
+        /// <param name="error">Why it cannot be published into, or null.</param>
+        /// <returns>The row, with a type warning added when the type does not fit the role.</returns>
+        internal static LibraryStatus ProjectLibraryStatus(
+            string role, string name, bool needed, CollectionTypeOptions? collectionType, string? error)
+        {
+            // A library that did not resolve has no type worth judging, and a second message would
+            // only bury the one that matters.
+            if (error is not null)
+                return new LibraryStatus(role, name, needed, error, null);
+
+            var accepts = string.Equals(role, LibraryRouting.MoviesRole, StringComparison.Ordinal)
+                ? LibraryTypeRules.AcceptsMovies(collectionType)
+                : LibraryTypeRules.AcceptsSeries(collectionType);
+
+            var warning = accepts
+                ? null
+                : $"Library '{name}' is typed {collectionType} and will display {role} badly.";
+
+            return new LibraryStatus(role, name, needed, null, warning);
         }
 
         /// <summary>

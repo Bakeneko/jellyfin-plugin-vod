@@ -43,7 +43,7 @@ namespace Jellyfin.Plugin.VOD.Data
         /// Schema version this build expects, tracked in SQLite's <c>user_version</c>.
         /// Bump it and add the matching case to <see cref="Migrate"/> whenever the schema changes.
         /// </summary>
-        private const int SchemaVersion = 3;
+        private const int SchemaVersion = 4;
 
         /// <inheritdoc />
         public void EnsureCreated()
@@ -148,6 +148,17 @@ namespace Jellyfin.Plugin.VOD.Data
                         """;
                     break;
 
+                case 4:
+                    // No backfill: there is no honest value to invent for a row that predates the
+                    // column. Null means "unknown", and the sweep falls back to the configured
+                    // libraries, which is the best effort that existed before it.
+                    cmd.CommandText = """
+                        ALTER TABLE sources ADD COLUMN published_anchor_id TEXT;
+
+                        PRAGMA user_version = 4;
+                        """;
+                    break;
+
                 default:
                     throw new InvalidOperationException(
                         $"No migration defined for schema version {version}");
@@ -172,10 +183,10 @@ namespace Jellyfin.Plugin.VOD.Data
                 cmd.CommandText = """
                     INSERT INTO sources
                         (url, name, series_thumbnail_url, series_banner_url, tags, series_synopsis,
-                         last_synced_at, last_error, video_count)
+                         last_synced_at, last_error, video_count, published_anchor_id)
                     VALUES
                         ($url, $name, $thumbnailUrl, $bannerUrl, $tags, $synopsis,
-                         $lastSyncedAt, $lastError, $videoCount)
+                         $lastSyncedAt, $lastError, $videoCount, $publishedAnchorId)
                     ON CONFLICT(url) DO UPDATE SET
                         name                 = excluded.name,
                         series_thumbnail_url = excluded.series_thumbnail_url,
@@ -184,7 +195,8 @@ namespace Jellyfin.Plugin.VOD.Data
                         series_synopsis      = excluded.series_synopsis,
                         last_synced_at       = excluded.last_synced_at,
                         last_error           = excluded.last_error,
-                        video_count          = excluded.video_count;
+                        video_count          = excluded.video_count,
+                        published_anchor_id  = excluded.published_anchor_id;
                     """;
                 cmd.Parameters.AddWithValue("$url", source.Url);
                 cmd.Parameters.AddWithValue("$name", (object?)source.Name ?? DBNull.Value);
@@ -195,6 +207,9 @@ namespace Jellyfin.Plugin.VOD.Data
                 cmd.Parameters.AddWithValue("$lastSyncedAt", (object?)source.LastSyncedAt?.ToString("O") ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$lastError", (object?)source.LastError ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$videoCount", source.VideoCount);
+                cmd.Parameters.AddWithValue(
+                    "$publishedAnchorId",
+                    (object?)source.PublishedAnchorId?.ToString("N") ?? DBNull.Value);
                 cmd.ExecuteNonQuery();
             }
         }
@@ -503,6 +518,12 @@ namespace Jellyfin.Plugin.VOD.Data
                 return s is null ? null : DateTimeOffset.Parse(s, null, System.Globalization.DateTimeStyles.RoundtripKind);
             }
 
+            Guid? G(string col)
+            {
+                var s = S(col);
+                return s is not null && Guid.TryParse(s, out var id) ? id : null;
+            }
+
             return new SourceRecord
             {
                 Url = r.GetString(r.GetOrdinal("url")),
@@ -515,7 +536,8 @@ namespace Jellyfin.Plugin.VOD.Data
                 SeriesSynopsis = S("series_synopsis"),
                 LastSyncedAt = D("last_synced_at"),
                 LastError = S("last_error"),
-                VideoCount = r.GetInt32(r.GetOrdinal("video_count"))
+                VideoCount = r.GetInt32(r.GetOrdinal("video_count")),
+                PublishedAnchorId = G("published_anchor_id")
             };
         }
 

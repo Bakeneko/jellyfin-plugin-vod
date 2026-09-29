@@ -45,41 +45,106 @@ namespace Jellyfin.Plugin.VOD.Tests.Controllers
             => Assert.True(VodController.IsProbeableUrl(url));
 
         [Fact]
-        public void ProjectLibraryNames_SortsForDisplay()
+        public void ProjectLibraryOptions_SortsForDisplay()
         {
-            var names = VodController.ProjectLibraryNames(
+            var options = VodController.ProjectLibraryOptions(
             [
                 new VirtualFolderInfo { Name = "VOD" },
-                new VirtualFolderInfo { Name = "Films" },
-                new VirtualFolderInfo { Name = "Séries" }
+                new VirtualFolderInfo { Name = "Films", CollectionType = CollectionTypeOptions.movies },
+                new VirtualFolderInfo { Name = "Séries", CollectionType = CollectionTypeOptions.tvshows }
             ]);
 
             // Asserting "sorted", not a particular collation: CurrentCulture ordering is what
             // the UI wants, but pinning its exact output would make the test hostage to the CI
             // machine's locale.
+            var names = options.Select(o => o.Name).ToList();
             Assert.Equal(names.OrderBy(n => n, StringComparer.CurrentCultureIgnoreCase), names);
-            Assert.Equal(3, names.Count);
+            Assert.Equal(3, options.Count);
         }
 
         [Fact]
-        public void ProjectLibraryNames_ReturnsEmptyRatherThanNull_WhenNoLibraryExists()
+        public void ProjectLibraryOptions_ReturnsEmptyRatherThanNull_WhenNoLibraryExists()
         {
-            // The configuration page feeds this straight into a <select>; a null would break the
+            // The configuration page feeds this straight into two <select>s; a null would break the
             // page rather than show an empty dropdown.
-            Assert.Empty(VodController.ProjectLibraryNames([]));
+            Assert.Empty(VodController.ProjectLibraryOptions([]));
         }
 
         [Fact]
-        public void ProjectLibraryNames_SkipsALibraryWithNoUsableName()
+        public void ProjectLibraryOptions_SkipsALibraryWithNoUsableName()
         {
-            var names = VodController.ProjectLibraryNames(
+            var options = VodController.ProjectLibraryOptions(
             [
                 new VirtualFolderInfo { Name = "VOD" },
                 new VirtualFolderInfo { Name = "   " },
                 new VirtualFolderInfo { Name = null! }
             ]);
 
-            Assert.Equal(new[] { "VOD" }, names);
+            Assert.Equal(new[] { "VOD" }, options.Select(o => o.Name));
+        }
+
+        [Fact]
+        public void ProjectLibraryOptions_CarriesTheAcceptanceOfEachType()
+        {
+            // The page holds no type rule of its own: it filters each selector on these two flags.
+            var options = VodController.ProjectLibraryOptions(
+            [
+                new VirtualFolderInfo { Name = "Films", CollectionType = CollectionTypeOptions.movies },
+                new VirtualFolderInfo { Name = "Mixte" },
+                new VirtualFolderInfo { Name = "Musique", CollectionType = CollectionTypeOptions.music },
+                new VirtualFolderInfo { Name = "Séries", CollectionType = CollectionTypeOptions.tvshows }
+            ]).ToDictionary(o => o.Name, StringComparer.Ordinal);
+
+            Assert.True(options["Films"].AcceptsMovies);
+            Assert.False(options["Films"].AcceptsSeries);
+            Assert.False(options["Séries"].AcceptsMovies);
+            Assert.True(options["Séries"].AcceptsSeries);
+
+            // Only a mixed library appears in both selectors — the invariant the whole design rests on.
+            Assert.True(options["Mixte"].AcceptsMovies && options["Mixte"].AcceptsSeries);
+            Assert.Null(options["Mixte"].CollectionType);
+
+            Assert.False(options["Musique"].AcceptsMovies || options["Musique"].AcceptsSeries);
+            Assert.Equal("music", options["Musique"].CollectionType);
+        }
+
+        [Fact]
+        public void ProjectLibraryStatus_ReportsNothingWrongForAMatchingType()
+        {
+            var status = VodController.ProjectLibraryStatus(
+                "series", "Séries", needed: true, CollectionTypeOptions.tvshows, error: null);
+
+            Assert.Equal("series", status.Role);
+            Assert.Equal("Séries", status.Name);
+            Assert.True(status.Needed);
+            Assert.Null(status.Error);
+            Assert.Null(status.Warning);
+        }
+
+        [Fact]
+        public void ProjectLibraryStatus_WarnsButDoesNotErrorOnAMismatchedType()
+        {
+            // Review focus 5: a type that does not fit is cosmetic — it corrupts nothing — so it
+            // must not become an error, which under all-or-nothing would stop every source.
+            var status = VodController.ProjectLibraryStatus(
+                "series", "Musique", needed: true, CollectionTypeOptions.music, error: null);
+
+            Assert.Null(status.Error);
+            Assert.NotNull(status.Warning);
+            Assert.Contains("Musique", status.Warning, StringComparison.Ordinal);
+        }
+
+        [Fact]
+        public void ProjectLibraryStatus_KeepsTheErrorAndSkipsTheTypeCheck()
+        {
+            // A library that does not resolve has no type to judge, and a second message about its
+            // type would only bury the one that matters.
+            var status = VodController.ProjectLibraryStatus(
+                "movies", string.Empty, needed: true, collectionType: null,
+                error: "No movies library is configured.");
+
+            Assert.Equal("No movies library is configured.", status.Error);
+            Assert.Null(status.Warning);
         }
 
         [Fact]

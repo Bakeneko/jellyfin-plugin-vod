@@ -45,5 +45,17 @@ namespace Jellyfin.Plugin.VOD.Data.Models
 
         /// <summary>Gets or sets the count of videos currently synced for this source.</summary>
         public int VideoCount { get; set; }
+
+        /// <summary>
+        /// Gets or sets the id of the anchor folder this source last published into, or null when it
+        /// has never published or predates the column.
+        /// </summary>
+        /// <remarks>
+        /// Read at the start of a sync and of a retirement, to know where else this source's items may
+        /// still be. It covers the one case the two configured libraries cannot: changing a source's
+        /// mode AND its library in the same edit leaves the old target as neither of them. Null is not
+        /// an error — the sweep then falls back to the configured libraries.
+        /// </remarks>
+        public Guid? PublishedAnchorId { get; set; }
     }
 }

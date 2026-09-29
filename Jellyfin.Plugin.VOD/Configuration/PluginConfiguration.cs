@@ -30,21 +30,34 @@ namespace Jellyfin.Plugin.VOD.Configuration
         // ── Library ──────────────────────────────────────────────────────────────
 
         /// <summary>
-        /// Gets or sets the name of the Jellyfin library to publish into.
-        /// The library must exist and have been scanned at least once.
+        /// Gets or sets the name of the Jellyfin library sources in <see cref="SourceMode.Movies"/>
+        /// publish into. Empty means no library is configured for that role.
         /// </summary>
-        public string LibraryName { get; set; } = "VOD";
+        /// <remarks>
+        /// May name the same library as <see cref="SeriesLibraryName"/>. That only means one target
+        /// for both kinds; whether that library is MIXED is decided by its collection type, never by
+        /// the two names being equal.
+        /// </remarks>
+        public string MoviesLibraryName { get; set; } = "VOD";
+
+        /// <summary>
+        /// Gets or sets the name of the Jellyfin library sources in <see cref="SourceMode.Series"/>
+        /// publish into. Empty means no library is configured for that role.
+        /// </summary>
+        public string SeriesLibraryName { get; set; } = "VOD";
 
         /// <summary>
         /// Gets or sets a value indicating whether the published date added is the video's release
         /// date instead of the date the plugin first saw it.
         /// </summary>
         /// <remarks>
-        /// For a MIXED library (movies and series in one), where Jellyfin's default view makes
-        /// recently added episodes hard to find. Turning it on makes "date added" sort
-        /// chronologically by publication; the cost is that a channel added today but active for
-        /// years will never surface in "recently added", because its videos carry their old release
-        /// dates. Reversible either way: nothing is overwritten, the published date is recomputed.
+        /// Only takes effect on a MIXED target — one whose collection type is null or "mixed" —
+        /// because the problem it works around, Jellyfin defaulting such a library to the "Folders"
+        /// view, exists nowhere else. Turning it on makes "date added" sort chronologically by
+        /// publication; the cost is that a channel added today but active for years will never
+        /// surface in "recently added", because its videos carry their old release dates. Reversible
+        /// either way: nothing is overwritten, the published date is recomputed. Re-typing a mixed
+        /// library therefore recomputes the dates back on the next pass.
         /// </remarks>
         public bool UseReleaseDateAsDateAdded { get; set; }
 

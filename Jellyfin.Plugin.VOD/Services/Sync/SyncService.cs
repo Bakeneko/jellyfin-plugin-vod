@@ -53,19 +53,27 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// failed sync leaves <see cref="SourceRecord.LastSyncedAt"/> untouched, the per-source
         /// throttle never engages and that cost repeats on every wake-up.
         /// </remarks>
+        /// <param name="config">The current plugin configuration.</param>
         /// <param name="cancellationToken">A token to cancel the operation.</param>
         /// <returns>A task that completes once the library is ready to publish into.</returns>
         /// <exception cref="InvalidOperationException">
         /// Thrown when the library cannot be resolved or indexed.
         /// </exception>
-        public async Task PrepareLibraryAsync(CancellationToken cancellationToken)
+        public async Task PrepareLibraryAsync(
+            PluginConfiguration config, CancellationToken cancellationToken)
         {
-            var config = Plugin.Instance?.Configuration;
-            if (config is null || string.IsNullOrWhiteSpace(config.LibraryName))
-                return;
+            ArgumentNullException.ThrowIfNull(config);
 
-            await _publisher.PrepareAnchorAsync(config.LibraryName, cancellationToken)
-                .ConfigureAwait(false);
+            foreach (var (role, name) in LibraryRouting.NeededLibraries(config))
+            {
+                // Named by role rather than by value: there is no name to quote, and
+                // "No library named ''." tells the administrator nothing about which of the two
+                // settings is blank.
+                if (string.IsNullOrWhiteSpace(name))
+                    throw new InvalidOperationException($"No {role} library is configured.");
+
+                await _publisher.PrepareTargetAsync(name, cancellationToken).ConfigureAwait(false);
+            }
         }
 
         /// <summary>
@@ -74,19 +82,20 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// </summary>
         /// <remarks>
         /// Runs ahead of the per-source loop, because that loop only ever reads the configuration and
-        /// would never look at a source no longer in it. <see cref="PrepareLibraryAsync"/> runs
-        /// earlier still, so the anchor is known to resolve by the time this is reached. A source with
-        /// <c>Enabled = false</c> is NOT retired — it is paused, and its items stay: deletion cascades
-        /// to the user's watch history, which recreating the item does not bring back, so a cleared
-        /// checkbox must not destroy data.
+        /// would never look at a source no longer in it. A source with <c>Enabled = false</c> is NOT
+        /// retired — it is paused, and its items stay: deletion cascades to the user's watch history,
+        /// which recreating the item does not bring back, so a cleared checkbox must not destroy data.
+        /// <para>
+        /// Synchronous: nothing it does awaits. Keeping it <c>async</c> without an <c>await</c> would
+        /// be CS1998, which this project turns into a build error.
+        /// </para>
         /// </remarks>
+        /// <param name="config">The plugin configuration this pass runs against.</param>
         /// <param name="cancellationToken">A token to cancel the operation.</param>
         /// <returns>The number of sources retired.</returns>
-        public async Task<int> RetireRemovedSourcesAsync(CancellationToken cancellationToken)
+        public int RetireRemovedSources(PluginConfiguration config, CancellationToken cancellationToken)
         {
-            var config = Plugin.Instance?.Configuration;
-            if (config is null || string.IsNullOrWhiteSpace(config.LibraryName))
-                return 0;
+            ArgumentNullException.ThrowIfNull(config);
 
             // Every configured source, enabled or not — only absence from the configuration retires.
             var configured = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -103,58 +112,69 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             if (retired.Count == 0)
                 return 0;
 
-            // Unreachable on the scheduled path, where PrepareLibraryAsync has already resolved this
-            // same anchor and returned before the task got here. Kept because it is free and this
-            // method is public: a caller that skips that preparation, or a library deleted between
-            // the two calls, must skip retirement rather than throw. Throwing would escape
-            // SyncTask.ExecuteAsync, which catches nothing, and kill the whole scheduled task.
-            Folder anchor;
-            try
+            // Both configured libraries: a removed source's mode is gone from the configuration, so
+            // its items can be in either one. Best effort — one that no longer resolves is skipped.
+            var configuredAnchors = new List<Folder>();
+            foreach (var name in LibraryRouting.ConfiguredNames(config))
             {
-                anchor = _publisher.ResolveAnchor(config.LibraryName);
-            }
-            catch (InvalidOperationException ex)
-            {
-                LogRetirementSkipped(config.LibraryName, ex.Message);
-                return 0;
+                try
+                {
+                    configuredAnchors.Add(_publisher.ResolveTarget(name).Anchor);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    LogSweepAnchorUnavailable(name, ex.Message);
+                }
             }
 
+            var count = 0;
             foreach (var record in retired)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                // Rows first: the orphan loop spares any video the database still knows, so
-                // reconciling before the purge would leave every item exactly where it is.
+                // Read BEFORE the row is deleted: it is the only thing that knows where a source
+                // published when that library is neither of the two currently configured.
+                var anchors = new List<Folder>(configuredAnchors);
+                if (record.PublishedAnchorId is { } anchorId
+                    && _publisher.FindAnchorById(anchorId) is { } stored)
+                {
+                    anchors.Add(stored);
+                }
+
+                if (anchors.Count == 0)
+                {
+                    LogRetirementSkipped(record.Url);
+                    continue;
+                }
+
+                // Rows first: the purge spares any video the database still knows, so purging before
+                // the row is gone would leave every item exactly where it is.
                 _db.DeleteSource(record.Url);
 
-                // An empty expectation deletes the source's items and, through the container
-                // reconciliation, its series and seasons. The mode no longer exists in the
-                // configuration, but it does not matter: with nothing expected, the Series branch
-                // finds a series to reap or finds none, and the Movies branch reaps nothing.
-                await _publisher.ReconcileAsync(
-                        anchor, record, SourceMode.Series, record.Name ?? record.Url,
-                        [],
-                        _db.GetAllVideoIds().ToHashSet(StringComparer.OrdinalIgnoreCase),
-                        // Nothing is expected, so no date is derived and the flag cannot matter.
-                        config.LocalBaseUrl, useReleaseDateAsDateAdded: false, cancellationToken)
-                    .ConfigureAwait(false);
+                _publisher.PurgeSource(
+                    anchors, record, _db.GetAllVideoIds().ToHashSet(StringComparer.OrdinalIgnoreCase));
 
                 LogRetiredSource(record.Url);
+                count++;
             }
 
-            return retired.Count;
+            return count;
         }
 
         /// <summary>
         /// Performs a full sync for one source. Updates <see cref="SourceRecord"/> in the database
         /// with the outcome (success or error) regardless of whether the sync succeeds.
         /// </summary>
+        /// <param name="config">The current plugin configuration.</param>
         /// <param name="source">The source to sync.</param>
         /// <param name="cancellationToken">A token to cancel the operation.</param>
-        public async Task SyncSourceAsync(SourceDefinition source, CancellationToken cancellationToken)
+        public async Task SyncSourceAsync(
+            PluginConfiguration config, SourceDefinition source, CancellationToken cancellationToken)
         {
-            var config = Plugin.Instance?.Configuration;
-            if (config is null || string.IsNullOrWhiteSpace(config.LibraryName))
+            ArgumentNullException.ThrowIfNull(config);
+            ArgumentNullException.ThrowIfNull(source);
+
+            if (string.IsNullOrWhiteSpace(LibraryRouting.NameFor(config, source.Mode)))
             {
                 LogSkippedNoConfig(source.Url);
                 return;
@@ -317,13 +337,14 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
             // Step 7b: publish items to the Jellyfin library.
             // Resolved per sync: fails loudly when the library is missing or unscanned.
-            var anchor = _publisher.ResolveAnchor(config.LibraryName);
+            var target = _publisher.ResolveTarget(LibraryRouting.NameFor(config, source.Mode));
+            var otherAnchors = SweepAnchorsFor(config, source, sourceRecord);
 
             // Publication is driven by what the database holds, not by what this pass happened
             // to re-fetch: entries already known are deliberately skipped for metadata, and
             // would otherwise never reach the library.
             await _publisher.ReconcileAsync(
-                    anchor, sourceRecord, source.Mode, seriesName,
+                    target, otherAnchors, sourceRecord, source.Mode, seriesName,
                     _db.GetVideosBySource(source.Url),
                     _db.GetAllVideoIds().ToHashSet(StringComparer.OrdinalIgnoreCase),
                     config.LocalBaseUrl, config.UseReleaseDateAsDateAdded, ct)
@@ -334,6 +355,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             sourceRecord.LastSyncedAt = DateTimeOffset.UtcNow;
             sourceRecord.LastError = null;
             sourceRecord.VideoCount = videoCount;
+            sourceRecord.PublishedAnchorId = target.Anchor.Id;
             _db.UpsertSource(sourceRecord);
 
             LogSyncFinished(source.Url, videoCount);
@@ -641,8 +663,49 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             Message = "Retired {SourceUrl}: no longer in the configuration, its items and rows are gone")]
         private partial void LogRetiredSource(string sourceUrl);
 
-        [LoggerMessage(EventId = 12, Level = LogLevel.Error,
-            Message = "Sync: cannot retire removed sources — library '{LibraryName}' is unavailable: {Reason}")]
-        private partial void LogRetirementSkipped(string libraryName, string reason);
+        [LoggerMessage(EventId = 12, Level = LogLevel.Warning,
+            Message = "Sync: cannot retire {SourceUrl} — no configured library resolves")]
+        private partial void LogRetirementSkipped(string sourceUrl);
+
+        /// <summary>
+        /// The anchors other than the target that may still hold this source's items.
+        /// </summary>
+        /// <remarks>
+        /// Best effort by design: an anchor that no longer resolves is simply absent, because it only
+        /// ever serves cleanup. The stored anchor covers the one case the other configured library
+        /// cannot — changing a source's mode AND its library in the same edit leaves the old target as
+        /// neither of the two currently configured.
+        /// </remarks>
+        private List<Folder> SweepAnchorsFor(
+            PluginConfiguration config, SourceDefinition source, SourceRecord record)
+        {
+            var anchors = new List<Folder>();
+
+            var otherMode = source.Mode == SourceMode.Movies ? SourceMode.Series : SourceMode.Movies;
+            var otherName = LibraryRouting.NameFor(config, otherMode);
+            if (!string.IsNullOrWhiteSpace(otherName))
+            {
+                try
+                {
+                    anchors.Add(_publisher.ResolveTarget(otherName).Anchor);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    LogSweepAnchorUnavailable(otherName, ex.Message);
+                }
+            }
+
+            if (record.PublishedAnchorId is { } anchorId
+                && _publisher.FindAnchorById(anchorId) is { } stored)
+            {
+                anchors.Add(stored);
+            }
+
+            return anchors;
+        }
+
+        [LoggerMessage(EventId = 14, Level = LogLevel.Debug,
+            Message = "Sync: not sweeping library '{LibraryName}', it does not resolve: {Reason}")]
+        private partial void LogSweepAnchorUnavailable(string libraryName, string reason);
     }
 }

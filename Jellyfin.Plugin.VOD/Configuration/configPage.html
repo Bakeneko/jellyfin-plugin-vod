@@ -58,19 +58,30 @@
                         </div>
                     </div>
 
-                    <h2>Library</h2>
+                    <h2>Libraries</h2>
 
                     <div class="inputContainer">
-                        <label class="inputLabel inputLabelUnfocused" for="libraryName">Library name</label>
-                        <select id="libraryName" name="LibraryName"
+                        <label class="inputLabel inputLabelUnfocused" for="moviesLibraryName">Movies library</label>
+                        <select id="moviesLibraryName" name="MoviesLibraryName"
                                 is="emby-select" class="emby-select">
                         </select>
                         <div class="fieldDescription">
-                            Name of the Jellyfin library to publish VOD items into. The library must
-                            exist, but it does not need to have been scanned. A small
-                            <code>.keep</code> file is written into its folder, because Jellyfin
-                            skips a library folder that holds no files at all. Prefer a library of
-                            its own over one that already holds your media.
+                            Where sources set to "Movies" publish. Only libraries that can hold movies
+                            are listed — a movies library, or a mixed one.
+                        </div>
+                    </div>
+
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="seriesLibraryName">Series library</label>
+                        <select id="seriesLibraryName" name="SeriesLibraryName"
+                                is="emby-select" class="emby-select">
+                        </select>
+                        <div class="fieldDescription">
+                            Where sources set to "Series" publish. Pick the same library as above to
+                            keep everything together — a library that can hold both is a mixed one.
+                            Each library must exist, but needs no scan: a small <code>.keep</code>
+                            file is written into its folder, because Jellyfin skips a library folder
+                            that holds no files at all.
                         </div>
                     </div>
 
@@ -81,11 +92,13 @@
                             <span>Use the release date as the date added</span>
                         </label>
                         <div class="fieldDescription checkboxFieldDescription">
-                            For a mixed library, so sorting by date added follows publication order.
-                            Note the trade-off: a channel you add today but which has been running for
-                            years will never appear in "Recently added", because its videos keep their
-                            old release dates. You can turn this back off at any time — nothing is
-                            overwritten.
+                            Applies to a mixed library only, so sorting by date added follows
+                            publication order. It has no effect on a movies-only or series-only
+                            library, where the view is already right. Note the trade-off: a channel
+                            you add today but which has been running for years will never appear in
+                            "Recently added", because its videos keep their old release dates. You can
+                            turn this back off at any time — nothing is overwritten. Re-typing a mixed
+                            library has the same effect as turning it off.
                         </div>
                     </div>
 
@@ -150,6 +163,9 @@
                     <div id="libraryAlert"
                          style="display:none;margin:1em 0;padding:8px 12px;border-radius:4px;
                                 background:#7a1f1f;color:#fff"></div>
+                    <div id="libraryWarning"
+                         style="display:none;margin:1em 0;padding:8px 12px;border-radius:4px;
+                                background:#7a5a1f;color:#fff"></div>
 
                     <h2>Sources</h2>
                     <p class="fieldDescription">
@@ -342,16 +358,27 @@
 
             function applyStatus(status) {
                 var alert = document.getElementById('libraryAlert');
-                if (status.LibraryError) {
-                    // Set through textContent, not innerHTML: the message carries a library name
-                    // the administrator typed.
-                    alert.textContent = 'Library "' + status.LibraryName + '" cannot be used: '
-                        + status.LibraryError
-                        + ' No source can sync until this is fixed.';
-                    alert.style.display = '';
-                } else {
-                    alert.style.display = 'none';
-                }
+                var warning = document.getElementById('libraryWarning');
+                var libraries = status.Libraries || [];
+
+                var errors = libraries
+                    .filter(function (l) { return l.Error && l.Needed; })
+                    .map(function (l) {
+                        return 'The ' + l.Role + ' library "' + l.Name + '" cannot be used: ' + l.Error;
+                    });
+
+                // Set through textContent, not innerHTML: the messages carry library names the
+                // administrator typed.
+                alert.textContent = errors.length
+                    ? errors.join(' ') + ' No source can sync until this is fixed.'
+                    : '';
+                alert.style.display = errors.length ? '' : 'none';
+
+                var warnings = libraries
+                    .filter(function (l) { return l.Warning; })
+                    .map(function (l) { return l.Warning; });
+                warning.textContent = warnings.join(' ');
+                warning.style.display = warnings.length ? '' : 'none';
 
                 // Object.create(null): a bare literal inherits truthy __proto__ and
                 // constructor keys, which a lookup by URL would read as real rows.
@@ -411,46 +438,68 @@
                 select.appendChild(option);
             }
 
-            function populateLibraries(configuredName) {
-                var select = document.getElementById('libraryName');
+            function fillLibrarySelect(select, options, configuredName) {
+                select.innerHTML = '';
+                var wanted = configuredName || 'VOD';
+                var matched = false;
+
+                options.forEach(function (option) {
+                    var el = document.createElement('option');
+                    el.value = option.Name;
+                    el.textContent = option.CollectionType
+                        ? option.Name + ' (' + option.CollectionType + ')'
+                        : option.Name + ' (mixed)';
+                    // Case-insensitive, like the server's own library lookup: a configured name
+                    // differing only in case is the same library, and selecting it here rewrites
+                    // the stored value to the library's real spelling on the next save.
+                    if (option.Name.toLowerCase() === wanted.toLowerCase()) {
+                        el.selected = true;
+                        matched = true;
+                    }
+                    select.appendChild(el);
+                });
+
+                if (!matched) {
+                    // The configured library was renamed, deleted, or is now typed for the other
+                    // role. Showing it as a marked option keeps the mistake visible; dropping it
+                    // would silently republish the whole library somewhere else on the next save.
+                    var stale = document.createElement('option');
+                    stale.value = wanted;
+                    stale.textContent = wanted + ' (not found)';
+                    stale.selected = true;
+                    select.insertBefore(stale, select.firstChild);
+                }
+            }
+
+            function populateLibraries(config) {
+                var movies = document.getElementById('moviesLibraryName');
+                var series = document.getElementById('seriesLibraryName');
                 return ApiClient.ajax({
                     url: ApiClient.getUrl('VOD/libraries'),
                     type: 'GET',
                     dataType: 'json'
-                }).then(function (names) {
-                    select.innerHTML = '';
-                    var wanted = configuredName || 'VOD';
-                    var matched = false;
-
-                    (names || []).forEach(function (name) {
-                        var option = document.createElement('option');
-                        option.value = name;
-                        option.textContent = name;
-                        if (name === wanted) { option.selected = true; matched = true; }
-                        select.appendChild(option);
-                    });
-
-                    if (!matched) {
-                        // The configured library was renamed or deleted. Showing it as a marked
-                        // option keeps the mistake visible; dropping it would silently republish
-                        // the whole library somewhere else on the next save.
-                        var stale = document.createElement('option');
-                        stale.value = wanted;
-                        stale.textContent = wanted + ' (not found)';
-                        stale.selected = true;
-                        select.insertBefore(stale, select.firstChild);
-                    }
+                }).then(function (options) {
+                    var all = options || [];
+                    fillLibrarySelect(
+                        movies,
+                        all.filter(function (o) { return o.AcceptsMovies; }),
+                        config.MoviesLibraryName);
+                    fillLibrarySelect(
+                        series,
+                        all.filter(function (o) { return o.AcceptsSeries; }),
+                        config.SeriesLibraryName);
                 }).catch(function () {
-                    // Leaving the select empty would be destructive, not merely unhelpful: the
-                    // submit handler reads .value unconditionally, so an empty select writes
-                    // LibraryName = "", and both SyncSourceAsync and RetireRemovedSourcesAsync
-                    // bail on a blank name — one failed page load plus one Save switches the
-                    // plugin off. Keeping the configured name as the sole option makes Save a
-                    // no-op instead. Resolves rather than rethrows, so the chain still reaches
-                    // hideLoadingMsg.
-                    select.innerHTML = '';
-                    selectOnly(select, configuredName || 'VOD', ' (library list unavailable)');
-                    Dashboard.alert('Could not list libraries. The configured value is kept; '
+                    // Leaving a select empty would be destructive, not merely unhelpful: the submit
+                    // handler reads .value unconditionally, so an empty select writes a blank name,
+                    // and a blank name for a needed library now fails the whole pass — one failed
+                    // page load plus one Save switches the plugin off. Keeping the configured name
+                    // as the sole option makes Save a no-op instead. Resolves rather than rethrows,
+                    // so the chain still reaches hideLoadingMsg.
+                    movies.innerHTML = '';
+                    selectOnly(movies, config.MoviesLibraryName || 'VOD', ' (library list unavailable)');
+                    series.innerHTML = '';
+                    selectOnly(series, config.SeriesLibraryName || 'VOD', ' (library list unavailable)');
+                    Dashboard.alert('Could not list libraries. The configured values are kept; '
                         + 'check that you are signed in as an administrator.');
                 });
             }
@@ -475,7 +524,7 @@
                                 config.UseReleaseDateAsDateAdded || false;
                             document.getElementById('sourcesBody').innerHTML = '';
                             (config.Sources || []).forEach(addSourceRow);
-                            return populateLibraries(config.LibraryName)
+                            return populateLibraries(config)
                                 .then(refreshStatus)
                                 .then(function () { Dashboard.hideLoadingMsg(); });
                         })
@@ -497,7 +546,8 @@
                             config.JsRuntime       = document.querySelector('#jsRuntime').value;
                             config.FfmpegPath      = document.querySelector('#ffmpegPath').value;
                             config.CookiesPath     = document.querySelector('#cookiesPath').value;
-                            config.LibraryName     = document.querySelector('#libraryName').value;
+                            config.MoviesLibraryName = document.querySelector('#moviesLibraryName').value;
+                            config.SeriesLibraryName = document.querySelector('#seriesLibraryName').value;
                             config.LocalBaseUrl    = document.querySelector('#localBaseUrl').value;
                             config.CacheMinutes    = parseInt(document.querySelector('#cacheMinutes').value, 10) || 5;
                             config.MaxHeight       = parseInt(document.querySelector('#maxHeight').value, 10) || 1080;

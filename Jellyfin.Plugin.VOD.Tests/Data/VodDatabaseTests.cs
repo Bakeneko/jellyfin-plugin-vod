@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using Jellyfin.Plugin.VOD.Data;
 using Jellyfin.Plugin.VOD.Data.Models;
@@ -372,7 +373,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
             using var cmd = conn.CreateCommand();
             cmd.CommandText = "PRAGMA user_version";
 
-            Assert.Equal(3L, (long)cmd.ExecuteScalar()!);
+            Assert.Equal(4L, (long)cmd.ExecuteScalar()!);
         }
 
         [Fact]
@@ -432,7 +433,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
 
                 using var version = conn.CreateCommand();
                 version.CommandText = "PRAGMA user_version";
-                Assert.Equal(3L, (long)version.ExecuteScalar()!);
+                Assert.Equal(4L, (long)version.ExecuteScalar()!);
 
                 using var backfilled = conn.CreateCommand();
                 backfilled.CommandText = "SELECT first_seen_at FROM videos WHERE id = 'legacy'";
@@ -557,7 +558,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
 
                 using var version = conn.CreateCommand();
                 version.CommandText = "PRAGMA user_version";
-                Assert.Equal(3L, (long)version.ExecuteScalar()!);
+                Assert.Equal(4L, (long)version.ExecuteScalar()!);
 
                 using var columns = conn.CreateCommand();
                 columns.CommandText = "SELECT name FROM pragma_table_info('videos') WHERE name = 'channels'";
@@ -585,6 +586,124 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
             });
 
             Assert.Null(_db.GetVideoByUuid("uuid-no-channels")!.Channels);
+        }
+
+        [Fact]
+        public void PublishedAnchorId_RoundTripsThroughTheV4Column()
+        {
+            var anchor = Guid.NewGuid();
+            _db.UpsertSource(new SourceRecord
+            {
+                Url = "https://example.test/anchored",
+                PublishedAnchorId = anchor
+            });
+
+            Assert.Equal(anchor, _db.GetSource("https://example.test/anchored")!.PublishedAnchorId);
+        }
+
+        [Fact]
+        public void PublishedAnchorId_IsNullUntilSomethingHasBeenPublished()
+        {
+            // Null is not an error state: it means "unknown", and the sweep then falls back to the
+            // configured libraries — exactly the best effort that existed before the column.
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/fresh" });
+
+            Assert.Null(_db.GetSource("https://example.test/fresh")!.PublishedAnchorId);
+        }
+
+        [Fact]
+        public void PublishedAnchorId_SurvivesAnUpsertMadeFromAReadBackRecord()
+        {
+            // The trap this guards: SyncTask's error path reads a record, sets LastError and writes
+            // it back. If MapSource did not read the column, that round trip would silently erase
+            // the anchor and the next retirement would no longer know where to look.
+            var anchor = Guid.NewGuid();
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/rt", PublishedAnchorId = anchor });
+
+            var readBack = _db.GetSource("https://example.test/rt")!;
+            readBack.LastError = "boom";
+            _db.UpsertSource(readBack);
+
+            Assert.Equal(anchor, _db.GetSource("https://example.test/rt")!.PublishedAnchorId);
+        }
+
+        /// <summary>
+        /// A fresh database and a migrated one must agree on the shape of <c>sources</c>. The v3
+        /// review left this untested (finding P7) — a column added to the migration but forgotten in
+        /// the CREATE TABLE, or the reverse, only shows up on one of the two installation paths.
+        /// </summary>
+        [Fact]
+        public void EnsureCreated_GivesAMigratedDatabaseTheSameSourcesShapeAsAFreshOne()
+        {
+            var path = Path.GetTempFileName();
+            try
+            {
+                using (var seed = new SqliteConnection($"Data Source={path}"))
+                {
+                    seed.Open();
+                    using var cmd = seed.CreateCommand();
+                    // The v1 shape of sources, verbatim: anything less would make the comparison
+                    // below pass for the wrong reason.
+                    cmd.CommandText = """
+                        CREATE TABLE sources (
+                            url                  TEXT PRIMARY KEY,
+                            name                 TEXT,
+                            series_thumbnail_url TEXT,
+                            series_banner_url    TEXT,
+                            tags                 TEXT,
+                            published_image_url  TEXT,
+                            published_banner_url TEXT,
+                            series_synopsis      TEXT,
+                            last_synced_at       TEXT,
+                            last_error           TEXT,
+                            video_count          INTEGER NOT NULL DEFAULT 0
+                        );
+                        CREATE TABLE videos (
+                            id            TEXT PRIMARY KEY,
+                            source_url    TEXT NOT NULL,
+                            video_url     TEXT NOT NULL,
+                            synced_at     TEXT NOT NULL,
+                            channels      TEXT,
+                            first_seen_at TEXT
+                        );
+                        PRAGMA user_version = 3;
+                        """;
+                    cmd.ExecuteNonQuery();
+                }
+
+                using (var db = new VodDatabase(path, NullLogger<VodDatabase>.Instance))
+                {
+                    db.EnsureCreated();
+                }
+
+                Assert.Equal(SourceColumns(_dbPath), SourceColumns(path));
+                Assert.Contains("published_anchor_id", SourceColumns(path));
+            }
+            finally
+            {
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+        }
+
+        private static List<string> SourceColumns(string path)
+        {
+            using var conn = new SqliteConnection($"Data Source={path}");
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "PRAGMA table_info(sources)";
+            using var reader = cmd.ExecuteReader();
+
+            var columns = new List<string>();
+            while (reader.Read())
+            {
+                columns.Add(reader.GetString(reader.GetOrdinal("name")));
+            }
+
+            columns.Sort(StringComparer.Ordinal);
+            return columns;
         }
     }
 }

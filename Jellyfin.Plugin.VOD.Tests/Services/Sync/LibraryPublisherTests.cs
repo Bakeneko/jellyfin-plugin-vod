@@ -7,6 +7,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Data.Enums;
 using Jellyfin.Plugin.VOD.Configuration;
 using Jellyfin.Plugin.VOD.Data;
 using Jellyfin.Plugin.VOD.Data.Models;
@@ -79,14 +80,14 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         }
 
         [Fact]
-        public void ResolveAnchor_Throws_WhenLibraryUnknown()
+        public void ResolveTarget_Throws_WhenLibraryUnknown()
         {
             _library.GetVirtualFolders().Returns([]);
-            Assert.Throws<InvalidOperationException>(() => _publisher.ResolveAnchor("Vods"));
+            Assert.Throws<InvalidOperationException>(() => _publisher.ResolveTarget("Vods"));
         }
 
         [Fact]
-        public void ResolveAnchor_Throws_WhenPhysicalFolderMissing()
+        public void ResolveTarget_Throws_WhenPhysicalFolderMissing()
         {
             // Falling back to the CollectionFolder would publish items nothing can find —
             // the most expensive failure mode observed. It must be loud.
@@ -101,12 +102,12 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             ]);
             _library.FindByPath("/media/Vods", true).Returns((BaseItem?)null);
 
-            var ex = Assert.Throws<InvalidOperationException>(() => _publisher.ResolveAnchor("Vods"));
+            var ex = Assert.Throws<InvalidOperationException>(() => _publisher.ResolveTarget("Vods"));
             Assert.Contains("/media/Vods", ex.Message, StringComparison.Ordinal);
         }
 
         [Fact]
-        public void ResolveAnchor_ReturnsPhysicalFolder()
+        public void ResolveTarget_ReturnsPhysicalFolder()
         {
             var folder = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
             _library.GetVirtualFolders().Returns(
@@ -120,7 +121,56 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             ]);
             _library.FindByPath("/media/Vods", true).Returns(folder);
 
-            Assert.Same(folder, _publisher.ResolveAnchor("Vods"));
+            Assert.Same(folder, _publisher.ResolveTarget("Vods").Anchor);
+        }
+
+        [Theory]
+        [InlineData(null, true)]
+        [InlineData(CollectionTypeOptions.mixed, true)]
+        [InlineData(CollectionTypeOptions.movies, false)]
+        [InlineData(CollectionTypeOptions.tvshows, false)]
+        public void ResolveTarget_CarriesTheCollectionType(
+            CollectionTypeOptions? type, bool expectedMixed)
+        {
+            // Read from the same VirtualFolderInfo the location comes from, so learning the type
+            // costs no extra query.
+            var folder = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+            _library.GetVirtualFolders().Returns(
+            [
+                new VirtualFolderInfo
+                {
+                    Name = "Vods",
+                    ItemId = Guid.NewGuid().ToString("N"),
+                    Locations = ["/media/Vods"],
+                    CollectionType = type
+                }
+            ]);
+            _library.FindByPath("/media/Vods", true).Returns(folder);
+
+            var target = _publisher.ResolveTarget("Vods");
+            Assert.Equal(type, target.CollectionType);
+            Assert.Equal(expectedMixed, target.IsMixed);
+            Assert.Equal("Vods", target.LibraryName);
+        }
+
+        [Fact]
+        public void ResolveTarget_MatchesTheLibraryNameCaseInsensitively()
+        {
+            // The name is stored from a dropdown but can be edited, renamed, or carried over from an
+            // older configuration. Jellyfin's own library lookup is case-insensitive.
+            var folder = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+            _library.GetVirtualFolders().Returns(
+            [
+                new VirtualFolderInfo
+                {
+                    Name = "VODs",
+                    ItemId = Guid.NewGuid().ToString("N"),
+                    Locations = ["/media/Vods"]
+                }
+            ]);
+            _library.FindByPath("/media/Vods", true).Returns(folder);
+
+            Assert.Same(folder, _publisher.ResolveTarget("vods").Anchor);
         }
 
         [Fact]
@@ -139,7 +189,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             var source = new SourceRecord { Url = "https://example.com/source" };
 
             await _publisher.ReconcileAsync(
-                anchor, source, SourceMode.Movies, "Test",
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
                 Array.Empty<VideoRecord>(),
                 new HashSet<string> { vodId },
                 "http://localhost:8096", useReleaseDateAsDateAdded: false,
@@ -165,7 +215,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             var source = new SourceRecord { Url = "https://example.com/source" };
 
             await _publisher.ReconcileAsync(
-                anchor, source, SourceMode.Movies, "Test",
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
                 Array.Empty<VideoRecord>(),
                 new HashSet<string>(),
                 "http://localhost:8096", useReleaseDateAsDateAdded: false,
@@ -189,7 +239,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             var source = new SourceRecord { Url = "https://www.youtube.com/@arte/streams" };
 
             await _publisher.ReconcileAsync(
-                anchor, source, SourceMode.Series, "Arte",
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Series, "Arte",
                 Array.Empty<VideoRecord>(),
                 new HashSet<string>(),
                 "http://localhost:8096", useReleaseDateAsDateAdded: false,
@@ -212,7 +262,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             var source = new SourceRecord { Url = "https://www.youtube.com/@arte/streams" };
 
             await _publisher.ReconcileAsync(
-                anchor, source, SourceMode.Series, "Arte",
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Series, "Arte",
                 Array.Empty<VideoRecord>(),
                 new HashSet<string>(),
                 "http://localhost:8096", useReleaseDateAsDateAdded: false,
@@ -245,7 +295,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             };
 
             var report = await _publisher.ReconcileAsync(
-                anchor, source, SourceMode.Movies, "Test",
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
                 new[] { video },
                 new HashSet<string> { vodId },
                 "http://localhost:8096", useReleaseDateAsDateAdded: false,
@@ -282,7 +332,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
 
             var first = await _publisher.ReconcileAsync(
-                anchor, source, SourceMode.Movies, "Test",
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
                 new[] { video },
                 new HashSet<string> { vodId },
                 "http://localhost:8096", useReleaseDateAsDateAdded: false,
@@ -297,7 +347,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 .Returns(new List<BaseItem> { created });
 
             var second = await _publisher.ReconcileAsync(
-                anchor, source, SourceMode.Movies, "Test",
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
                 new[] { video },
                 new HashSet<string> { vodId },
                 "http://localhost:8096", useReleaseDateAsDateAdded: false,
@@ -333,7 +383,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
 
             await _publisher.ReconcileAsync(
-                anchor, source, SourceMode.Movies, "Test",
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
                 new[] { video },
                 new HashSet<string> { vodId },
                 "http://localhost:8096", useReleaseDateAsDateAdded: false,
@@ -346,7 +396,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             video.Title = "After";
 
             var second = await _publisher.ReconcileAsync(
-                anchor, source, SourceMode.Movies, "Test",
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
                 new[] { video },
                 new HashSet<string> { vodId },
                 "http://localhost:8096", useReleaseDateAsDateAdded: false,
@@ -422,7 +472,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 .Returns(new List<BaseItem> { created });
 
             var second = await _publisher.ReconcileAsync(
-                _studioAnchor,
+                StudioTarget, [],
                 new SourceRecord { Url = "https://example.com/source" },
                 SourceMode.Movies, "Test",
                 new[] { VideoWith(vodId, "Youtube", """["Terrapodia"]""") },
@@ -579,14 +629,14 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
 
         private Task<ReconcileReport> Republish(VideoRecord video, bool useReleaseDate)
             => _publisher.ReconcileAsync(
-                _studioAnchor, new SourceRecord { Url = "https://example.com/source" },
+                StudioTarget, [], new SourceRecord { Url = "https://example.com/source" },
                 SourceMode.Movies, "Test", new[] { video },
                 new HashSet<string> { video.Id }, "http://localhost:8096",
                 useReleaseDate, CancellationToken.None);
 
         private Task<ReconcileReport> ReconcileSeriesAsync(VideoRecord video, bool useReleaseDate)
             => _publisher.ReconcileAsync(
-                _studioAnchor, new SourceRecord { Url = "https://example.com/source" },
+                StudioTarget, [], new SourceRecord { Url = "https://example.com/source" },
                 SourceMode.Series, "Test", new[] { video },
                 new HashSet<string> { video.Id }, "http://localhost:8096",
                 useReleaseDate, CancellationToken.None);
@@ -646,6 +696,79 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             Assert.Equal(released.UtcDateTime, created.DateCreated);
         }
 
+        [Theory]
+        [InlineData(null, true)]
+        [InlineData(CollectionTypeOptions.mixed, true)]
+        [InlineData(CollectionTypeOptions.movies, false)]
+        [InlineData(CollectionTypeOptions.tvshows, false)]
+        public async Task ReconcileAsync_AppliesTheReleaseDateOnlyToAMixedTarget(
+            CollectionTypeOptions? type, bool expectRelease)
+        {
+            // The option exists because a mixed library defaults to the "Folders" view. A typed
+            // library does not have that problem, so overwriting the date added there would cost the
+            // known price — a channel active for years never surfacing in "Recently added" — and buy
+            // nothing.
+            var seen = new DateTimeOffset(2026, 9, 1, 0, 0, 0, TimeSpan.Zero);
+            var released = new DateTimeOffset(2019, 3, 3, 0, 0, 0, TimeSpan.Zero);
+
+            var video = VideoWith("3f9a2b1c-0000-0000-0000-000000000090", "Youtube", null);
+            video.FirstSeenAt = seen;
+            video.PublishedAt = released;
+
+            BaseItem? created = null;
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created = call.ArgAt<BaseItem>(0));
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", _studioAnchor, type), [],
+                new SourceRecord { Url = "https://example.com/source" },
+                SourceMode.Movies, "Test", new[] { video },
+                new HashSet<string> { video.Id }, "http://localhost:8096",
+                useReleaseDateAsDateAdded: true, CancellationToken.None);
+
+            Assert.NotNull(created);
+            Assert.Equal(
+                expectRelease ? released.UtcDateTime : seen.UtcDateTime,
+                created.DateCreated);
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_RestoresTheDateAdded_WhenAMixedLibraryIsLaterTyped()
+        {
+            // Re-typing a library is as reversible as turning the option off, because the option-off
+            // branch assigns FirstSeenAt rather than leaving the field alone. A field written in one
+            // direction only is never reversible, whatever is kept beside it.
+            var seen = new DateTimeOffset(2026, 9, 1, 0, 0, 0, TimeSpan.Zero);
+            var released = new DateTimeOffset(2019, 3, 3, 0, 0, 0, TimeSpan.Zero);
+
+            var video = VideoWith("3f9a2b1c-0000-0000-0000-000000000091", "Youtube", null);
+            video.FirstSeenAt = seen;
+            video.PublishedAt = released;
+
+            BaseItem? created = null;
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created = call.ArgAt<BaseItem>(0));
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            await ReconcileInto(new LibraryTarget("Vods", _studioAnchor, null), video);
+            Assert.Equal(released.UtcDateTime, created!.DateCreated);
+
+            _library.GetItemList(Arg.Any<InternalItemsQuery>())
+                .Returns(new List<BaseItem> { created });
+
+            await ReconcileInto(
+                new LibraryTarget("Vods", _studioAnchor, CollectionTypeOptions.movies), video);
+            Assert.Equal(seen.UtcDateTime, created.DateCreated);
+        }
+
+        private Task<ReconcileReport> ReconcileInto(LibraryTarget target, VideoRecord video)
+            => _publisher.ReconcileAsync(
+                target, [], new SourceRecord { Url = "https://example.com/source" },
+                SourceMode.Movies, "Test", new[] { video },
+                new HashSet<string> { video.Id }, "http://localhost:8096",
+                useReleaseDateAsDateAdded: true, CancellationToken.None);
+
         /// <summary>
         /// The regression guard: the second pass must find nothing changed. Feeding the same in-memory
         /// item back would not prove it, so the item is re-read the way Jellyfin returns it.
@@ -664,7 +787,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 .Returns(new List<BaseItem> { created });
 
             var second = await _publisher.ReconcileAsync(
-                _studioAnchor, new SourceRecord { Url = "https://example.com/source" },
+                StudioTarget, [], new SourceRecord { Url = "https://example.com/source" },
                 SourceMode.Movies, "Test", new[] { video },
                 new HashSet<string> { vodId }, "http://localhost:8096",
                 useReleaseDateAsDateAdded: false, CancellationToken.None);
@@ -681,7 +804,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
 
             var report = await _publisher.ReconcileAsync(
-                _studioAnchor, new SourceRecord { Url = "https://example.com/source" },
+                StudioTarget, [], new SourceRecord { Url = "https://example.com/source" },
                 SourceMode.Movies, "Test", new[] { video },
                 new HashSet<string> { video.Id }, "http://localhost:8096",
                 useReleaseDate, CancellationToken.None);
@@ -783,7 +906,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
 
             await _publisher.ReconcileAsync(
-                _studioAnchor, new SourceRecord { Url = "https://example.com/source" },
+                StudioTarget, [], new SourceRecord { Url = "https://example.com/source" },
                 SourceMode.Series, "Test", videos,
                 videos.Select(v => v.Id).ToHashSet(), "http://localhost:8096",
                 useReleaseDate, CancellationToken.None);
@@ -852,7 +975,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 .Returns(new List<BaseItem> { created });
 
             var second = await _publisher.ReconcileAsync(
-                _studioAnchor,
+                StudioTarget, [],
                 new SourceRecord { Url = "https://example.com/source" },
                 SourceMode.Movies, "Test",
                 new[] { VideoWith(vodId, "ArteTV", null) },
@@ -886,7 +1009,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
 
             var first = await _publisher.ReconcileAsync(
-                _studioAnchor, new SourceRecord { Url = "https://example.com/source" },
+                StudioTarget, [], new SourceRecord { Url = "https://example.com/source" },
                 SourceMode.Movies, "Test", new[] { video },
                 new HashSet<string> { vodId }, "http://localhost:8096",
                 useReleaseDateAsDateAdded: false, CancellationToken.None);
@@ -900,7 +1023,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 .Returns(new List<BaseItem> { created });
 
             var second = await _publisher.ReconcileAsync(
-                _studioAnchor, new SourceRecord { Url = "https://example.com/source" },
+                StudioTarget, [], new SourceRecord { Url = "https://example.com/source" },
                 SourceMode.Movies, "Test", new[] { video },
                 new HashSet<string> { vodId }, "http://localhost:8096",
                 useReleaseDateAsDateAdded: false, CancellationToken.None);
@@ -962,10 +1085,359 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         }
 
         /// <summary>
+        /// The duplicate the split creates. Flipping a source's mode while the two libraries differ
+        /// publishes the Episode in one and leaves the Movie in the other; the flip-detection delete
+        /// only ever saw one anchor, so nothing removed the stale kind and the video existed twice.
+        /// </summary>
+        [Fact]
+        public async Task ReconcileAsync_DeletesTheOtherKind_WhenItLivesInTheOtherLibrary()
+        {
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000100";
+            var otherAnchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Films" };
+
+            var stale = new Movie { Id = DeterministicId("movie"), ParentId = otherAnchor.Id };
+            stale.SetProviderId("VOD", vodId);
+            _library.GetItemList(Arg.Any<InternalItemsQuery>())
+                .Returns(new List<BaseItem> { stale });
+
+            var video = VideoWith(vodId, "Youtube", null);
+            await _publisher.ReconcileAsync(
+                StudioTarget, new[] { otherAnchor },
+                new SourceRecord { Url = "https://example.com/source" },
+                SourceMode.Series, "Test", new[] { video },
+                new HashSet<string> { vodId }, "http://localhost:8096",
+                useReleaseDateAsDateAdded: false, CancellationToken.None);
+
+            _library.Received(1).DeleteItem(
+                stale, Arg.Any<DeleteOptions>(), Arg.Any<bool>());
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_DeletesEveryStaleCandidate_NotJustTheFirst()
+        {
+            // Review focus 3. Two libraries can each hold a leftover of the wrong kind once a source
+            // has moved twice. Keeping only the first would leave the second orphaned for ever,
+            // since the next pass finds the right kind and never looks again.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000101";
+            var first = new Folder { Id = Guid.NewGuid(), Path = "/media/A" };
+            var second = new Folder { Id = Guid.NewGuid(), Path = "/media/B" };
+
+            var staleA = new Movie { Id = DeterministicId("stale-a"), ParentId = first.Id };
+            staleA.SetProviderId("VOD", vodId);
+            var staleB = new Movie { Id = DeterministicId("stale-b"), ParentId = second.Id };
+            staleB.SetProviderId("VOD", vodId);
+            _library.GetItemList(Arg.Any<InternalItemsQuery>())
+                .Returns(new List<BaseItem> { staleA, staleB });
+
+            var video = VideoWith(vodId, "Youtube", null);
+            await _publisher.ReconcileAsync(
+                StudioTarget, new[] { first, second },
+                new SourceRecord { Url = "https://example.com/source" },
+                SourceMode.Series, "Test", new[] { video },
+                new HashSet<string> { vodId }, "http://localhost:8096",
+                useReleaseDateAsDateAdded: false, CancellationToken.None);
+
+            _library.Received(1).DeleteItem(staleA, Arg.Any<DeleteOptions>(), Arg.Any<bool>());
+            _library.Received(1).DeleteItem(staleB, Arg.Any<DeleteOptions>(), Arg.Any<bool>());
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_MovesSeriesAndEpisodeThroughAddChild_WhenLibraryChanges()
+        {
+            // Flipping SeriesLibraryName from "Old" to "Vods" (StudioTarget) must commit the Series,
+            // its Season and its Episode through AddChild so Jellyfin recomputes TopParentId for all.
+            // The movie-mode equivalent is ReconcileAsync_ReparentsThroughAddChild_KeepingTheItemId.
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000300";
+            var oldAnchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Old" };
+
+            // Series in the old anchor — simulates what was stored before the library change.
+            var seriesKey = $"vod-source:https://example.com/s|Series";
+            var seriesId = DeterministicId(seriesKey);
+            var existingSeries = new Series { Id = seriesId, ParentId = oldAnchor.Id };
+            _library.GetItemById(seriesId).Returns(existingSeries);
+
+            // Episode in the old anchor (appears in ExistingByVodId query).
+            var stale = new Episode { Id = DeterministicId($"vod:{vodId}|Episode"), ParentId = oldAnchor.Id };
+            stale.SetProviderId("VOD", vodId);
+            _library.GetItemList(Arg.Any<InternalItemsQuery>())
+                .Returns(new List<BaseItem> { stale });
+
+            var created = new List<(BaseItem item, BaseItem parent)>();
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created.Add((call.ArgAt<BaseItem>(0), call.ArgAt<BaseItem>(1))));
+
+            var video = new VideoRecord
+            {
+                Id = vodId, SourceUrl = "https://example.com/s", VideoUrl = "http://localhost:8096/stream.m3u8",
+                Title = "Ep 1", SeasonNumber = 1, EpisodeNumber = 1,
+                FirstSeenAt = DateTimeOffset.UtcNow, SyncedAt = DateTimeOffset.UtcNow
+            };
+
+            await _publisher.ReconcileAsync(
+                StudioTarget, new[] { oldAnchor },
+                new SourceRecord { Url = "https://example.com/s" },
+                SourceMode.Series, "Test Series", new[] { video },
+                new HashSet<string> { vodId }, "http://localhost:8096",
+                useReleaseDateAsDateAdded: false, CancellationToken.None);
+
+            // Series must have been committed through AddChild (CreateItem), not UpdateToRepositoryAsync.
+            Assert.Contains(created, t => t.item is Series && t.item.Id == seriesId);
+            // Episode must also go through AddChild with seriesMoved = true.
+            Assert.Contains(created, t => t.item is Episode);
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_ReparentsThroughAddChild_KeepingTheItemId()
+        {
+            // Changing the target library must MOVE the item, not replace it: the id is derived from
+            // the content key, and deleting to recreate would take the user's watch history with it.
+            // AddChild is the path a live probe exercised on a library change; it upserts and keeps
+            // the id, and Jellyfin recomputes TopParentId from the new parent on persist.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000102";
+            var oldAnchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Old" };
+
+            var moved = new Movie { Id = DeterministicId("moved"), ParentId = oldAnchor.Id };
+            moved.SetProviderId("VOD", vodId);
+            var originalId = moved.Id;
+            _library.GetItemList(Arg.Any<InternalItemsQuery>())
+                .Returns(new List<BaseItem> { moved });
+
+            BaseItem? added = null;
+            BaseItem? addedTo = null;
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call =>
+                {
+                    added = call.ArgAt<BaseItem>(0);
+                    addedTo = call.ArgAt<BaseItem>(1);
+                });
+
+            var video = VideoWith(vodId, "Youtube", null);
+            await _publisher.ReconcileAsync(
+                StudioTarget, new[] { oldAnchor },
+                new SourceRecord { Url = "https://example.com/source" },
+                SourceMode.Movies, "Test", new[] { video },
+                new HashSet<string> { vodId }, "http://localhost:8096",
+                useReleaseDateAsDateAdded: false, CancellationToken.None);
+
+            Assert.Same(moved, added);
+            Assert.Same(_studioAnchor, addedTo);
+            Assert.Equal(originalId, moved.Id);
+            Assert.Equal(_studioAnchor.Id, moved.ParentId);
+            _library.DidNotReceive().DeleteItem(moved, Arg.Any<DeleteOptions>(), Arg.Any<bool>());
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_SweepsEachAnchorOnlyOnce_WhenTwoNamesResolveToTheSameFolder()
+        {
+            // Review focus 1. Two configured names differing only in case resolve to ONE folder. A
+            // sweep deduplicating by name rather than by id would list the target twice and sweep it
+            // against itself.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000103";
+            var same = _studioAnchor;
+
+            var published = new Movie { Id = DeterministicId("same"), ParentId = same.Id };
+            published.SetProviderId("VOD", vodId);
+            _library.GetItemList(Arg.Any<InternalItemsQuery>())
+                .Returns(new List<BaseItem> { published });
+
+            var video = VideoWith(vodId, "Youtube", null);
+            var report = await _publisher.ReconcileAsync(
+                StudioTarget, new[] { same },
+                new SourceRecord { Url = "https://example.com/source" },
+                SourceMode.Movies, "Test", new[] { video },
+                new HashSet<string> { vodId }, "http://localhost:8096",
+                useReleaseDateAsDateAdded: false, CancellationToken.None);
+
+            Assert.Equal(0, report.Removed);
+            _library.DidNotReceive().DeleteItem(published, Arg.Any<DeleteOptions>(), Arg.Any<bool>());
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_BehavesIdentically_WhenThereIsOnlyOneAnchor()
+        {
+            // The non-regression that matters most: someone who keeps a single mixed library must
+            // see exactly what 7f4670b did.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000104";
+            var video = VideoWith(vodId, "Youtube", null);
+
+            BaseItem? created = null;
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created = call.ArgAt<BaseItem>(0));
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            var report = await _publisher.ReconcileAsync(
+                StudioTarget, [],
+                new SourceRecord { Url = "https://example.com/source" },
+                SourceMode.Movies, "Test", new[] { video },
+                new HashSet<string> { vodId }, "http://localhost:8096",
+                useReleaseDateAsDateAdded: false, CancellationToken.None);
+
+            Assert.Equal(1, report.Created);
+            Assert.Equal(0, report.Removed);
+            Assert.NotNull(created);
+            Assert.Equal(_studioAnchor.Id, created.ParentId);
+        }
+
+        [Fact]
+        public void PurgeSource_DeletesTheSourcesItemsInEveryAnchor()
+        {
+            var other = new Folder { Id = Guid.NewGuid(), Path = "/media/Films" };
+
+            var here = new Movie { Id = DeterministicId("here"), ParentId = _studioAnchor.Id };
+            here.SetProviderId("VOD", "3f9a2b1c-0000-0000-0000-000000000110");
+            var there = new Movie { Id = DeterministicId("there"), ParentId = other.Id };
+            there.SetProviderId("VOD", "3f9a2b1c-0000-0000-0000-000000000111");
+            _library.GetItemList(Arg.Any<InternalItemsQuery>())
+                .Returns(new List<BaseItem> { here, there });
+
+            var removed = _publisher.PurgeSource(
+                new[] { _studioAnchor, other },
+                new SourceRecord { Url = "https://example.com/source" },
+                new HashSet<string>());
+
+            Assert.Equal(2, removed);
+            _library.Received(1).DeleteItem(here, Arg.Any<DeleteOptions>(), Arg.Any<bool>());
+            _library.Received(1).DeleteItem(there, Arg.Any<DeleteOptions>(), Arg.Any<bool>());
+        }
+
+        [Fact]
+        public void PurgeSource_SparesAVideoAnotherSourceStillClaims()
+        {
+            // The same rule as the orphan sweep: an item survives while ANY source still accounts for
+            // its video. Retiring one source must not delete a video a second one shares.
+            const string shared = "3f9a2b1c-0000-0000-0000-000000000112";
+            var kept = new Movie { Id = DeterministicId("kept"), ParentId = _studioAnchor.Id };
+            kept.SetProviderId("VOD", shared);
+            _library.GetItemList(Arg.Any<InternalItemsQuery>())
+                .Returns(new List<BaseItem> { kept });
+
+            var removed = _publisher.PurgeSource(
+                new[] { _studioAnchor },
+                new SourceRecord { Url = "https://example.com/source" },
+                new HashSet<string> { shared });
+
+            Assert.Equal(0, removed);
+            _library.DidNotReceive().DeleteItem(kept, Arg.Any<DeleteOptions>(), Arg.Any<bool>());
+        }
+
+        [Fact]
+        public void FindAnchorById_ReturnsNull_WhenTheAnchorIsGoneOrIsNotAFolder()
+        {
+            // Review focus 2. A stored anchor outlives the library it named. It only ever serves
+            // cleanup, so its disappearance must not fail a source whose own target is fine.
+            Assert.Null(_publisher.FindAnchorById(Guid.Empty));
+
+            var missing = Guid.NewGuid();
+            _library.GetItemById(missing).Returns((BaseItem?)null);
+            Assert.Null(_publisher.FindAnchorById(missing));
+
+            var notAFolder = Guid.NewGuid();
+            _library.GetItemById(notAFolder).Returns(new Movie { Id = notAFolder });
+            Assert.Null(_publisher.FindAnchorById(notAFolder));
+
+            var real = Guid.NewGuid();
+            var folder = new Folder { Id = real, Path = "/media/Real" };
+            _library.GetItemById(real).Returns(folder);
+            Assert.Same(folder, _publisher.FindAnchorById(real));
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_PurgesEmptySeriesShell_InNonTargetAnchor()
+        {
+            // spec §14. After a source moves to a new library, the old one may still hold an empty
+            // Series container. The swept[1..] loop reaps it if no episode lives under it.
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000301";
+            var oldAnchor = new Folder { Id = Guid.NewGuid(), Path = "/media/OldShell" };
+
+            // An empty Series shell that FindSeries will find in the old anchor.
+            var shell = new Series { Id = Guid.NewGuid() };
+            shell.SetProviderId("VOD", "https://example.com/shell");
+
+            // ExistingByVodId (queries Episode/Movie): returns nothing.
+            _library.GetItemList(Arg.Is<InternalItemsQuery>(q =>
+                !q.IncludeItemTypes.Contains(BaseItemKind.Series)))
+                .Returns(new List<BaseItem>());
+            // FindSeries for old anchor: returns the shell.
+            _library.GetItemList(Arg.Is<InternalItemsQuery>(q =>
+                q.IncludeItemTypes.Contains(BaseItemKind.Series)
+                && q.TopParentIds.Contains(oldAnchor.Id)))
+                .Returns(new List<BaseItem> { shell });
+            // ChildCount for the shell: 0 episodes.
+            _library.GetCount(Arg.Is<InternalItemsQuery>(q => q.ParentId == shell.Id)).Returns(0);
+
+            var video = new VideoRecord
+            {
+                Id = vodId, SourceUrl = "https://example.com/shell", VideoUrl = "u",
+                Title = "Ep", SeasonNumber = 1, EpisodeNumber = 1,
+                FirstSeenAt = DateTimeOffset.UtcNow, SyncedAt = DateTimeOffset.UtcNow
+            };
+
+            await _publisher.ReconcileAsync(
+                StudioTarget, new[] { oldAnchor },
+                new SourceRecord { Url = "https://example.com/shell" },
+                SourceMode.Series, "Shell Series", new[] { video },
+                new HashSet<string> { vodId }, "http://localhost:8096",
+                useReleaseDateAsDateAdded: false, CancellationToken.None);
+
+            _library.Received(1).DeleteItem(shell, Arg.Any<DeleteOptions>(), Arg.Any<bool>());
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_SparesSeriesShell_InNonTargetAnchor_WhenItHasEpisodes()
+        {
+            // spec §14. A Series shell that still holds episodes must not be reaped.
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000302";
+            var oldAnchor = new Folder { Id = Guid.NewGuid(), Path = "/media/OldLive" };
+
+            var activeShell = new Series { Id = Guid.NewGuid() };
+            activeShell.SetProviderId("VOD", "https://example.com/active");
+
+            _library.GetItemList(Arg.Is<InternalItemsQuery>(q =>
+                !q.IncludeItemTypes.Contains(BaseItemKind.Series)))
+                .Returns(new List<BaseItem>());
+            _library.GetItemList(Arg.Is<InternalItemsQuery>(q =>
+                q.IncludeItemTypes.Contains(BaseItemKind.Series)
+                && q.TopParentIds.Contains(oldAnchor.Id)))
+                .Returns(new List<BaseItem> { activeShell });
+            _library.GetCount(Arg.Is<InternalItemsQuery>(q => q.ParentId == activeShell.Id)).Returns(2);
+
+            var video = new VideoRecord
+            {
+                Id = vodId, SourceUrl = "https://example.com/active", VideoUrl = "u",
+                Title = "Ep", SeasonNumber = 1, EpisodeNumber = 1,
+                FirstSeenAt = DateTimeOffset.UtcNow, SyncedAt = DateTimeOffset.UtcNow
+            };
+
+            await _publisher.ReconcileAsync(
+                StudioTarget, new[] { oldAnchor },
+                new SourceRecord { Url = "https://example.com/active" },
+                SourceMode.Series, "Active Series", new[] { video },
+                new HashSet<string> { vodId }, "http://localhost:8096",
+                useReleaseDateAsDateAdded: false, CancellationToken.None);
+
+            _library.DidNotReceive().DeleteItem(activeShell, Arg.Any<DeleteOptions>(), Arg.Any<bool>());
+        }
+
+        /// <summary>
         /// Shared across both passes of the idempotence test: a fresh anchor would give the item a
         /// different ParentId and report an update for that reason rather than for its studios.
         /// </summary>
         private readonly Folder _studioAnchor = new() { Id = Guid.NewGuid(), Path = "/media/Vods" };
+
+        /// <summary>
+        /// The anchor as a target. Mixed (CollectionType null) on purpose: that is what every test
+        /// written before the split assumed, so the option keeps biting exactly where it used to.
+        /// </summary>
+        private LibraryTarget StudioTarget => new("Vods", _studioAnchor, null);
 
         private async Task<BaseItem> PublishOneMovieAsync(
             string vodId, string? extractorKey, string? channelsJson)
@@ -976,7 +1448,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
 
             var report = await _publisher.ReconcileAsync(
-                _studioAnchor,
+                StudioTarget, [],
                 new SourceRecord { Url = "https://example.com/source" },
                 SourceMode.Movies, "Test",
                 new[] { VideoWith(vodId, extractorKey, channelsJson) },

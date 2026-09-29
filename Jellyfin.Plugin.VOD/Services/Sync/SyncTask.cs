@@ -67,11 +67,11 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             // library from costing one yt-dlp enumeration per source on every single wake-up.
             try
             {
-                await _syncService.PrepareLibraryAsync(cancellationToken).ConfigureAwait(false);
+                await _syncService.PrepareLibraryAsync(config, cancellationToken).ConfigureAwait(false);
             }
             catch (InvalidOperationException ex)
             {
-                LogLibraryUnavailable(config.LibraryName, ex.Message);
+                LogLibraryUnavailable(ex.Message);
 
                 // Recorded against each source so the configuration page can show why nothing synced.
                 foreach (var source in sources)
@@ -89,7 +89,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             // by the loop that follows, since that loop only ever reads the configuration. Retiring
             // has to be driven from the database instead — and emptying the source list entirely is
             // exactly the case where it matters most.
-            await _syncService.RetireRemovedSourcesAsync(cancellationToken).ConfigureAwait(false);
+            _syncService.RetireRemovedSources(config, cancellationToken);
 
             if (sources.Count == 0)
             {
@@ -113,7 +113,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
                 LogSyncingSource(i + 1, sources.Count, sources[i].Url);
 
-                await _syncService.SyncSourceAsync(sources[i], cancellationToken)
+                await _syncService.SyncSourceAsync(config, sources[i], cancellationToken)
                     .ConfigureAwait(false);
             }
 
@@ -129,7 +129,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         private partial void LogSkippingSource(string url, DateTimeOffset lastSyncedAt, int intervalMinutes);
 
         [LoggerMessage(EventId = 3, Level = LogLevel.Error,
-            Message = "SyncTask: nothing synced — library {LibraryName} cannot hold published items: {Reason}")]
-        private partial void LogLibraryUnavailable(string libraryName, string reason);
+            Message = "SyncTask: nothing synced — a configured library cannot hold published items: {Reason}")]
+        private partial void LogLibraryUnavailable(string reason);
     }
 }

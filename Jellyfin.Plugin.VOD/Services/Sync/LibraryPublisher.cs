@@ -77,30 +77,38 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             "Prevent Jellyfin from skipping empty library folders needed for virtual libraries";
 
         /// <summary>
-        /// Returns the library's first location. Resolves against the configuration only, so it
+        /// Returns the library's virtual folder. Resolves against the configuration only, so it
         /// answers whether the library exists without asking whether Jellyfin has indexed it.
         /// </summary>
-        private string ResolveLocation(string libraryName)
+        /// <remarks>
+        /// Returns the whole <see cref="VirtualFolderInfo"/> rather than just its first location:
+        /// the collection type is on the same object, so learning it costs no extra query.
+        /// </remarks>
+        private VirtualFolderInfo ResolveVirtualFolder(string libraryName)
         {
             var virtualFolder = _libraryManager.GetVirtualFolders()
                 .Find(v => string.Equals(v.Name, libraryName, StringComparison.OrdinalIgnoreCase))
                 ?? throw new InvalidOperationException($"No library named '{libraryName}'.");
 
             return virtualFolder.Locations.Length > 0
-                ? virtualFolder.Locations[0]
+                ? virtualFolder
                 : throw new InvalidOperationException($"Library '{libraryName}' has no location.");
         }
 
         /// <summary>
-        /// Returns the folder new items must hang off: the library's physical folder.
+        /// Returns the target new items must hang off: the library's physical folder, with the type
+        /// that library is declared as.
         /// </summary>
+        /// <param name="libraryName">The configured library name.</param>
+        /// <returns>The resolved target.</returns>
         /// <exception cref="InvalidOperationException">
         /// Thrown when the library or its indexed folder is missing. Falling back to the
         /// CollectionFolder would publish items no query can reach, so this fails loudly.
         /// </exception>
-        public Folder ResolveAnchor(string libraryName)
+        public LibraryTarget ResolveTarget(string libraryName)
         {
-            var location = ResolveLocation(libraryName);
+            var virtualFolder = ResolveVirtualFolder(libraryName);
+            var location = virtualFolder.Locations[0];
 
             if (_libraryManager.FindByPath(location, true) is not Folder anchor)
             {
@@ -109,16 +117,16 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                     + "Scan the library once so Jellyfin indexes it before publishing.");
             }
 
-            return anchor;
+            return new LibraryTarget(libraryName, anchor, virtualFolder.CollectionType);
         }
 
         /// <summary>
-        /// Resolves the anchor, letting Jellyfin index the library location first when it never has.
+        /// Resolves the target, letting Jellyfin index the library location first when it never has.
         /// </summary>
         /// <remarks>
         /// A scan skips a library folder that holds no filesystem entries: the check it gates on,
         /// <c>DirectoryService.IsAccessible</c>, is an emptiness test rather than an access test, and
-        /// the early return it triggers means the folder item <see cref="ResolveAnchor"/> needs is
+        /// the early return it triggers means the folder item <see cref="ResolveTarget"/> needs is
         /// never created. A library holding only virtual items therefore stays unusable however many
         /// times it is scanned — the failure looks like a scan that did not take. Writing a marker
         /// makes the directory non-empty, after which re-validating the top-level folders indexes it.
@@ -132,24 +140,26 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// </remarks>
         /// <param name="libraryName">The configured library name.</param>
         /// <param name="cancellationToken">A token to cancel the operation.</param>
-        /// <returns>The folder new items must hang off.</returns>
+        /// <returns>The resolved target.</returns>
         /// <exception cref="InvalidOperationException">
         /// Thrown when the library is missing, has no location, or could not be indexed.
         /// </exception>
-        public async Task<Folder> PrepareAnchorAsync(string libraryName, CancellationToken cancellationToken)
+        public async Task<LibraryTarget> PrepareTargetAsync(
+            string libraryName, CancellationToken cancellationToken)
         {
-            var location = ResolveLocation(libraryName);
+            var virtualFolder = ResolveVirtualFolder(libraryName);
+            var location = virtualFolder.Locations[0];
 
             EnsureKeepMarker(location);
 
             if (_libraryManager.FindByPath(location, true) is Folder indexed)
-                return indexed;
+                return new LibraryTarget(libraryName, indexed, virtualFolder.CollectionType);
 
             LogIndexingLibrary(libraryName, location);
             await _libraryManager.ValidateTopLibraryFolders(cancellationToken).ConfigureAwait(false);
 
             // Reuses the "has no indexed folder" message when the validation still produced nothing.
-            return ResolveAnchor(libraryName);
+            return ResolveTarget(libraryName);
         }
 
         private static void EnsureKeepMarker(string location)
@@ -173,8 +183,23 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// <summary>
         /// Aligns the library with <paramref name="expected"/> for one source.
         /// </summary>
+        /// <remarks>
+        /// <paramref name="useReleaseDateAsDateAdded"/> is the administrator's setting, not what is
+        /// applied: it only takes effect on a MIXED target, because the "Folders" default view it
+        /// works around exists nowhere else. Deriving that from the target itself makes an
+        /// inconsistent (anchor, flag) pair impossible to build, and both stay parameters — reading
+        /// the configuration here would make the option's ON state untestable, since Plugin.Instance
+        /// is null under xUnit.
+        /// <para>
+        /// <paramref name="otherAnchors"/> lists the anchors OTHER than the target that may still
+        /// hold this source's items: the library the other mode publishes into, and the one this
+        /// source last published into. The target is always swept and need not appear here. An empty
+        /// list reproduces the single-library behaviour exactly.
+        /// </para>
+        /// </remarks>
         public async Task<ReconcileReport> ReconcileAsync(
-            Folder anchor,
+            LibraryTarget target,
+            IReadOnlyList<Folder> otherAnchors,
             SourceRecord source,
             SourceMode mode,
             string seriesName,
@@ -184,12 +209,17 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             bool useReleaseDateAsDateAdded,
             CancellationToken cancellationToken)
         {
-            ArgumentNullException.ThrowIfNull(anchor);
+            ArgumentNullException.ThrowIfNull(target);
+            ArgumentNullException.ThrowIfNull(otherAnchors);
             ArgumentNullException.ThrowIfNull(source);
             ArgumentNullException.ThrowIfNull(expected);
             ArgumentNullException.ThrowIfNull(allKnownVideoIds);
 
-            var published = ExistingByVodId(anchor);
+            var anchor = target.Anchor;
+            var useReleaseDate = useReleaseDateAsDateAdded && target.IsMixed;
+            var swept = DistinctById([anchor, .. otherAnchors]);
+
+            var published = ExistingByVodId(swept);
             var studios = EnsureStudioEntities(expected);
 
             Series? series = null;
@@ -206,21 +236,23 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 if (mode == SourceMode.Movies)
                 {
                     outcome = await UpsertMovieAsync(
-                        anchor, video, streamUrl, published, useReleaseDateAsDateAdded,
+                        anchor, video, streamUrl, published, useReleaseDate,
                         cancellationToken).ConfigureAwait(false);
                 }
                 else
                 {
-                    series ??= await EnsureSeriesAsync(
-                        anchor, source, seriesName, FirstAvailableThumbnail(expected),
-                        OldestPublishedAt(expected), studios,
-                        SeriesDates(expected, useReleaseDateAsDateAdded), cancellationToken)
-                        .ConfigureAwait(false);
-                    currentSeason = await EnsureSeasonAsync(series, video.SeasonNumber, currentSeason, cancellationToken).ConfigureAwait(false);
+                    bool seriesMoved = false;
+                    if (series is null)
+                        (series, seriesMoved) = await EnsureSeriesAsync(
+                            anchor, source, seriesName, FirstAvailableThumbnail(expected),
+                            OldestPublishedAt(expected), studios,
+                            SeriesDates(expected, useReleaseDate), cancellationToken)
+                            .ConfigureAwait(false);
+                    currentSeason = await EnsureSeasonAsync(series, video.SeasonNumber, currentSeason, seriesMoved, cancellationToken).ConfigureAwait(false);
 
                     outcome = await UpsertEpisodeAsync(
                         series, currentSeason, video, streamUrl, published,
-                        useReleaseDateAsDateAdded, cancellationToken)
+                        useReleaseDate, seriesMoved, cancellationToken)
                         .ConfigureAwait(false);
                 }
 
@@ -236,22 +268,23 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                         unchanged++;
                         break;
                 }
-
-                published.Remove(video.Id);
             }
 
-            // An item is orphaned only when no source claims its video any more. Items
-            // belonging to other sources are in this map too, because the query is
-            // library-wide while `expected` is per-source.
+            // An item is orphaned only when no source claims its video any more. Items belonging to
+            // other sources are in this map too, because the query spans whole libraries while
+            // `expected` is per-source.
             var removed = 0;
-            foreach (var (vodId, orphan) in published)
+            foreach (var (vodId, orphans) in published)
             {
                 if (allKnownVideoIds.Contains(vodId))
                     continue;
 
-                _libraryManager.DeleteItem(
-                    orphan, new DeleteOptions { DeleteFileLocation = false }, true);
-                removed++;
+                foreach (var orphan in orphans)
+                {
+                    _libraryManager.DeleteItem(
+                        orphan, new DeleteOptions { DeleteFileLocation = false }, true);
+                    removed++;
+                }
             }
 
             // A Movies source must own no containers at all, so the same reconciliation runs with an
@@ -260,6 +293,12 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             removed += mode == SourceMode.Movies
                 ? ReconcileContainers(anchor, source, [], null)
                 : ReconcileContainers(anchor, source, expected, series);
+
+            // The empty Series and Season shells a change of target library leaves behind: FindSeries
+            // is scoped to one anchor, so moving the episodes creates a new Series and never finds
+            // the old one. swept[0] is the target, already reconciled above.
+            for (var i = 1; i < swept.Count; i++)
+                removed += ReconcileContainers(swept[i], source, [], null);
 
             LogReconciled(source.Url, created, updated, removed, unchanged);
             return new ReconcileReport(created, updated, removed, unchanged);
@@ -359,31 +398,97 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             });
 
         /// <summary>
-        /// One query for the whole library, indexed by the VOD provider id.
+        /// One query across every swept anchor, indexed by the VOD provider id.
         /// </summary>
         /// <remarks>
-        /// Scoped by TopParentIds, which assumes the library is dedicated to the plugin.
-        /// Series carry a source-shaped VOD id rather than a video uuid, so filtering on the
-        /// item kinds keeps them out of the map.
+        /// A list per id rather than a single item: the same video can legitimately have a Movie in
+        /// one library and an Episode in another once a source's mode has been flipped while the two
+        /// libraries differ. The two carry different ids — GetNewItemId derives them from the type —
+        /// so they coexist, and the stale one has to be found to be removed.
+        /// <para>
+        /// TopParentIds takes an array, so widening the sweep costs no extra query.
+        /// </para>
         /// </remarks>
-        private Dictionary<string, BaseItem> ExistingByVodId(Folder anchor)
+        private Dictionary<string, List<BaseItem>> ExistingByVodId(List<Folder> anchors)
         {
+            var topParentIds = new Guid[anchors.Count];
+            for (var i = 0; i < anchors.Count; i++)
+                topParentIds[i] = anchors[i].Id;
+
             var items = _libraryManager.GetItemList(new InternalItemsQuery
             {
-                TopParentIds = [anchor.Id],
+                TopParentIds = topParentIds,
                 IncludeItemTypes = [BaseItemKind.Episode, BaseItemKind.Movie],
                 Recursive = true
             });
 
-            var map = new Dictionary<string, BaseItem>(StringComparer.OrdinalIgnoreCase);
+            var map = new Dictionary<string, List<BaseItem>>(StringComparer.OrdinalIgnoreCase);
             foreach (var item in items)
             {
                 var id = item.GetProviderId("VOD");
-                if (!string.IsNullOrEmpty(id))
-                    map[id] = item;
+                if (string.IsNullOrEmpty(id))
+                    continue;
+
+                if (!map.TryGetValue(id, out var candidates))
+                    map[id] = candidates = [];
+
+                candidates.Add(item);
             }
 
             return map;
+        }
+
+        /// <summary>
+        /// Returns the anchors with duplicates dropped, first occurrence kept.
+        /// </summary>
+        /// <remarks>
+        /// By id, never by name: two configured names differing only in case resolve to the same
+        /// folder, and a target listed twice would be swept against itself.
+        /// </remarks>
+        private static List<Folder> DistinctById(IReadOnlyList<Folder> anchors)
+        {
+            var seen = new HashSet<Guid>();
+            var distinct = new List<Folder>(anchors.Count);
+            foreach (var folder in anchors)
+            {
+                if (seen.Add(folder.Id))
+                    distinct.Add(folder);
+            }
+
+            return distinct;
+        }
+
+        /// <summary>
+        /// Returns this video's item of the wanted type, deletes every other item claiming the same
+        /// video, and takes the whole entry out of the map so the orphan sweep never sees it again.
+        /// </summary>
+        /// <remarks>
+        /// A source whose Mode was flipped has the video published as the other kind. That id is
+        /// derived from the type, so the new item cannot reuse the old one's row: the stale item has
+        /// to go, or it stays in the library with nothing accounting for it. Every stale candidate is
+        /// deleted, not only the first — a source that has moved twice can have left one in each
+        /// library.
+        /// </remarks>
+        private T? TakeOfType<T>(string vodId, Dictionary<string, List<BaseItem>> published)
+            where T : BaseItem
+        {
+            if (!published.Remove(vodId, out var candidates))
+                return null;
+
+            T? kept = null;
+            foreach (var candidate in candidates)
+            {
+                if (kept is null && candidate is T wanted)
+                {
+                    kept = wanted;
+                    continue;
+                }
+
+                _libraryManager.DeleteItem(
+                    candidate, new DeleteOptions { DeleteFileLocation = false }, true);
+            }
+
+            return kept;
         }
 
         /// <summary>Publishes one video as a Movie and reports what that did to the library.</summary>
@@ -391,24 +496,18 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             Folder anchor,
             VideoRecord video,
             string streamUrl,
-            Dictionary<string, BaseItem> published,
+            Dictionary<string, List<BaseItem>> published,
             bool useReleaseDateAsDateAdded,
             CancellationToken cancellationToken)
         {
-            var isNew = !published.TryGetValue(video.Id, out var existing);
+            var existing = TakeOfType<Movie>(video.Id, published);
+            var isNew = existing is null;
 
-            // A source whose Mode was flipped has the video published as the other kind. The id is
-            // derived from the type, so the new item cannot reuse the old one's row: the stale item
-            // has to go, or it stays in the library with nothing accounting for it.
-            if (existing is not null and not Movie)
-            {
-                _libraryManager.DeleteItem(
-                    existing, new DeleteOptions { DeleteFileLocation = false }, true);
-                isNew = true;
-                existing = null;
-            }
+            // The item moved between libraries: commit through AddChild so Jellyfin re-parents it
+            // and recomputes TopParentId, keeping the id and therefore the user's watch history.
+            var reparent = existing is not null && existing.ParentId != anchor.Id;
 
-            var movie = existing as Movie ?? new Movie
+            var movie = existing ?? new Movie
             {
                 Id = _libraryManager.GetNewItemId(ItemKeyFor(video.Id), typeof(Movie))
             };
@@ -422,7 +521,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             var changed = isNew
                 || !string.Equals(movie.Name, video.Title, StringComparison.Ordinal)
                 || !string.Equals(movie.Overview, overview, StringComparison.Ordinal)
-                || movie.ParentId != anchor.Id
+                || reparent
                 || !string.Equals(movie.Path, streamUrl, StringComparison.Ordinal)
                 || movie.PremiereDate != premiereDate
                 || movie.ProductionYear != productionYear
@@ -454,7 +553,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             if (!changed)
                 return UpsertOutcome.Unchanged;
 
-            await CommitAsync(movie, anchor, isNew, cancellationToken).ConfigureAwait(false);
+            await CommitAsync(movie, anchor, isNew || reparent, cancellationToken).ConfigureAwait(false);
             imageWrite?.Invoke();
             return isNew ? UpsertOutcome.Created : UpsertOutcome.Updated;
         }
@@ -465,24 +564,16 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             Season season,
             VideoRecord video,
             string streamUrl,
-            Dictionary<string, BaseItem> published,
+            Dictionary<string, List<BaseItem>> published,
             bool useReleaseDateAsDateAdded,
+            bool seriesMoved,
             CancellationToken cancellationToken)
         {
-            var isNew = !published.TryGetValue(video.Id, out var existing);
+            var existing = TakeOfType<Episode>(video.Id, published);
+            var isNew = existing is null;
+            var reparent = existing is not null && (existing.ParentId != season.Id || seriesMoved);
 
-            // A source whose Mode was flipped has the video published as the other kind. The id is
-            // derived from the type, so the new item cannot reuse the old one's row: the stale item
-            // has to go, or it stays in the library with nothing accounting for it.
-            if (existing is not null and not Episode)
-            {
-                _libraryManager.DeleteItem(
-                    existing, new DeleteOptions { DeleteFileLocation = false }, true);
-                isNew = true;
-                existing = null;
-            }
-
-            var episode = existing as Episode ?? new Episode
+            var episode = existing ?? new Episode
             {
                 Id = _libraryManager.GetNewItemId(ItemKeyFor(video.Id), typeof(Episode))
             };
@@ -498,7 +589,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             var changed = isNew
                 || !string.Equals(episode.Name, video.Title, StringComparison.Ordinal)
                 || !string.Equals(episode.Overview, overview, StringComparison.Ordinal)
-                || episode.ParentId != season.Id
+                || reparent
                 || !string.Equals(episode.Path, streamUrl, StringComparison.Ordinal)
                 || episode.IndexNumber != video.EpisodeNumber
                 || episode.ParentIndexNumber != season.IndexNumber
@@ -542,29 +633,30 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             if (!changed)
                 return UpsertOutcome.Unchanged;
 
-            await CommitAsync(episode, season, isNew, cancellationToken).ConfigureAwait(false);
+            await CommitAsync(episode, season, isNew || reparent, cancellationToken).ConfigureAwait(false);
             imageWrite?.Invoke();
             return isNew ? UpsertOutcome.Created : UpsertOutcome.Updated;
         }
 
         /// <summary>
-        /// Creates through AddChild, updates through the repository.
+        /// Creates or re-parents through AddChild, updates in place through the repository.
         /// </summary>
         /// <remarks>
-        /// AddChild raises ItemAdded every time it is called, so it is reserved for genuine
-        /// creations; updating an existing item through it would re-fire the event each sync.
+        /// AddChild raises ItemAdded every time it is called, so it is reserved for an item genuinely
+        /// arriving under this parent: a creation, or a move from another library. Updating an
+        /// existing item in place through it would re-fire the event on every sync.
         /// </remarks>
         private static async Task CommitAsync(
-            BaseItem item, Folder parent, bool isNew, CancellationToken cancellationToken)
+            BaseItem item, Folder parent, bool arriving, CancellationToken cancellationToken)
         {
-            if (isNew)
+            if (arriving)
                 parent.AddChild(item);
             else
                 await item.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, cancellationToken)
                     .ConfigureAwait(false);
         }
 
-        private async Task<Series> EnsureSeriesAsync(
+        private async Task<(Series Series, bool Moved)> EnsureSeriesAsync(
             Folder anchor,
             SourceRecord source,
             string seriesName,
@@ -583,10 +675,13 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             var premiereDate = oldestPublishedAt?.UtcDateTime;
             var productionYear = oldestPublishedAt?.UtcDateTime.Year;
 
+            // Must be computed before the assignments mutate the existing item.
+            var seriesMoved = existing is not null && existing.ParentId != anchor.Id;
+
             var changed = existing is null
+                || seriesMoved
                 || !string.Equals(series.Name, seriesName, StringComparison.Ordinal)
                 || !string.Equals(series.Overview, overview, StringComparison.Ordinal)
-                || series.ParentId != anchor.Id
                 || series.PremiereDate != premiereDate
                 || series.ProductionYear != productionYear
                 || series.DateLastMediaAdded != dates.LastContent;
@@ -625,16 +720,16 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             changed |= EnsurePoster(series, key);
 
             if (changed)
-                await CommitAsync(series, anchor, existing is null, cancellationToken)
+                await CommitAsync(series, anchor, existing is null || seriesMoved, cancellationToken)
                     .ConfigureAwait(false);
             primaryWrite?.Invoke();
             bannerWrite?.Invoke();
 
-            return series;
+            return (series, seriesMoved);
         }
 
         private async Task<Season> EnsureSeasonAsync(
-            Series series, int? seasonNumber, Season? current, CancellationToken cancellationToken)
+            Series series, int? seasonNumber, Season? current, bool seriesMoved, CancellationToken cancellationToken)
         {
             var number = seasonNumber ?? 0;
             if (current is not null && current.IndexNumber == number)
@@ -653,6 +748,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             var seriesKey = series.GetPresentationUniqueKey();
 
             var changed = existing is null
+                || seriesMoved
                 || !string.Equals(season.Name, name, StringComparison.Ordinal)
                 || season.IndexNumber != number
                 || season.ParentId != series.Id
@@ -678,7 +774,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 $"{series.GetProviderId("VOD") ?? series.Id.ToString()}|S{number.ToString(CultureInfo.InvariantCulture)}");
 
             if (changed)
-                await CommitAsync(season, series, existing is null, cancellationToken)
+                await CommitAsync(season, series, existing is null || seriesMoved, cancellationToken)
                     .ConfigureAwait(false);
 
             return season;
@@ -1129,6 +1225,65 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             return oldest;
         }
 
+        /// <summary>
+        /// Returns a previously published anchor by id, or null when it no longer exists or is no
+        /// longer a folder.
+        /// </summary>
+        /// <remarks>
+        /// A stored anchor outlives the library it named. It only ever serves cleanup, so a caller
+        /// must be able to carry on without it rather than fail a source whose own target is fine.
+        /// </remarks>
+        public Folder? FindAnchorById(Guid anchorId)
+            => anchorId == Guid.Empty ? null : _libraryManager.GetItemById(anchorId) as Folder;
+
+        /// <summary>
+        /// Removes every trace of one source from the given anchors: its items, and the containers
+        /// that held them.
+        /// </summary>
+        /// <param name="anchors">Everywhere this source may have published. Deduplicated here.</param>
+        /// <param name="source">The source being retired.</param>
+        /// <param name="allKnownVideoIds">
+        /// Every video the database still knows. An item whose video appears here is claimed by
+        /// another source and is spared.
+        /// </param>
+        /// <returns>How many items were removed.</returns>
+        /// <remarks>
+        /// Separate from <see cref="ReconcileAsync"/> rather than an empty-expectation call to it:
+        /// there is no target to publish into and no mode to honour, and passing an arbitrary one
+        /// only invited a comment explaining that it did not matter.
+        /// </remarks>
+        public int PurgeSource(
+            IReadOnlyList<Folder> anchors,
+            SourceRecord source,
+            IReadOnlySet<string> allKnownVideoIds)
+        {
+            ArgumentNullException.ThrowIfNull(anchors);
+            ArgumentNullException.ThrowIfNull(source);
+            ArgumentNullException.ThrowIfNull(allKnownVideoIds);
+
+            var swept = DistinctById(anchors);
+
+            var removed = 0;
+            foreach (var (vodId, items) in ExistingByVodId(swept))
+            {
+                if (allKnownVideoIds.Contains(vodId))
+                    continue;
+
+                foreach (var item in items)
+                {
+                    _libraryManager.DeleteItem(
+                        item, new DeleteOptions { DeleteFileLocation = false }, true);
+                    removed++;
+                }
+            }
+
+            foreach (var anchor in swept)
+                removed += ReconcileContainers(anchor, source, [], null);
+
+            LogPurgedSource(source.Url, removed);
+            return removed;
+        }
+
         [LoggerMessage(EventId = 1, Level = LogLevel.Information,
             Message = "Reconciled {SourceUrl}: {Created} created, {Updated} updated, {Removed} removed, {Unchanged} unchanged")]
         private partial void LogReconciled(
@@ -1137,5 +1292,9 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         [LoggerMessage(EventId = 2, Level = LogLevel.Information,
             Message = "Library {LibraryName} has no indexed folder at {Location}; re-validating the top-level folders so Jellyfin indexes it")]
         private partial void LogIndexingLibrary(string libraryName, string location);
+
+        [LoggerMessage(EventId = 4, Level = LogLevel.Information,
+            Message = "Purged source {SourceUrl}: {Removed} item(s) removed")]
+        private partial void LogPurgedSource(string sourceUrl, int removed);
     }
 }
