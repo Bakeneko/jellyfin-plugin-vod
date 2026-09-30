@@ -898,6 +898,27 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         private async Task<Series> PublishSeriesAsync(params VideoRecord[] videos)
             => await PublishSeriesAsync(useReleaseDate: false, videos);
 
+        /// <summary>
+        /// Publishes a series from a caller-supplied source, so a test can carry artwork on it.
+        /// <see cref="PublishSeriesAsync(VideoRecord[])"/> builds a bare record and cannot.
+        /// </summary>
+        private async Task<Series> PublishSeriesWithSourceAsync(
+            SourceRecord source, params VideoRecord[] videos)
+        {
+            var captured = new List<BaseItem>();
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => captured.Add(call.ArgAt<BaseItem>(0)));
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            await _publisher.ReconcileAsync(
+                StudioTarget, [], source,
+                SourceMode.Series, "Test", videos,
+                videos.Select(v => v.Id).ToHashSet(), "http://localhost:8096",
+                useReleaseDateAsDateAdded: false, CancellationToken.None);
+
+            return Assert.Single(captured.OfType<Series>());
+        }
+
         private async Task<Series> PublishSeriesAsync(bool useReleaseDate, params VideoRecord[] videos)
         {
             var captured = new List<BaseItem>();
@@ -931,6 +952,80 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             Assert.Equal(seen.UtcDateTime, LibraryPublisher.DateAddedFor(video, useReleaseDate: false));
             Assert.Equal(released.UtcDateTime, LibraryPublisher.DateAddedFor(video, useReleaseDate: true));
             Assert.Equal(seen.UtcDateTime, LibraryPublisher.DateAddedFor(video, useReleaseDate: false));
+        }
+
+        /// <summary>
+        /// Jellyfin builds a library's own tile from its children's Backdrop, not their Primary:
+        /// BaseDynamicImageProvider sets <c>useBackdrop</c> for a CollectionFolder and only falls back
+        /// to Primary then Thumb. A published item carrying no Backdrop therefore leaves the library
+        /// without a generated image, which is what these three tests pin.
+        /// </summary>
+        [Fact]
+        public async Task ReconcileAsync_PublishesTheStillAsBackdrop_ForAMovie()
+        {
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000060";
+            const string still = "https://example.test/still.jpg";
+
+            var video = VideoWith(vodId, "Youtube", null);
+            video.ThumbnailUrl = still;
+
+            BaseItem? created = null;
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created = call.ArgAt<BaseItem>(0));
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            await _publisher.ReconcileAsync(
+                StudioTarget, [], new SourceRecord { Url = "https://example.com/source" },
+                SourceMode.Movies, "Test", new[] { video },
+                new HashSet<string> { vodId }, "http://localhost:8096",
+                useReleaseDateAsDateAdded: false, CancellationToken.None);
+
+            Assert.NotNull(created);
+            Assert.Equal(still, created.GetImageInfo(ImageType.Backdrop, 0)?.Path);
+        }
+
+        /// <summary>
+        /// The Backdrop follows the series image, not the Thumb's banner: a YouTube channel banner is
+        /// about 6.2:1, so the 16:9 collage tile would crop it to an unrecognisable strip.
+        /// </summary>
+        [Fact]
+        public async Task ReconcileAsync_PublishesTheSeriesImageAsBackdrop_NotTheBanner()
+        {
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000061";
+            const string avatar = "https://example.test/avatar.jpg";
+
+            var video = VideoWith(vodId, "Youtube", null);
+            video.ThumbnailUrl = "https://example.test/still.jpg";
+
+            var series = await PublishSeriesWithSourceAsync(
+                new SourceRecord
+                {
+                    Url = "https://example.com/source",
+                    SeriesThumbnailUrl = avatar,
+                    SeriesBannerUrl = "https://example.test/banner.jpg"
+                },
+                video);
+
+            Assert.Equal(avatar, series.GetImageInfo(ImageType.Backdrop, 0)?.Path);
+        }
+
+        /// <summary>
+        /// Arte exposes no image at collection level, so the series image is the first episode's still
+        /// and the Backdrop must follow it there too.
+        /// </summary>
+        [Fact]
+        public async Task ReconcileAsync_FallsBackToTheFirstStillAsBackdrop_WhenTheSourceHasNoImage()
+        {
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000062";
+            const string still = "https://example.test/still.jpg";
+
+            var video = VideoWith(vodId, "ArteTV", null);
+            video.ThumbnailUrl = still;
+
+            var series = await PublishSeriesWithSourceAsync(
+                new SourceRecord { Url = "https://example.com/source" }, video);
+
+            Assert.Equal(still, series.GetImageInfo(ImageType.Backdrop, 0)?.Path);
         }
 
         private static VideoRecord VideoWith(string vodId, string? extractorKey, string? channelsJson)

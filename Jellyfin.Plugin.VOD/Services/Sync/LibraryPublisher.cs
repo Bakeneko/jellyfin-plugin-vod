@@ -548,6 +548,10 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             // The still is landscape, so it serves as the Thumb too; Jellyfin crops it for the poster
             // grid. A generated 2:3 poster only steps in when there is no still at all.
             changed |= ApplyImage(movie, ImageType.Thumb, video.ThumbnailUrl, video.PublishedImageUrl, null, out _);
+            // Jellyfin builds a library's own tile from its children's Backdrop, falling back to
+            // Primary then Thumb (BaseDynamicImageProvider.GetStripCollageImagePaths). Without one
+            // the library is left with no generated image.
+            changed |= ApplyImage(movie, ImageType.Backdrop, video.ThumbnailUrl, video.PublishedImageUrl, null, out _);
             changed |= EnsurePoster(movie, ItemKeyFor(video.Id));
 
             if (!changed)
@@ -717,6 +721,12 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             changed |= ApplyImage(series, ImageType.Thumb, source.SeriesBannerUrl ?? seriesImage,
                 source.PublishedBannerUrl,
                 url => _db.SetSourcePublishedBannerUrl(source.Url, url), out var bannerWrite);
+            // Gives a series library a generated tile, for the reason given on the movie Backdrop
+            // above. Follows the series image rather than the Thumb's banner: a YouTube channel banner
+            // is about 6.2:1, which the 16:9 collage tile would crop to an unrecognisable strip. It
+            // therefore tracks the URL the Primary call persists, which that call already writes.
+            changed |= ApplyImage(series, ImageType.Backdrop, seriesImage,
+                source.PublishedImageUrl, null, out _);
             changed |= EnsurePoster(series, key);
 
             if (changed)
