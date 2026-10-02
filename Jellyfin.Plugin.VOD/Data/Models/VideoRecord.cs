@@ -39,35 +39,14 @@ namespace Jellyfin.Plugin.VOD.Data.Models
         /// <summary>Gets or sets the UTC timestamp of the last sync of this entry.</summary>
         public DateTimeOffset SyncedAt { get; set; }
 
-        // Written by the sync, read by nothing yet: reserved for the remux path.
-        // No provider may rely on these — tracks come from the filtered HLS master.
-        /// <summary>Gets or sets the JSON array of available audio language codes.</summary>
-        public string? AudioLangs { get; set; }
-
-        // Written by the sync, read by nothing yet: reserved for the remux path.
-        // No provider may rely on these — tracks come from the filtered HLS master.
-        /// <summary>Gets or sets the JSON array of available subtitle language codes.</summary>
-        public string? SubtitleLangs { get; set; }
-
         /// <summary>Gets or sets the thumbnail URL.</summary>
         public string? ThumbnailUrl { get; set; }
 
-        /// <summary>The video's tags, as a JSON array, capped at the platform-agnostic limit.</summary>
-        public string? Tags { get; set; }
-
-        /// <summary>The video's categories, as a JSON array. Published as Jellyfin genres.</summary>
-        public string? Categories { get; set; }
-
         /// <summary>
-        /// The channels that own or uploaded the video, as a JSON array. Published as Jellyfin
-        /// studios, qualified with the platform at publish time.
+        /// The fields that need no column of their own. Never null: an absent or unreadable payload
+        /// reads back as an empty record, so a consumer never has to null-check it.
         /// </summary>
-        /// <remarks>
-        /// Holds the bare names yt-dlp reported, not the qualified studio strings. Keeping the
-        /// platform suffix out of storage leaves the labelling free to change without a migration,
-        /// and <see cref="ExtractorKey"/> already carries what the suffix is built from.
-        /// </remarks>
-        public string? Channels { get; set; }
+        public VideoExtras Extras { get; set; } = new();
 
         /// <summary>
         /// When the plugin first discovered this video. Set once, at the initial insert, and never

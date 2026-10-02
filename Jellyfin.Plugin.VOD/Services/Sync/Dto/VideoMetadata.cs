@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Text.Json;
+using Jellyfin.Plugin.VOD.Data.Models;
+using Jellyfin.Plugin.VOD.Services;
 
 namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
 {
@@ -78,8 +80,11 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
         /// </summary>
         public long? ReleaseTimestamp { get; init; }
 
-        /// <summary>Gets the unique audio language codes extracted from yt-dlp formats.</summary>
-        public IReadOnlyList<string> AudioLanguages { get; init; } = [];
+        /// <summary>The video qualities reachable through HLS, ascending by height then codec.</summary>
+        public IReadOnlyList<VideoQuality> Qualities { get; init; } = [];
+
+        /// <summary>The audio tracks reachable through HLS, in yt-dlp's reporting order.</summary>
+        public IReadOnlyList<AudioTrack> AudioTracks { get; init; } = [];
 
         /// <summary>Gets the subtitle language codes from the yt-dlp subtitles dictionary (not auto-captions).</summary>
         public IReadOnlyList<string> SubtitleLanguages { get; init; } = [];
@@ -131,26 +136,45 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
                     thumb = last;
                 }
 
-                // Audio languages: unique non-null language values from formats with audio
-                var audioLangs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                // Only HLS formats exist for this plugin: ResolveAsync selects bv*[protocol^=m3u8]
+                // and the filter parses an HLS master. This single rule excludes storyboards
+                // (mhtml) and every DASH-only format (https) — AV1 among them, which the HLS path
+                // cannot serve. It also fixes a latent bug: the HLS audio renditions report
+                // "acodec": null, so a predicate keyed on acodec dropped all of them.
+                var qualities = new List<VideoQuality>();
+                var audioTracks = new List<AudioTrack>();
+                var seenQualities = new HashSet<(int, string, int?)>();
+
                 if (root.TryGetProperty("formats", out var formats)
                     && formats.ValueKind == JsonValueKind.Array)
                 {
                     foreach (var fmt in formats.EnumerateArray())
                     {
-                        if (!fmt.TryGetProperty("acodec", out var acodec)) continue;
-                        var ac = acodec.GetString();
-                        if (string.IsNullOrEmpty(ac) || ac.Equals("none", StringComparison.OrdinalIgnoreCase))
+                        if (!IsHlsFormat(fmt))
                             continue;
-                        if (fmt.TryGetProperty("language", out var lang)
-                            && lang.ValueKind == JsonValueKind.String)
+
+                        var vcodec = ReadString(fmt, "vcodec");
+                        if (string.Equals(vcodec, "none", StringComparison.OrdinalIgnoreCase))
                         {
-                            var l = lang.GetString();
-                            if (!string.IsNullOrWhiteSpace(l))
-                                audioLangs.Add(l);
+                            audioTracks.Add(new AudioTrack(
+                                ReadString(fmt, "language"), ReadString(fmt, "format_id")));
+                            continue;
                         }
+
+                        var height = ReadInt(fmt, "height");
+                        var codec = CodecNames.Normalise(vcodec);
+                        if (height is null || codec is null)
+                            continue;
+
+                        var fps = ReadInt(fmt, "fps");
+                        if (seenQualities.Add((height.Value, codec, fps)))
+                            qualities.Add(new VideoQuality(height.Value, codec, fps));
                     }
                 }
+
+                qualities.Sort((a, b) => a.Height != b.Height
+                    ? a.Height.CompareTo(b.Height)
+                    : string.CompareOrdinal(a.Codec, b.Codec));
 
                 // Subtitle languages: keys of "subtitles" dict (not "automatic_captions")
                 var subLangs = new List<string>();
@@ -185,7 +209,8 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
                     IsUpcoming = root.TryGetProperty("is_upcoming", out var iu) && iu.ValueKind == JsonValueKind.True,
                     ReleaseTimestamp = root.TryGetProperty("release_timestamp", out var rt) && rt.ValueKind == JsonValueKind.Number
                         ? rt.GetInt64() : null,
-                    AudioLanguages = [.. audioLangs],
+                    Qualities = qualities,
+                    AudioTracks = audioTracks,
                     SubtitleLanguages = subLangs,
                     Tags = JsonArrays.ReadStrings(root, "tags", MaxTags),
                     Categories = JsonArrays.ReadStrings(root, "categories", MaxTags),
@@ -197,6 +222,19 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
                 return null;
             }
         }
+
+        /// <summary>Whether this format is reachable through the HLS path the plugin serves.</summary>
+        private static bool IsHlsFormat(JsonElement fmt)
+            => ReadString(fmt, "protocol") is { } p
+               && p.Contains("m3u8", StringComparison.OrdinalIgnoreCase);
+
+        private static string? ReadString(JsonElement el, string name)
+            => el.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String
+                ? v.GetString() : null;
+
+        private static int? ReadInt(JsonElement el, string name)
+            => el.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number
+                ? (int)Math.Round(v.GetDouble()) : null;
 
         /// <summary>
         /// The scalar properties holding a channel name, in the order they are preferred.

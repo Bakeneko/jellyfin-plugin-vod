@@ -73,9 +73,6 @@ namespace Jellyfin.Plugin.VOD.Configuration
         /// <summary>Gets or sets the HLS playlist cache TTL in minutes.</summary>
         public int CacheMinutes { get; set; } = 5;
 
-        /// <summary>Gets or sets the maximum video height (pixels) passed to HlsPlaylistFilter.</summary>
-        public int MaxHeight { get; set; } = 1080;
-
         /// <summary>
         /// Gets or sets the preferred audio language codes (BCP-47 prefixes, e.g. "en", "fr").
         /// Used by HlsPlaylistFilter to keep matching audio renditions.

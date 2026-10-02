@@ -214,5 +214,13 @@ namespace Jellyfin.Plugin.VOD.Tests.Controllers
         [Fact]
         public void JoinLanguages_TreatsNullAsEmpty()
             => Assert.Equal(string.Empty, VodController.JoinLanguages(null));
+
+        [Theory]
+        [InlineData(null, null, true)]      // no selection: the default rule applies
+        [InlineData(1080, "h264", true)]    // a complete selection
+        [InlineData(1080, null, false)]     // half a selection is a malformed request
+        [InlineData(null, "h264", false)]
+        public void IsWellFormedSelection_RequiresBothOrNeither(int? height, string? codec, bool expected)
+            => Assert.Equal(expected, VodController.IsWellFormedSelection(height, codec));
     }
 }

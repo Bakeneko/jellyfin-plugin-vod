@@ -13,6 +13,7 @@ using Jellyfin.Plugin.VOD.Data;
 using Jellyfin.Plugin.VOD.Data.Models;
 using Jellyfin.Plugin.VOD.Imaging;
 using Jellyfin.Plugin.VOD.Localization;
+using Jellyfin.Plugin.VOD.Services;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.Movies;
 using MediaBrowser.Controller.Entities.TV;
@@ -67,8 +68,32 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             _logger = logger;
         }
 
-        /// <summary>The key a video's item id is derived from. Never contains a path.</summary>
-        public string ItemKeyFor(string videoUuid) => $"vod:{videoUuid}";
+        /// <summary>The id key of a video's primary item.</summary>
+        /// <param name="videoUuid">The video's opaque VOD uuid.</param>
+        /// <returns>The id key.</returns>
+        public string ItemKeyFor(string videoUuid) => VersionGroup.KeyFor(videoUuid, null);
+
+        /// <summary>
+        /// Every item this video should have: the primary, plus one alternate per offered quality
+        /// tier.
+        /// </summary>
+        /// <param name="video">The stored video record.</param>
+        /// <param name="localBaseUrl">The base URL Jellyfin reaches this plugin on.</param>
+        /// <returns>One to three members, the primary at index 0.</returns>
+        /// <remarks>
+        /// A live video gets no alternates: its ladder is volatile and its segment URLs rotate, so a
+        /// tier captured at sync may already be gone by the time anyone selects it.
+        /// </remarks>
+        internal IReadOnlyList<VersionMember> MembersFor(VideoRecord video, string localBaseUrl)
+        {
+            ArgumentNullException.ThrowIfNull(video);
+
+            return video.IsLive
+                ? [new VersionMember(
+                    null, VersionGroup.KeyFor(video.Id, null), video.Title ?? string.Empty,
+                    VersionGroup.PathFor(localBaseUrl, video.Id, null))]
+                : VersionGroup.For(video, localBaseUrl);
+        }
 
         /// <summary>The marker that keeps a library location from reading as empty.</summary>
         private const string KeepMarkerName = ".keep";
@@ -226,18 +251,34 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             Season? currentSeason = null;
             int created = 0, updated = 0, unchanged = 0;
 
+            var processedVodIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
             foreach (var video in expected)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                var streamUrl = $"{localBaseUrl.TrimEnd('/')}/VOD/stream/{video.Id}.m3u8";
+                var members = MembersFor(video, localBaseUrl);
+                var primary = members[0];
+                processedVodIds.Add(video.Id);
 
                 UpsertOutcome outcome;
                 if (mode == SourceMode.Movies)
                 {
-                    outcome = await UpsertMovieAsync(
-                        anchor, video, streamUrl, published, useReleaseDate,
+                    Video committed;
+                    (outcome, committed) = await UpsertMovieAsync(
+                        anchor, video, primary, published, useReleaseDate,
                         cancellationToken).ConfigureAwait(false);
+
+                    var alternates = new List<BaseItem>();
+                    for (var i = 1; i < members.Count; i++)
+                    {
+                        alternates.Add(await UpsertAlternateAsync<Movie>(
+                                anchor, video, members[i], published, false, cancellationToken)
+                            .ConfigureAwait(false));
+                    }
+
+                    await LinkVersionsAsync(committed, alternates, cancellationToken)
+                        .ConfigureAwait(false);
                 }
                 else
                 {
@@ -250,9 +291,21 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                             .ConfigureAwait(false);
                     currentSeason = await EnsureSeasonAsync(series, video.SeasonNumber, currentSeason, seriesMoved, cancellationToken).ConfigureAwait(false);
 
-                    outcome = await UpsertEpisodeAsync(
-                        series, currentSeason, video, streamUrl, published,
+                    Video committed;
+                    (outcome, committed) = await UpsertEpisodeAsync(
+                        series, currentSeason, video, primary, published,
                         useReleaseDate, seriesMoved, cancellationToken)
+                        .ConfigureAwait(false);
+
+                    var alternates = new List<BaseItem>();
+                    for (var i = 1; i < members.Count; i++)
+                    {
+                        alternates.Add(await UpsertAlternateAsync<Episode>(
+                                currentSeason, video, members[i], published, seriesMoved, cancellationToken)
+                            .ConfigureAwait(false));
+                    }
+
+                    await LinkVersionsAsync(committed, alternates, cancellationToken)
                         .ConfigureAwait(false);
                 }
 
@@ -270,13 +323,18 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 }
             }
 
-            // An item is orphaned only when no source claims its video any more. Items belonging to
-            // other sources are in this map too, because the query spans whole libraries while
-            // `expected` is per-source.
+            // An item is orphaned when no source claims its video any more, or when it is a member
+            // this video no longer expects — a stale item from a flipped source mode, or an
+            // alternate for a tier the upstream has dropped. Every expected member was removed from
+            // the map by TakeById above, so whatever is left is genuinely unaccounted for. Items
+            // belonging to other sources are in this map too, because the query spans whole
+            // libraries while `expected` is per-source.
             var removed = 0;
             foreach (var (vodId, orphans) in published)
             {
-                if (allKnownVideoIds.Contains(vodId))
+                // Skip items that belong to a video claimed by another source and were not
+                // processed in this reconcile: they are not ours to delete.
+                if (allKnownVideoIds.Contains(vodId) && !processedVodIds.Contains(vodId))
                     continue;
 
                 foreach (var orphan in orphans)
@@ -415,10 +473,16 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             for (var i = 0; i < anchors.Count; i++)
                 topParentIds[i] = anchors[i].Id;
 
+            // IncludeAlternateVersions is load-bearing: Jellyfin hides every item carrying a
+            // PrimaryVersionId behind the version it belongs to, and its own comment on that filter
+            // says the library scan keeps them "so a merged version is not mistaken for a new item".
+            // Without it this sweep never sees the alternates it published — it would recreate them on
+            // every pass, and the orphan loop could never reap one whose tier the upstream dropped.
             var items = _libraryManager.GetItemList(new InternalItemsQuery
             {
                 TopParentIds = topParentIds,
                 IncludeItemTypes = [BaseItemKind.Episode, BaseItemKind.Movie],
+                IncludeAlternateVersions = true,
                 Recursive = true
             });
 
@@ -459,58 +523,64 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         }
 
         /// <summary>
-        /// Returns this video's item of the wanted type, deletes every other item claiming the same
-        /// video, and takes the whole entry out of the map so the orphan sweep never sees it again.
+        /// Returns the item carrying <paramref name="itemId"/> from this video's published group, and
+        /// removes it from the group so later passes do not see it again.
         /// </summary>
         /// <remarks>
-        /// A source whose Mode was flipped has the video published as the other kind. That id is
-        /// derived from the type, so the new item cannot reuse the old one's row: the stale item has
-        /// to go, or it stays in the library with nothing accounting for it. Every stale candidate is
-        /// deleted, not only the first — a source that has moved twice can have left one in each
-        /// library.
+        /// Targeted by id rather than by type: a video now has up to three items of the same type,
+        /// so "the first one of type T" is no longer a usable identity. Whatever is left in the group
+        /// after every expected member has been taken is handled by the caller — a stale item from a
+        /// flipped source mode, or an alternate for a tier the upstream dropped.
         /// </remarks>
-        private T? TakeOfType<T>(string vodId, Dictionary<string, List<BaseItem>> published)
+        private static T? TakeById<T>(string vodId, Guid itemId, Dictionary<string, List<BaseItem>> published)
             where T : BaseItem
         {
-            if (!published.Remove(vodId, out var candidates))
-                return null;
-
-            T? kept = null;
-            foreach (var candidate in candidates)
+            if (!published.TryGetValue(vodId, out var candidates))
             {
-                if (kept is null && candidate is T wanted)
-                {
-                    kept = wanted;
-                    continue;
-                }
-
-                _libraryManager.DeleteItem(
-                    candidate, new DeleteOptions { DeleteFileLocation = false }, true);
+                return null;
             }
 
-            return kept;
+            for (var i = 0; i < candidates.Count; i++)
+            {
+                if (candidates[i].Id.Equals(itemId) && candidates[i] is T wanted)
+                {
+                    candidates.RemoveAt(i);
+                    return wanted;
+                }
+            }
+
+            return null;
         }
 
-        /// <summary>Publishes one video as a Movie and reports what that did to the library.</summary>
-        private async Task<UpsertOutcome> UpsertMovieAsync(
+        /// <summary>
+        /// Publishes one video as a Movie and reports what that did to the library, along with the
+        /// instance it committed.
+        /// </summary>
+        /// <remarks>
+        /// Hands the instance back for the same reason <see cref="UpsertAlternateAsync{T}"/> does: the
+        /// linking step must write through the entity this method mutated and saved. Reading the
+        /// primary back by id instead would return whatever the LRU cache holds, which
+        /// <c>LibraryManager.UpdateItemsAsync</c> deliberately leaves unrefreshed — a copy from the
+        /// pass that created the item, whose stale fields a link write would commit over the fresh
+        /// ones.
+        /// </remarks>
+        private async Task<(UpsertOutcome Outcome, Video Item)> UpsertMovieAsync(
             Folder anchor,
             VideoRecord video,
-            string streamUrl,
+            VersionMember member,
             Dictionary<string, List<BaseItem>> published,
             bool useReleaseDateAsDateAdded,
             CancellationToken cancellationToken)
         {
-            var existing = TakeOfType<Movie>(video.Id, published);
+            var itemId = _libraryManager.GetNewItemId(member.ItemKey, typeof(Movie));
+            var existing = TakeById<Movie>(video.Id, itemId, published);
             var isNew = existing is null;
 
             // The item moved between libraries: commit through AddChild so Jellyfin re-parents it
             // and recomputes TopParentId, keeping the id and therefore the user's watch history.
             var reparent = existing is not null && existing.ParentId != anchor.Id;
 
-            var movie = existing ?? new Movie
-            {
-                Id = _libraryManager.GetNewItemId(ItemKeyFor(video.Id), typeof(Movie))
-            };
+            var movie = existing ?? new Movie { Id = itemId };
 
             var overview = BuildVideoOverview(video);
             var premiereDate = video.PublishedAt?.UtcDateTime;
@@ -522,7 +592,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 || !string.Equals(movie.Name, video.Title, StringComparison.Ordinal)
                 || !string.Equals(movie.Overview, overview, StringComparison.Ordinal)
                 || reparent
-                || !string.Equals(movie.Path, streamUrl, StringComparison.Ordinal)
+                || !string.Equals(movie.Path, member.Path, StringComparison.Ordinal)
                 || movie.PremiereDate != premiereDate
                 || movie.ProductionYear != productionYear
                 || movie.RunTimeTicks != runTimeTicks;
@@ -530,13 +600,13 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             movie.Name = video.Title;
             movie.Overview = overview;
             movie.ParentId = anchor.Id;
-            movie.Path = streamUrl;
+            movie.Path = member.Path;
             movie.PremiereDate = premiereDate;
             movie.ProductionYear = productionYear;
             movie.RunTimeTicks = runTimeTicks;
             changed |= ApplyDateAdded(movie, dateAdded);
             changed |= ApplyVideoIds(movie, video);
-            changed |= ApplyTags(movie, video.Tags, video.Categories);
+            changed |= ApplyTags(movie, video.Extras.Tags, video.Extras.Categories);
             changed |= ApplyStudios(movie, StudiosFor(video));
 
             var presentationKey = movie.CreatePresentationUniqueKey();
@@ -555,32 +625,34 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             changed |= EnsurePoster(movie, ItemKeyFor(video.Id));
 
             if (!changed)
-                return UpsertOutcome.Unchanged;
+                return (UpsertOutcome.Unchanged, movie);
 
             await CommitAsync(movie, anchor, isNew || reparent, cancellationToken).ConfigureAwait(false);
             imageWrite?.Invoke();
-            return isNew ? UpsertOutcome.Created : UpsertOutcome.Updated;
+            return (isNew ? UpsertOutcome.Created : UpsertOutcome.Updated, movie);
         }
 
-        /// <summary>Publishes one video as an Episode and reports what that did to the library.</summary>
-        private async Task<UpsertOutcome> UpsertEpisodeAsync(
+        /// <summary>
+        /// Publishes one video as an Episode and reports what that did to the library, along with the
+        /// instance it committed.
+        /// </summary>
+        /// <remarks>See <see cref="UpsertMovieAsync"/> for why the instance is handed back.</remarks>
+        private async Task<(UpsertOutcome Outcome, Video Item)> UpsertEpisodeAsync(
             Series series,
             Season season,
             VideoRecord video,
-            string streamUrl,
+            VersionMember member,
             Dictionary<string, List<BaseItem>> published,
             bool useReleaseDateAsDateAdded,
             bool seriesMoved,
             CancellationToken cancellationToken)
         {
-            var existing = TakeOfType<Episode>(video.Id, published);
+            var itemId = _libraryManager.GetNewItemId(member.ItemKey, typeof(Episode));
+            var existing = TakeById<Episode>(video.Id, itemId, published);
             var isNew = existing is null;
             var reparent = existing is not null && (existing.ParentId != season.Id || seriesMoved);
 
-            var episode = existing ?? new Episode
-            {
-                Id = _libraryManager.GetNewItemId(ItemKeyFor(video.Id), typeof(Episode))
-            };
+            var episode = existing ?? new Episode { Id = itemId };
 
             var overview = BuildVideoOverview(video);
             var premiereDate = video.PublishedAt?.UtcDateTime;
@@ -594,7 +666,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 || !string.Equals(episode.Name, video.Title, StringComparison.Ordinal)
                 || !string.Equals(episode.Overview, overview, StringComparison.Ordinal)
                 || reparent
-                || !string.Equals(episode.Path, streamUrl, StringComparison.Ordinal)
+                || !string.Equals(episode.Path, member.Path, StringComparison.Ordinal)
                 || episode.IndexNumber != video.EpisodeNumber
                 || episode.ParentIndexNumber != season.IndexNumber
                 || episode.PremiereDate != premiereDate
@@ -609,7 +681,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             episode.Name = video.Title;
             episode.Overview = overview;
             episode.ParentId = season.Id;
-            episode.Path = streamUrl;
+            episode.Path = member.Path;
             episode.IndexNumber = video.EpisodeNumber;
             episode.ParentIndexNumber = season.IndexNumber;
             episode.PremiereDate = premiereDate;
@@ -622,7 +694,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             episode.SeriesPresentationUniqueKey = seriesKey;
             changed |= ApplyDateAdded(episode, dateAdded);
             changed |= ApplyVideoIds(episode, video);
-            changed |= ApplyTags(episode, video.Tags, video.Categories);
+            changed |= ApplyTags(episode, video.Extras.Tags, video.Extras.Categories);
             changed |= ApplyStudios(episode, StudiosFor(video));
 
             var presentationKey = episode.CreatePresentationUniqueKey();
@@ -635,11 +707,180 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             changed |= ApplyImage(episode, ImageType.Thumb, video.ThumbnailUrl, video.PublishedImageUrl, null, out _);
 
             if (!changed)
-                return UpsertOutcome.Unchanged;
+                return (UpsertOutcome.Unchanged, episode);
 
             await CommitAsync(episode, season, isNew || reparent, cancellationToken).ConfigureAwait(false);
             imageWrite?.Invoke();
-            return isNew ? UpsertOutcome.Created : UpsertOutcome.Updated;
+            return (isNew ? UpsertOutcome.Created : UpsertOutcome.Updated, episode);
+        }
+
+        /// <summary>
+        /// Publishes one quality tier as its own item, carrying the same descriptive metadata as the
+        /// primary: only the name and the id differ.
+        /// </summary>
+        /// <remarks>
+        /// An alternate used to carry no description, tags, studios or images, on the reasoning that
+        /// being linked into a version group hides it from every listing, so artwork would be stored
+        /// for something nothing ever displays. That premise is too narrow: the playback history and
+        /// the resume rows show the item actually played, which is the alternate, so it needs to look
+        /// like the video. Only the published-image bookkeeping stays the primary's, because the
+        /// database holds one published_image_url per video.
+        /// <para>
+        /// Its PresentationUniqueKey is the computed value, like every other item. Before the
+        /// primary and alternate are linked, <c>Video.CreatePresentationUniqueKey</c> yields each
+        /// item's own <c>Id.ToString("N")</c>, so the keys are distinct. Once Task 6 calls
+        /// <c>SetPrimaryVersionId</c>, that method itself sets <c>PresentationUniqueKey</c> to the
+        /// primary's Guid, which is Jellyfin's own mechanism for hiding linked alternates from
+        /// listings — so there is nothing to fight here.
+        /// </para>
+        /// </remarks>
+        private async Task<BaseItem> UpsertAlternateAsync<T>(
+            Folder parent,
+            VideoRecord video,
+            VersionMember member,
+            Dictionary<string, List<BaseItem>> published,
+            bool seriesMoved,
+            CancellationToken cancellationToken)
+            where T : BaseItem, new()
+        {
+            var itemId = _libraryManager.GetNewItemId(member.ItemKey, typeof(T));
+            var existing = TakeById<T>(video.Id, itemId, published);
+            var isNew = existing is null;
+            var reparent = existing is not null && (existing.ParentId != parent.Id || seriesMoved);
+
+            var item = existing ?? new T { Id = itemId };
+
+            var runTimeTicks = RunTimeTicks(video);
+            var premiereDate = video.PublishedAt?.UtcDateTime;
+
+            var overview = BuildVideoOverview(video);
+            var productionYear = video.PublishedAt?.UtcDateTime.Year;
+
+            var changed = isNew
+                || reparent
+                || !string.Equals(item.Name, member.Name, StringComparison.Ordinal)
+                || !string.Equals(item.Overview, overview, StringComparison.Ordinal)
+                || !string.Equals(item.Path, member.Path, StringComparison.Ordinal)
+                || item.PremiereDate != premiereDate
+                || item.ProductionYear != productionYear
+                || item.RunTimeTicks != runTimeTicks;
+
+            item.Name = member.Name;
+            item.Overview = overview;
+            item.Path = member.Path;
+            item.ParentId = parent.Id;
+            item.PremiereDate = premiereDate;
+            item.ProductionYear = productionYear;
+            item.RunTimeTicks = runTimeTicks;
+            changed |= ApplyVideoIds(item, video);
+            changed |= ApplyTags(item, video.Extras.Tags, video.Extras.Categories);
+            changed |= ApplyStudios(item, StudiosFor(video));
+
+            // The published-image bookkeeping stays the primary's: the database holds one
+            // published_image_url per video, so an alternate passes no write-back callback.
+            changed |= ApplyImage(item, ImageType.Primary, video.ThumbnailUrl, video.PublishedImageUrl,
+                null, out _);
+            changed |= ApplyImage(item, ImageType.Thumb, video.ThumbnailUrl, video.PublishedImageUrl,
+                null, out _);
+            changed |= ApplyImage(item, ImageType.Backdrop, video.ThumbnailUrl, video.PublishedImageUrl,
+                null, out _);
+            // Keyed on the primary's item key, so the whole group shares one generated file instead of
+            // three identical ones. The primary is upserted before its alternates, so the text drawn
+            // on it is the video title rather than a tier label.
+            changed |= EnsurePoster(item, ItemKeyFor(video.Id));
+
+            var presentationKey = item.CreatePresentationUniqueKey();
+            changed |= !string.Equals(item.PresentationUniqueKey, presentationKey, StringComparison.Ordinal);
+            item.PresentationUniqueKey = presentationKey;
+
+            if (item is Episode episode && parent is Season season)
+            {
+                var seriesKey = season.SeriesPresentationUniqueKey;
+                changed |= episode.SeasonId != season.Id
+                    || episode.SeriesId != season.SeriesId
+                    || episode.IndexNumber != video.EpisodeNumber
+                    || episode.ParentIndexNumber != season.IndexNumber
+                    || !string.Equals(episode.SeriesPresentationUniqueKey, seriesKey, StringComparison.Ordinal);
+
+                episode.SeasonId = season.Id;
+                episode.SeasonName = season.Name;
+                episode.SeriesId = season.SeriesId;
+                episode.SeriesName = season.SeriesName;
+                episode.SeriesPresentationUniqueKey = seriesKey;
+                episode.IndexNumber = video.EpisodeNumber;
+                episode.ParentIndexNumber = season.IndexNumber;
+            }
+
+            if (changed)
+            {
+                await CommitAsync(item, parent, isNew || reparent, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            // The item itself, not an outcome: Task 6's linking step needs the committed instance,
+            // and an unchanged alternate still has to be linked.
+            return item;
+        }
+
+        /// <summary>
+        /// Ties a video's alternates to its primary: PrimaryVersionId on each alternate,
+        /// LinkedAlternateVersions on the primary in display order.
+        /// </summary>
+        /// <remarks>
+        /// Deliberately not MergeVersions: that endpoint elects the primary by Width, which this
+        /// plugin never sets, so the choice would be arbitrary. Measured on the test instance, it
+        /// picked by id order.
+        /// <para>
+        /// The primary's list is rewritten from the expected tiers every time, which is what makes a
+        /// vanished tier disappear from the menu before the orphan sweep deletes its item: a link
+        /// pointing at a deleted item would leave a dead entry behind.
+        /// </para>
+        /// <para>
+        /// Takes the instance the upsert committed rather than looking the primary up by id: the two
+        /// are not the same object inside one Jellyfin process, and only the committed one carries
+        /// this pass's metadata. See <see cref="UpsertMovieAsync"/>.
+        /// </para>
+        /// </remarks>
+        private static async Task LinkVersionsAsync(
+            Video primary,
+            IReadOnlyList<BaseItem> alternates,
+            CancellationToken cancellationToken)
+        {
+            var primaryId = primary.Id;
+
+            foreach (var alternate in alternates)
+            {
+                if (alternate is not Video alternateVideo
+                    || alternateVideo.PrimaryVersionId == primaryId)
+                {
+                    continue;
+                }
+
+                alternateVideo.SetPrimaryVersionId(primaryId);
+                await alternateVideo
+                    .UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            var links = alternates
+                .Select(a => new LinkedChild
+                {
+                    ItemId = a.Id,
+                    Type = LinkedChildType.LinkedAlternateVersion
+                })
+                .ToArray();
+
+            if (primary.LinkedAlternateVersions.Length == links.Length
+                && primary.LinkedAlternateVersions
+                    .Select(l => l.ItemId)
+                    .SequenceEqual(links.Select(l => l.ItemId)))
+            {
+                return;
+            }
+
+            primary.LinkedAlternateVersions = links;
+            await primary.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, cancellationToken)
+                .ConfigureAwait(false);
         }
 
         /// <summary>
@@ -698,7 +939,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             series.DateLastMediaAdded = dates.LastContent;
             changed |= ApplyDateAdded(series, dates.Added);
             changed |= ApplySourceIds(series, key);
-            changed |= ApplyTags(series, source.Tags, null);
+            changed |= ApplyTags(series, DeserialiseStrings(source.Tags), []);
             changed |= ApplyStudios(series, studios);
 
             // Jellyfin only fills PresentationUniqueKey in MetadataService.BeforeSaveInternal, which
@@ -964,10 +1205,11 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// item when something actually differs: a field written without being compared would be
         /// computed on every pass and silently thrown away.
         /// </remarks>
-        private static bool ApplyTags(BaseItem item, string? tagsJson, string? categoriesJson)
+        private static bool ApplyTags(
+            BaseItem item, IReadOnlyList<string> tagValues, IReadOnlyList<string> categoryValues)
         {
-            var tags = AsJellyfinStores(DeserialiseStrings(tagsJson));
-            var genres = AsJellyfinStores(DeserialiseStrings(categoriesJson));
+            var tags = AsJellyfinStores(tagValues);
+            var genres = AsJellyfinStores(categoryValues);
 
             var changed = !item.Tags.SequenceEqual(tags, StringComparer.Ordinal)
                 || !item.Genres.SequenceEqual(genres, StringComparer.Ordinal);
@@ -995,12 +1237,12 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// are never re-fetched: full metadata is only pulled for new playlist entries.
         /// </para>
         /// </remarks>
-        private static string[] AsJellyfinStores(string[] values)
+        private static string[] AsJellyfinStores(IReadOnlyList<string> values)
         {
-            if (values.Length == 0)
-                return values;
+            if (values.Count == 0)
+                return [];
 
-            var kept = new List<string>(values.Length);
+            var kept = new List<string>(values.Count);
             foreach (var value in values)
             {
                 var cleaned = value.Replace('|', '/');
@@ -1019,7 +1261,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// </summary>
         /// <remarks>
         /// The platform suffix is what stops two same-named channels on different platforms from
-        /// collapsing into one studio. <see cref="VideoRecord.Channels"/> holds the bare names so
+        /// collapsing into one studio. <see cref="VideoExtras.Channels"/> holds the bare names so
         /// the label can be rebuilt without migrating stored rows — but changing its format is not
         /// free: every label already published has a Studio item behind it, <c>Studio.CanDelete</c>
         /// is false, and nothing reaps the old ones. A relabel, like an upstream channel rename,
@@ -1142,12 +1384,12 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// </summary>
         private static string[] StudiosFor(VideoRecord video)
         {
-            var channels = DeserialiseStrings(video.Channels);
-            if (channels.Length == 0)
-                return channels;
+            var channels = video.Extras.Channels;
+            if (channels.Count == 0)
+                return [];
 
-            var qualified = new string[channels.Length];
-            for (var i = 0; i < channels.Length; i++)
+            var qualified = new string[channels.Count];
+            for (var i = 0; i < channels.Count; i++)
             {
                 qualified[i] = string.IsNullOrWhiteSpace(video.ExtractorKey)
                     ? channels[i]

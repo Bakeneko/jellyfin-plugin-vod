@@ -1,0 +1,106 @@
+{
+  "id": "128788-000-A",
+  "title": "La femme qui murmure à l'oreille des baleines bleues",
+  "formats": [
+    {
+      "format_id": "VF-STF-audio_0-allemand",
+      "protocol": "m3u8_native",
+      "vcodec": "none",
+      "acodec": null,
+      "height": null,
+      "fps": null,
+      "tbr": null,
+      "language": "de"
+    },
+    {
+      "format_id": "VF-STF-audio_0-allemand__confort_audio_",
+      "protocol": "m3u8_native",
+      "vcodec": "none",
+      "acodec": null,
+      "height": null,
+      "fps": null,
+      "tbr": null,
+      "language": "de"
+    },
+    {
+      "format_id": "VF-STF-audio_0-français__confort_audio_",
+      "protocol": "m3u8_native",
+      "vcodec": "none",
+      "acodec": null,
+      "height": null,
+      "fps": null,
+      "tbr": null,
+      "language": "fr"
+    },
+    {
+      "format_id": "VF-STF-audio_0-français",
+      "protocol": "m3u8_native",
+      "vcodec": "none",
+      "acodec": null,
+      "height": null,
+      "fps": null,
+      "tbr": null,
+      "language": "fr"
+    },
+    {
+      "format_id": "VF-STF-1083",
+      "protocol": "m3u8_native",
+      "vcodec": "avc1.4D001E",
+      "acodec": "none",
+      "height": 432,
+      "fps": 25.0,
+      "tbr": 1083.232,
+      "language": null
+    },
+    {
+      "format_id": "VF-STF-952",
+      "protocol": "m3u8_native",
+      "vcodec": "hev1.1.6.L90.B0",
+      "acodec": "none",
+      "height": 432,
+      "fps": 25.0,
+      "tbr": 952.136,
+      "language": null
+    },
+    {
+      "format_id": "VF-STF-1834",
+      "protocol": "m3u8_native",
+      "vcodec": "avc1.64001F",
+      "acodec": "none",
+      "height": 720,
+      "fps": 25.0,
+      "tbr": 1834.056,
+      "language": null
+    },
+    {
+      "format_id": "VF-STF-1647",
+      "protocol": "m3u8_native",
+      "vcodec": "hev1.1.6.L93.B0",
+      "acodec": "none",
+      "height": 720,
+      "fps": 25.0,
+      "tbr": 1647.672,
+      "language": null
+    },
+    {
+      "format_id": "VF-STF-3059",
+      "protocol": "m3u8_native",
+      "vcodec": "avc1.640028",
+      "acodec": "none",
+      "height": 1080,
+      "fps": 25.0,
+      "tbr": 3059.344,
+      "language": null
+    },
+    {
+      "format_id": "VF-STF-2921",
+      "protocol": "m3u8_native",
+      "vcodec": "hev1.1.6.L120.B0",
+      "acodec": "none",
+      "height": 1080,
+      "fps": 25.0,
+      "tbr": 2921.544,
+      "language": null
+    }
+  ]
+}

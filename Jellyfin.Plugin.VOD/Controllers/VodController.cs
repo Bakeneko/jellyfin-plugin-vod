@@ -74,7 +74,8 @@ namespace Jellyfin.Plugin.VOD.Controllers
         /// </summary>
         /// <param name="id">Opaque UUID from the <c>videos</c> table.</param>
         /// <param name="format">yt-dlp format selector. Default picks any HLS video stream.</param>
-        /// <param name="maxHeight">Tallest variant to serve. Falls back to the configured value.</param>
+        /// <param name="height">Exact variant height to serve, or null for the default tier.</param>
+        /// <param name="codec">Exact variant codec to serve, or null for the default tier.</param>
         /// <param name="audioLangs">Comma-separated language prefixes to keep beside the original audio. Falls back to the configured value.</param>
         /// <param name="subLangs">Comma-separated subtitle language prefixes to include. Falls back to the configured value.</param>
         /// <param name="cancellationToken">Cancellation token.</param>
@@ -83,7 +84,7 @@ namespace Jellyfin.Plugin.VOD.Controllers
         /// false — Jellyfin must not hand this URL to a remote client (CDN segments are signed for the
         /// server's IP; loopback resolves only inside the container).
         ///
-        /// Every filtering parameter is nullable so an absent one can fall back to the configured
+        /// Audio and subtitle parameters are nullable so an absent one can fall back to the configured
         /// value: Jellyfin builds these URLs itself and passes none of them, so without the fallback
         /// the administrator's settings would never reach playback. Absent and "?audioLangs=" are
         /// NOT distinguishable here — MVC binds an empty query value to null through
@@ -93,13 +94,23 @@ namespace Jellyfin.Plugin.VOD.Controllers
         public async Task<ActionResult> GetStream(
             [FromRoute] string id,
             [FromQuery] string format = "bv*[protocol^=m3u8]",
-            [FromQuery] int? maxHeight = null,
+            [FromQuery] int? height = null,
+            [FromQuery] string? codec = null,
             [FromQuery] string? audioLangs = null,
             [FromQuery] string? subLangs = null,
             CancellationToken cancellationToken = default)
         {
+            if (!IsWellFormedSelection(height, codec))
+            {
+                return BadRequest(new
+                {
+                    error = "height and codec must be supplied together, or neither",
+                    height,
+                    codec
+                });
+            }
+
             var config = Plugin.Instance?.Configuration;
-            var effectiveMaxHeight = maxHeight ?? config?.MaxHeight ?? 1080;
             var effectiveAudioLangs = audioLangs ?? JoinLanguages(config?.PreferredAudioLanguages);
             var effectiveSubLangs = subLangs ?? JoinLanguages(config?.PreferredSubtitleLanguages);
 
@@ -111,7 +122,7 @@ namespace Jellyfin.Plugin.VOD.Controllers
 
             var cacheKey = string.Create(
                 System.Globalization.CultureInfo.InvariantCulture,
-                $"{id}|{format}|{effectiveMaxHeight}|{effectiveAudioLangs}|{effectiveSubLangs}");
+                $"{id}|{format}|{height}|{codec}|{effectiveAudioLangs}|{effectiveSubLangs}");
 
             if (_cache.TryGet(cacheKey, out var cached))
             {
@@ -134,13 +145,20 @@ namespace Jellyfin.Plugin.VOD.Controllers
             }
 
             var filtered = await FilterUpstreamAsync(
-                    resolution.Url, effectiveMaxHeight, effectiveAudioLangs, effectiveSubLangs,
+                    resolution.Url, height, codec, effectiveAudioLangs, effectiveSubLangs,
                     cancellationToken)
                 .ConfigureAwait(false);
 
             if (filtered is null)
             {
-                return Redirect(resolution.Url);
+                return height is null
+                    ? Redirect(resolution.Url)
+                    : StatusCode(503, new
+                    {
+                        error = "Could not serve the requested quality: the tier is no longer offered upstream, or the upstream playlist could not be fetched",
+                        height,
+                        codec
+                    });
             }
 
             // Cache miss only: this bounds stream writes to roughly one per playlist TTL.
@@ -149,7 +167,7 @@ namespace Jellyfin.Plugin.VOD.Controllers
             try
             {
                 var streams = MediaStreamBuilder.Build(filtered);
-                _streamWriter.TryWrite(id, streams, cancellationToken);
+                _streamWriter.TryWrite(id, height, codec, streams, cancellationToken);
             }
 #pragma warning disable CA1031 // nothing about persisting track labels is worth failing playback for
             catch (Exception ex)
@@ -408,8 +426,17 @@ namespace Jellyfin.Plugin.VOD.Controllers
                 ? string.Empty
                 : string.Join(',', languages.Where(l => !string.IsNullOrWhiteSpace(l)));
 
+        /// <summary>
+        /// Whether the quality selection is complete. height and codec identify one variant
+        /// together; one without the other is a malformed request, not half a selection to guess at.
+        /// </summary>
+        /// <param name="height">The requested height, or null for the default tier.</param>
+        /// <param name="codec">The requested codec, or null for the default tier.</param>
+        internal static bool IsWellFormedSelection(int? height, string? codec)
+            => height.HasValue == !string.IsNullOrWhiteSpace(codec);
+
         private async Task<string?> FilterUpstreamAsync(
-            string masterUrl, int maxHeight, string audioLangs, string subLangs, CancellationToken cancellationToken)
+            string masterUrl, int? height, string? codec, string audioLangs, string subLangs, CancellationToken cancellationToken)
         {
             var baseUri = new Uri(masterUrl);
             var upstream = await FetchStringAsync(masterUrl, cancellationToken).ConfigureAwait(false);
@@ -421,7 +448,8 @@ namespace Jellyfin.Plugin.VOD.Controllers
             return HlsPlaylistFilter.FilterMaster(
                 upstream,
                 baseUri,
-                maxHeight,
+                height,
+                codec,
                 audioLangs.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries),
                 subLangs.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries),
                 ServeSubtitle);

@@ -251,8 +251,12 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
             // A stored entry's metadata is immutable except while it is live: a stream that has
             // since ended would keep IsLive set and its scheduled-broadcast synopsis forever.
+            // Rows that have never been given a payload (written before the extras column existed)
+            // are excluded from the skip set, so they are probed on EVERY pass until a fetch
+            // answers — one yt-dlp process per such row per sync. That recurring cost is accepted
+            // deliberately; see HasPayload for why remembering a failure instead is worse.
             var skipMetadataIds = existingVideos
-                .Where(v => v.NativeId is not null && !v.IsLive)
+                .Where(v => v.NativeId is not null && !v.IsLive && HasPayload(v.Extras))
                 .Select(v => v.NativeId!)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
@@ -284,6 +288,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                         var meta = await _ytDlp.GetVideoMetadataAsync(entry.VideoUrl, ct)
                             .ConfigureAwait(false);
                         if (meta is null) continue;
+
                         var publishedAt = ParseDate(meta);
                         if (publishedAt.HasValue && publishedAt.Value < retentionCutoff.Value)
                             break;
@@ -463,16 +468,16 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 // The localized prefix is resolved via IVodLocalizer
                 record.Description = BuildDescription(meta, publishedAt, _localizer);
                 record.ThumbnailUrl = meta.Thumbnail;
-                record.Tags = meta.Tags.Count > 0 ? JsonSerializer.Serialize(meta.Tags) : null;
-                record.Categories = meta.Categories.Count > 0
-                    ? JsonSerializer.Serialize(meta.Categories) : null;
-                record.Channels = meta.Channels.Count > 0
-                    ? JsonSerializer.Serialize(meta.Channels) : null;
+                record.Extras = record.Extras with
+                {
+                    Tags = meta.Tags,
+                    Categories = meta.Categories,
+                    Channels = meta.Channels,
+                    SubtitleLanguages = meta.SubtitleLanguages,
+                    Qualities = meta.Qualities,
+                    AudioTracks = meta.AudioTracks
+                };
                 record.DurationSeconds = meta.Duration.HasValue ? (int)meta.Duration.Value : null;
-                record.AudioLangs = meta.AudioLanguages.Count > 0
-                    ? JsonSerializer.Serialize(meta.AudioLanguages) : null;
-                record.SubtitleLangs = meta.SubtitleLanguages.Count > 0
-                    ? JsonSerializer.Serialize(meta.SubtitleLanguages) : null;
                 record.IsLive = meta.IsLive;
                 record.SyncedAt = syncStart;
 
@@ -572,6 +577,34 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 LogDeletedOrphan(uuid);
             }
         }
+
+        /// <summary>
+        /// Whether this row has ever been given a payload, whatever that payload turned out to hold.
+        /// </summary>
+        /// <remarks>
+        /// A row that HAS one is never probed again, including when its payload is empty, because empty
+        /// is a real answer: the platform offered no formats, tags, categories, channels or subtitles.
+        /// Deciding this from the payload's content instead made that case indistinguishable from a row
+        /// that was never given a payload at all, so such a video cost one yt-dlp process per sync for
+        /// ever. The column being NULL is what carries the distinction; <c>VodDatabase.ReadExtras</c>
+        /// turns it into <see cref="VideoExtras.NoPayload"/>, and nothing else answers version 0.
+        /// <para>
+        /// A row that has none — written before the extras column existed, or holding a value that no
+        /// longer parses — is probed on every pass until a fetch answers, and that recurring cost is
+        /// accepted deliberately. There is no safe way to remember the failure: a fetch that resolves
+        /// nothing reports it as a null result, and so does every transient failure — a bot check, an
+        /// HTTP 429, expired cookies, a broken extractor, a DNS blip, unparseable output
+        /// (<c>YtDlpService.RunProcessAsync</c> returns null on ANY non-zero exit). Remembering that
+        /// would mark a perfectly good video as having an empty payload, permanently: migration 5 added
+        /// the extras column with no backfill, so every pre-existing row is payload-less, and one
+        /// throttling wave would stamp them all at once. The empty payload published on that pass then
+        /// wipes each item's tags, genres and studios, since <c>ApplyTags</c> and <c>ApplyStudios</c>
+        /// assign unconditionally — and the row is never probed again, so they never come back.
+        /// Probing repeatedly costs CPU and self-corrects; remembering costs the item's metadata and
+        /// does not.
+        /// </para>
+        /// </remarks>
+        internal static bool HasPayload(VideoExtras extras) => extras.Version > 0;
 
         /// <summary>
         /// Picks the name a source's series carries.

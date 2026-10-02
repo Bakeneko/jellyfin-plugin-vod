@@ -13,22 +13,33 @@ namespace Jellyfin.Plugin.VOD.Services
     /// <remarks>
     /// Four behaviours make a bare upstream master unusable:
     /// (1) ffmpeg plays the first variant, not the best — Arte would play at 768x432.
-    /// (2) YouTube ships ~38 auto-dubbed audio renditions; ffmpeg opens every single one.
+    /// (2) YouTube ships ~38 auto-dubbed audio renditions; ffmpeg opens every single one, so
+    /// MaxAudioRenditions caps how many reach the served master.
     /// (3) YouTube's timedtext subtitle URIs cause ffmpeg to abort ("Invalid data found…").
     /// (4) Jellyfin probes with -probesize 1G, so every extra rendition costs startup time.
-    /// Output: one video variant (best H.264 ≤ maxHeight), genuine audio tracks, usable subtitles.
+    /// Output: one video variant (exact tier when requested, best AVC otherwise), genuine audio
+    /// tracks, usable subtitles.
     /// </remarks>
     public static partial class HlsPlaylistFilter
     {
         private const int MaxAudioRenditions = 8;
 
         /// <summary>
+        /// The ceiling applied to the default tier when no AVC variant exists. Not a setting: the
+        /// figure is the highest tier every measured platform ships in AVC, so it is the point
+        /// beyond which a default would start costing a transcode.
+        /// </summary>
+        private const int DefaultFallbackHeight = 1080;
+
+        /// <summary>
         /// Rewrites a master playlist down to a single video variant with its audio and usable subtitles.
-        /// Returns <see langword="null"/> if <paramref name="content"/> is not a master playlist.
+        /// Returns <see langword="null"/> if <paramref name="content"/> is not a master playlist,
+        /// or when an exact tier was requested but is no longer offered upstream.
         /// </summary>
         /// <param name="content">The upstream master playlist text.</param>
         /// <param name="baseUri">The master's own URL, used to absolutise relative URIs.</param>
-        /// <param name="maxHeight">Tallest variant to consider (fallback: uncapped).</param>
+        /// <param name="height">The requested height, or null for the default tier.</param>
+        /// <param name="codec">The requested codec, or null for the default tier.</param>
         /// <param name="audioLanguages">Language prefixes to keep (e.g. "fr", "en"). Empty = original only.</param>
         /// <param name="subtitleLanguages">Subtitle language prefixes to keep. Empty = keep all.</param>
         /// <param name="rewriteSubtitle">
@@ -38,7 +49,8 @@ namespace Jellyfin.Plugin.VOD.Services
         public static string? FilterMaster(
             string content,
             Uri baseUri,
-            int maxHeight,
+            int? height,
+            string? codec,
             IReadOnlyCollection<string> audioLanguages,
             IReadOnlyCollection<string> subtitleLanguages,
             Func<string, string?>? rewriteSubtitle = null)
@@ -82,6 +94,7 @@ namespace Jellyfin.Plugin.VOD.Services
                             ParseBandwidth(line),
                             ParseHeight(line),
                             line.Contains("avc1", StringComparison.OrdinalIgnoreCase),
+                            FirstCodec(line),
                             Attribute(line, "AUDIO"),
                             Attribute(line, "SUBTITLES"),
                             line,
@@ -97,7 +110,9 @@ namespace Jellyfin.Plugin.VOD.Services
                 }
             }
 
-            var best = SelectVariant(variants, maxHeight);
+            var best = height is { } h && codec is { } c
+                ? SelectExact(variants, h, c)
+                : SelectDefault(variants);
             if (best is null)
             {
                 return null;
@@ -107,9 +122,11 @@ namespace Jellyfin.Plugin.VOD.Services
                 .Where(m => m.IsAudio && m.GroupId == best.AudioGroup)
                 .ToList();
 
-            var candidates = audioGroup
-                .Where(m => !m.Uri.Contains("dubbed-auto", StringComparison.OrdinalIgnoreCase))
-                .ToList();
+            // Auto-dubbed renditions are served like any other: the client labels them at playback,
+            // so the viewer chooses knowingly. The old URI heuristic also made behaviour differ
+            // between platforms, because only YouTube marks these in the URI. MaxAudioRenditions
+            // below is what still bounds how many renditions ffmpeg will open.
+            var candidates = audioGroup.ToList();
 
             if (candidates.Exists(m => m.IsOriginal))
             {
@@ -157,9 +174,9 @@ namespace Jellyfin.Plugin.VOD.Services
             }
 
             var sb = new StringBuilder();
-            foreach (var h in header)
+            foreach (var hdr in header)
             {
-                sb.Append(h).Append('\n');
+                sb.Append(hdr).Append('\n');
             }
 
             for (var i = 0; i < audio.Count; i++)
@@ -190,24 +207,42 @@ namespace Jellyfin.Plugin.VOD.Services
             return sb.ToString();
         }
 
-        private static Variant? SelectVariant(List<Variant> variants, int maxHeight)
+        /// <summary>The requested tier, or null when the upstream no longer carries it.</summary>
+        private static Variant? SelectExact(List<Variant> variants, int height, string codec)
+            => variants
+                .Where(v => v.Height == height
+                    && string.Equals(CodecNames.Normalise(v.VideoCodec), codec, StringComparison.Ordinal))
+                .OrderByDescending(v => v.Bandwidth)
+                .FirstOrDefault();
+
+        /// <summary>
+        /// The default tier: the best AVC variant. When a platform ships none, the best variant at
+        /// or below <see cref="DefaultFallbackHeight"/>, so a VP9-only source cannot make 2160p the
+        /// default and surprise the viewer with a transcode.
+        /// </summary>
+        private static Variant? SelectDefault(List<Variant> variants)
         {
             if (variants.Count == 0)
             {
                 return null;
             }
 
-            var eligible = variants.Where(v => v.Height <= maxHeight).ToList();
-            if (eligible.Count == 0)
+            var avc = variants.Where(v => v.IsAvc).ToList();
+            if (avc.Count > 0)
             {
-                eligible = variants;
+                return avc.OrderByDescending(v => v.Bandwidth).First();
             }
 
-            return eligible
-                .OrderByDescending(v => v.IsAvc)
-                .ThenByDescending(v => v.Bandwidth)
-                .First();
+            var capped = variants.Where(v => v.Height <= DefaultFallbackHeight).ToList();
+            return (capped.Count > 0 ? capped : variants)
+                .OrderByDescending(v => v.Bandwidth).First();
         }
+
+        /// <summary>The variant's video codec, which CODECS lists first.</summary>
+        private static string? FirstCodec(string streamInf)
+            => (Attribute(streamInf, "CODECS") ?? string.Empty)
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .FirstOrDefault();
 
         private static string ForceDefault(string line, bool isDefault)
         {
@@ -331,6 +366,7 @@ namespace Jellyfin.Plugin.VOD.Services
             long Bandwidth,
             int Height,
             bool IsAvc,
+            string? VideoCodec,
             string? AudioGroup,
             string? SubtitleGroup,
             string Raw,

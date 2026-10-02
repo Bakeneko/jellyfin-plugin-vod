@@ -11,7 +11,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Jellyfin.Controller" Version="12.0.0" />
+    <PackageReference Include="Jellyfin.Controller" Version="12.1.0" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
     <!-- Compile-time only: the server already loads SkiaSharp and its native library from
          /jellyfin, so shipping our own copy would duplicate it and risk two versions in one

@@ -1,0 +1,67 @@
+{
+  "id": "317863628898",
+  "title": "otplol_ (live) 2026-09-30 10:38",
+  "is_live": true,
+  "formats": [
+    {
+      "format_id": "audio_only",
+      "protocol": "m3u8_native",
+      "vcodec": "none",
+      "acodec": "mp4a.40.2",
+      "height": null,
+      "fps": null,
+      "tbr": 160.0,
+      "language": null
+    },
+    {
+      "format_id": "160p",
+      "protocol": "m3u8_native",
+      "vcodec": "avc1.4D401F",
+      "acodec": "mp4a.40.2",
+      "height": 160,
+      "fps": 30.0,
+      "tbr": 230.0,
+      "language": null
+    },
+    {
+      "format_id": "360p",
+      "protocol": "m3u8_native",
+      "vcodec": "avc1.4D401F",
+      "acodec": "mp4a.40.2",
+      "height": 360,
+      "fps": 30.0,
+      "tbr": 630.0,
+      "language": null
+    },
+    {
+      "format_id": "480p",
+      "protocol": "m3u8_native",
+      "vcodec": "avc1.4D401F",
+      "acodec": "mp4a.40.2",
+      "height": 480,
+      "fps": 30.0,
+      "tbr": 1427.999,
+      "language": null
+    },
+    {
+      "format_id": "720p60",
+      "protocol": "m3u8_native",
+      "vcodec": "avc1.4D401F",
+      "acodec": "mp4a.40.2",
+      "height": 720,
+      "fps": 60.0,
+      "tbr": 3422.999,
+      "language": null
+    },
+    {
+      "format_id": "1080p60__source_",
+      "protocol": "m3u8_native",
+      "vcodec": "avc1.64002A",
+      "acodec": "mp4a.40.2",
+      "height": 1080,
+      "fps": 60.0,
+      "tbr": 9168.232,
+      "language": null
+    }
+  ]
+}

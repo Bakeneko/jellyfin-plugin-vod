@@ -126,17 +126,6 @@
                     </div>
 
                     <div class="inputContainer">
-                        <label class="inputLabel inputLabelUnfocused" for="maxHeight">Max video height (px)</label>
-                        <input id="maxHeight" name="MaxHeight" type="number" min="144" max="2160"
-                               is="emby-input" class="emby-input"
-                               placeholder="1080" />
-                        <div class="fieldDescription">
-                            Maximum video height passed to HLS playlist filtering. Variants above this
-                            height are excluded. Fallback: uncapped if no variant fits.
-                        </div>
-                    </div>
-
-                    <div class="inputContainer">
                         <label class="inputLabel inputLabelUnfocused" for="preferredAudioLanguages">Preferred audio languages</label>
                         <input id="preferredAudioLanguages" name="PreferredAudioLanguages" type="text"
                                is="emby-input" class="emby-input"
@@ -515,7 +504,6 @@
                             document.querySelector('#cookiesPath').value       = config.CookiesPath || '';
                             document.querySelector('#localBaseUrl').value      = config.LocalBaseUrl || 'http://localhost:8096';
                             document.querySelector('#cacheMinutes').value      = config.CacheMinutes || 5;
-                            document.querySelector('#maxHeight').value         = config.MaxHeight || 1080;
                             document.querySelector('#preferredAudioLanguages').value =
                                 (config.PreferredAudioLanguages || []).join(', ');
                             document.querySelector('#preferredSubtitleLanguages').value =
@@ -550,7 +538,6 @@
                             config.SeriesLibraryName = document.querySelector('#seriesLibraryName').value;
                             config.LocalBaseUrl    = document.querySelector('#localBaseUrl').value;
                             config.CacheMinutes    = parseInt(document.querySelector('#cacheMinutes').value, 10) || 5;
-                            config.MaxHeight       = parseInt(document.querySelector('#maxHeight').value, 10) || 1080;
                             config.PreferredAudioLanguages = document.querySelector('#preferredAudioLanguages').value
                                 .split(',').map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; });
                             config.PreferredSubtitleLanguages = document.querySelector('#preferredSubtitleLanguages').value

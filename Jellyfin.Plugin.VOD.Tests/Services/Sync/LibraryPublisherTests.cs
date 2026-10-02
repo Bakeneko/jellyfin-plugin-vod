@@ -275,8 +275,9 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         public async Task ReconcileAsync_ReplacesTheStaleItem_WhenTheSourceModeWasFlipped()
         {
             // Switching a source from Series to Movies republishes the video as a Movie under a new
-            // id. Nothing else accounts for the Episode afterwards — the orphan loop has already
-            // taken it out of the map — so the upsert has to delete it itself.
+            // id. The stale Episode's id does not match any expected member's id, so TakeById never
+            // claims it. After the per-video loop, processedVodIds contains the video's id, so the
+            // orphan loop's guard does not skip it — the Episode is deleted there.
             const string vodId = "3f9a2b1c-0000-0000-0000-000000000044";
             var stale = new Episode { Id = Guid.NewGuid() };
             stale.SetProviderId("VOD", vodId);
@@ -415,7 +416,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             // The platform suffix is what keeps two same-named channels on different platforms from
             // collapsing into one studio.
             const string vodId = "3f9a2b1c-0000-0000-0000-000000000050";
-            var created = await PublishOneMovieAsync(vodId, "Youtube", """["Terrapodia"]""");
+            var created = await PublishOneMovieAsync(vodId, "Youtube", ["Terrapodia"]);
 
             Assert.Equal(["Terrapodia (Youtube)"], created.Studios);
         }
@@ -427,7 +428,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             // "Topic" channels, where the uploader is the artist behind the channel.
             const string vodId = "3f9a2b1c-0000-0000-0000-000000000051";
             var created = await PublishOneMovieAsync(
-                vodId, "Youtube", """["Some Artist - Topic","Some Artist"]""");
+                vodId, "Youtube", ["Some Artist - Topic", "Some Artist"]);
 
             Assert.Equal(
                 ["Some Artist - Topic (Youtube)", "Some Artist (Youtube)"],
@@ -442,7 +443,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         public async Task ReconcileAsync_PublishesNoStudio_WhenThePlatformReportsNoChannel()
         {
             const string vodId = "3f9a2b1c-0000-0000-0000-000000000052";
-            var created = await PublishOneMovieAsync(vodId, "ArteTV", channelsJson: null);
+            var created = await PublishOneMovieAsync(vodId, "ArteTV", channels: null);
 
             Assert.Empty(created.Studios);
         }
@@ -451,7 +452,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         public async Task ReconcileAsync_FallsBackToBareChannelNames_WhenTheExtractorIsUnknown()
         {
             const string vodId = "3f9a2b1c-0000-0000-0000-000000000053";
-            var created = await PublishOneMovieAsync(vodId, null, """["Somewhere"]""");
+            var created = await PublishOneMovieAsync(vodId, null, ["Somewhere"]);
 
             Assert.Equal(["Somewhere"], created.Studios);
         }
@@ -465,7 +466,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         public async Task ReconcileAsync_LeavesStudiosAlone_OnTheSecondPass()
         {
             const string vodId = "3f9a2b1c-0000-0000-0000-000000000054";
-            var created = await PublishOneMovieAsync(vodId, "Youtube", """["Terrapodia"]""");
+            var created = await PublishOneMovieAsync(vodId, "Youtube", ["Terrapodia"]);
 
             _library.ClearReceivedCalls();
             _library.GetItemList(Arg.Any<InternalItemsQuery>())
@@ -475,7 +476,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 StudioTarget, [],
                 new SourceRecord { Url = "https://example.com/source" },
                 SourceMode.Movies, "Test",
-                new[] { VideoWith(vodId, "Youtube", """["Terrapodia"]""") },
+                new[] { VideoWith(vodId, "Youtube", ["Terrapodia"]) },
                 new HashSet<string> { vodId },
                 "http://localhost:8096", useReleaseDateAsDateAdded: false,
                 CancellationToken.None);
@@ -1028,7 +1029,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             Assert.Equal(still, series.GetImageInfo(ImageType.Backdrop, 0)?.Path);
         }
 
-        private static VideoRecord VideoWith(string vodId, string? extractorKey, string? channelsJson)
+        private static VideoRecord VideoWith(string vodId, string? extractorKey, IReadOnlyList<string>? channels)
             => new()
             {
                 Id = vodId,
@@ -1037,7 +1038,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 Title = "Studio subject",
                 DurationSeconds = 120,
                 ExtractorKey = extractorKey,
-                Channels = channelsJson,
+                Extras = new VideoExtras { Channels = channels ?? [] },
                 // Always set in production (SyncService assigns syncStart), and it must be here too:
                 // a default DateTimeOffset derives a MinValue date added, which AddChild then treats
                 // as unset and replaces — the item would differ on every pass for ever.
@@ -1059,7 +1060,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         public async Task ReconcileAsync_LeavesAStudiolessItemAlone_WhenJellyfinReadsItBackAsOneEmptyEntry()
         {
             const string vodId = "3f9a2b1c-0000-0000-0000-000000000057";
-            var created = await PublishOneMovieAsync(vodId, "ArteTV", channelsJson: null);
+            var created = await PublishOneMovieAsync(vodId, "ArteTV", channels: null);
             Assert.Empty(created.Studios);
 
             // What Jellyfin hands back for the row it just wrote.
@@ -1096,7 +1097,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         {
             const string vodId = "3f9a2b1c-0000-0000-0000-000000000060";
             var video = VideoWith(vodId, "Youtube", null);
-            video.Tags = """["Le monde de Jamy","Le Monde de Jamy","Sciences"]""";
+            video.Extras = video.Extras with { Tags = ["Le monde de Jamy", "Le Monde de Jamy", "Sciences"] };
 
             BaseItem? created = null;
             _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
@@ -1136,7 +1137,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         {
             const string vodId = "3f9a2b1c-0000-0000-0000-000000000058";
             var created = await PublishOneMovieAsync(
-                vodId, "Youtube", """["Hardware | Software"]""");
+                vodId, "Youtube", ["Hardware | Software"]);
 
             Assert.Equal(["Hardware / Software (Youtube)"], created.Studios);
             Assert.DoesNotContain('|', Assert.Single(created.Studios));
@@ -1151,7 +1152,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         {
             const string vodId = "3f9a2b1c-0000-0000-0000-000000000059";
             var created = await PublishOneMovieAsync(
-                vodId, "Youtube", """["Terrapodia","TERRAPODIA"]""");
+                vodId, "Youtube", ["Terrapodia", "TERRAPODIA"]);
 
             Assert.Equal(["Terrapodia (Youtube)"], created.Studios);
         }
@@ -1165,7 +1166,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         public async Task ReconcileAsync_CreatesTheStudioEntity()
         {
             const string vodId = "3f9a2b1c-0000-0000-0000-000000000055";
-            await PublishOneMovieAsync(vodId, "Youtube", """["Terrapodia"]""");
+            await PublishOneMovieAsync(vodId, "Youtube", ["Terrapodia"]);
 
             _library.Received(1).GetStudio("Terrapodia (Youtube)");
         }
@@ -1174,7 +1175,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         public async Task ReconcileAsync_CreatesNoStudioEntity_WhenThePlatformReportsNoChannel()
         {
             const string vodId = "3f9a2b1c-0000-0000-0000-000000000056";
-            await PublishOneMovieAsync(vodId, "ArteTV", channelsJson: null);
+            await PublishOneMovieAsync(vodId, "ArteTV", channels: null);
 
             _library.DidNotReceive().GetStudio(Arg.Any<string>());
         }
@@ -1292,9 +1293,11 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             // AddChild is the path a live probe exercised on a library change; it upserts and keeps
             // the id, and Jellyfin recomputes TopParentId from the new parent on persist.
             const string vodId = "3f9a2b1c-0000-0000-0000-000000000102";
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
             var oldAnchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Old" };
 
-            var moved = new Movie { Id = DeterministicId("moved"), ParentId = oldAnchor.Id };
+            var moved = new Movie { Id = DeterministicId($"vod:{vodId}|Movie"), ParentId = oldAnchor.Id };
             moved.SetProviderId("VOD", vodId);
             var originalId = moved.Id;
             _library.GetItemList(Arg.Any<InternalItemsQuery>())
@@ -1331,9 +1334,11 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             // sweep deduplicating by name rather than by id would list the target twice and sweep it
             // against itself.
             const string vodId = "3f9a2b1c-0000-0000-0000-000000000103";
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
             var same = _studioAnchor;
 
-            var published = new Movie { Id = DeterministicId("same"), ParentId = same.Id };
+            var published = new Movie { Id = DeterministicId($"vod:{vodId}|Movie"), ParentId = same.Id };
             published.SetProviderId("VOD", vodId);
             _library.GetItemList(Arg.Any<InternalItemsQuery>())
                 .Returns(new List<BaseItem> { published });
@@ -1535,7 +1540,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         private LibraryTarget StudioTarget => new("Vods", _studioAnchor, null);
 
         private async Task<BaseItem> PublishOneMovieAsync(
-            string vodId, string? extractorKey, string? channelsJson)
+            string vodId, string? extractorKey, IReadOnlyList<string>? channels)
         {
             BaseItem? created = null;
             _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
@@ -1546,7 +1551,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 StudioTarget, [],
                 new SourceRecord { Url = "https://example.com/source" },
                 SourceMode.Movies, "Test",
-                new[] { VideoWith(vodId, extractorKey, channelsJson) },
+                new[] { VideoWith(vodId, extractorKey, channels) },
                 new HashSet<string> { vodId },
                 "http://localhost:8096", useReleaseDateAsDateAdded: false,
                 CancellationToken.None);
@@ -1555,5 +1560,740 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             Assert.NotNull(created);
             return created;
         }
+
+        // VideoRecord is a sealed class with settable properties, not a record, so there is no
+        // `with` expression available: every variant is built here.
+        private static VideoRecord TieredVideo(
+            string vodId,
+            bool isLive = false,
+            int? seasonNumber = null,
+            int? episodeNumber = null,
+            VideoQuality[]? qualities = null) => new()
+        {
+            Id = vodId,
+            Title = "A Video Title",
+            VideoUrl = "https://example.com/watch?v=abc",
+            SourceUrl = "https://example.com/channel",
+            IsLive = isLive,
+            SeasonNumber = seasonNumber,
+            EpisodeNumber = episodeNumber,
+            Extras = new VideoExtras
+            {
+                Qualities = qualities ??
+                [
+                    new VideoQuality(1080, "h264", 30),
+                    new VideoQuality(2160, "vp9", 30)
+                ]
+            }
+        };
+
+        [Fact]
+        public void MembersFor_ReturnsThePrimaryAlone_WhenTheVideoIsLive()
+        {
+            // A live ladder is volatile and its URLs rotate, so tiers captured at sync may already
+            // be wrong. Offering none is the honest answer.
+            var members = _publisher.MembersFor(
+                TieredVideo("3f9a2b1c-0000-0000-0000-000000000050", isLive: true),
+                "http://localhost:8096");
+
+            var primary = Assert.Single(members);
+            Assert.Null(primary.Tier);
+        }
+
+        [Fact]
+        public void MembersFor_ReturnsThePrimaryAndItsTiers_WhenTheVideoIsNotLive()
+        {
+            var members = _publisher.MembersFor(
+                TieredVideo("3f9a2b1c-0000-0000-0000-000000000051"),
+                "http://localhost:8096");
+
+            Assert.Equal(3, members.Count);
+            Assert.Null(members[0].Tier);
+            Assert.Equal("[1080p] A Video Title", members[1].Name);
+            Assert.Equal("[2160p (VP9)] A Video Title", members[2].Name);
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_CreatesOneItemPerMember()
+        {
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000052";
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+            var created = new List<BaseItem>();
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created.Add(call.ArgAt<BaseItem>(0)));
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            var anchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+            var source = new SourceRecord { Url = "https://example.com/source" };
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                [TieredVideo(vodId)],
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            // One primary plus two alternates are created under the anchor. Asserted on what the
+            // publisher asked the library to create: Folder.AddChild ends in
+            // LibraryManager.CreateItem, and Folder.Children is not an in-memory list, so a
+            // substituted library manager never populates it.
+            Assert.Equal(3, created.Count);
+            // The load-bearing property of the whole one-to-many change: two items sharing a Guid
+            // collide in Jellyfin's item table. Nothing asserted this before.
+            Assert.Equal(3, created.Select(c => c.Id).Distinct().Count());
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_NamesThePrimaryAfterTheVideoAndTheAlternatesAfterTheirTier()
+        {
+            // The publisher rewrites Name on every sync. Without a deliberate per-member rule the
+            // next sync would rename every alternate to the bare video title and the menu would turn
+            // into three identical entries.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000053";
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+            var created = new List<BaseItem>();
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created.Add(call.ArgAt<BaseItem>(0)));
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            var anchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+            var source = new SourceRecord { Url = "https://example.com/source" };
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                [TieredVideo(vodId)],
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            var names = created.Select(c => c.Name).ToList();
+            Assert.Contains("A Video Title", names);
+            Assert.Contains("[1080p] A Video Title", names);
+            Assert.Contains("[2160p (VP9)] A Video Title", names);
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_GivesEachAlternateItsParameterisedPath()
+        {
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000054";
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+            var created = new List<BaseItem>();
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created.Add(call.ArgAt<BaseItem>(0)));
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            var anchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+            var source = new SourceRecord { Url = "https://example.com/source" };
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                [TieredVideo(vodId)],
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            var paths = created.Select(c => c.Path).ToList();
+            Assert.Contains($"http://localhost:8096/VOD/stream/{vodId}.m3u8", paths);
+            Assert.Contains($"http://localhost:8096/VOD/stream/{vodId}.m3u8?height=1080&codec=h264", paths);
+            Assert.Contains($"http://localhost:8096/VOD/stream/{vodId}.m3u8?height=2160&codec=vp9", paths);
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_GivesEveryMemberTheSameVodProviderId()
+        {
+            // PurgeSource tests allKnownVideoIds.Contains(vodId) and ExistingByVodId groups on this
+            // value. Encoding the tier here would make every alternate look like an unknown video
+            // and get it deleted on every purge.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000055";
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+            var created = new List<BaseItem>();
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created.Add(call.ArgAt<BaseItem>(0)));
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            var anchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+            var source = new SourceRecord { Url = "https://example.com/source" };
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                [TieredVideo(vodId)],
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            Assert.Equal(3, created.Count);
+            Assert.All(created, c => Assert.Equal(vodId, c.GetProviderId("VOD")));
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_GivesEveryMemberTheKeyJellyfinComputesForIt()
+        {
+            // The publisher must never invent a key of its own: Jellyfin's query-level
+            // de-duplication is driven by this column, and a hand-made value would hide the wrong
+            // item. Each member therefore carries exactly what the entity computes for itself —
+            // its own Guid for the primary, and the primary's Guid for a linked alternate, which is
+            // how Jellyfin hides an alternate from listings (Video.cs:434-438).
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000056";
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+            var created = new List<BaseItem>();
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created.Add(call.ArgAt<BaseItem>(0)));
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            var anchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+            var source = new SourceRecord { Url = "https://example.com/source" };
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                [TieredVideo(vodId)],
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            Assert.Equal(3, created.Count);
+            Assert.All(created, c => Assert.Equal(c.CreatePresentationUniqueKey(), c.PresentationUniqueKey));
+
+            var primaryId = _library.GetNewItemId(_publisher.ItemKeyFor(vodId), typeof(Movie));
+            var primaryKey = primaryId.ToString("N", CultureInfo.InvariantCulture);
+            Assert.Equal(
+                primaryKey, created.Single(c => c.Id.Equals(primaryId)).PresentationUniqueKey);
+            Assert.All(
+                created.Where(c => !c.Id.Equals(primaryId)),
+                c => Assert.Equal(primaryKey, c.PresentationUniqueKey));
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_DoesNotDeleteAnAlternate_AsIfItWereAStaleDuplicate()
+        {
+            // TakeOfType used to delete every item beyond the first claiming a video. An alternate
+            // is an expected member, not a leftover from a flipped source mode.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000057";
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+            var video = TieredVideo(vodId);
+            var members = _publisher.MembersFor(video, "http://localhost:8096");
+
+            var published = new List<BaseItem>();
+            foreach (var member in members)
+            {
+                var movie = new Movie
+                {
+                    Id = _library.GetNewItemId(member.ItemKey, typeof(Movie)),
+                    Name = member.Name,
+                    Path = member.Path
+                };
+                movie.SetProviderId("VOD", vodId);
+                published.Add(movie);
+            }
+
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(published);
+
+            var anchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+            var source = new SourceRecord { Url = "https://example.com/source" };
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                [video],
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            _library.DidNotReceive().DeleteItem(
+                Arg.Any<BaseItem>(), Arg.Any<DeleteOptions>(), Arg.Any<bool>());
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_CreatesAlternatesAsEpisodes_InSeriesMode()
+        {
+            // Spec: in Series mode the alternates are Episodes under the same season, where being
+            // hidden from listings keeps them out of the season view.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000058";
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+            var created = new List<BaseItem>();
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created.Add(call.ArgAt<BaseItem>(0)));
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            var anchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+            var source = new SourceRecord { Url = "https://example.com/source" };
+
+            var video = TieredVideo(vodId, seasonNumber: 1, episodeNumber: 3);
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Series, "Test",
+                [video],
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            var episodes = created.OfType<Episode>().Select(e => e.Name).ToList();
+
+            Assert.Contains("[1080p] A Video Title", episodes);
+            Assert.Contains("[2160p (VP9)] A Video Title", episodes);
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_DeletesTheStaleAlternate_WhenATierDisappearsUpstream()
+        {
+            // The reason the orphan guard needed processedVodIds: the vodId is still known, so the
+            // old guard would have skipped the leftover forever. The primary and the surviving
+            // alternate must come through untouched.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000070";
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+            var before = TieredVideo(vodId);
+            var members = _publisher.MembersFor(before, "http://localhost:8096");
+            var staleId = _library.GetNewItemId(members[2].ItemKey, typeof(Movie));
+
+            var stale = new Movie { Id = staleId, Name = members[2].Name, Path = members[2].Path };
+            stale.SetProviderId("VOD", vodId);
+            _library.GetItemList(Arg.Any<InternalItemsQuery>())
+                .Returns(new List<BaseItem> { stale });
+
+            var after = TieredVideo(vodId, qualities: [new VideoQuality(1080, "h264", 30)]);
+
+            var anchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+            var source = new SourceRecord { Url = "https://example.com/source" };
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                [after],
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            _library.Received(1).DeleteItem(stale, Arg.Any<DeleteOptions>(), true);
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_SparesItemsOwnedByAnotherSource_WhenAnotherVideoIsProcessed()
+        {
+            // The preservation half of the processedVodIds guard. The pre-existing preservation
+            // test covers expected = []; this one exercises a pass that processes one video while
+            // another known video is in the map but not in expected.
+            const string ownedId = "3f9a2b1c-0000-0000-0000-000000000076";
+            const string processedId = "3f9a2b1c-0000-0000-0000-000000000077";
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+
+            // An item that belongs to a different source — in allKnownVideoIds but not in expected.
+            var spare = new Movie { Id = Guid.NewGuid() };
+            spare.SetProviderId("VOD", ownedId);
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem> { spare });
+
+            var anchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+            var source = new SourceRecord { Url = "https://example.com/source" };
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                [VideoWith(processedId, "Youtube", null)],
+                new HashSet<string> { ownedId, processedId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            _library.DidNotReceive().DeleteItem(spare, Arg.Any<DeleteOptions>(), Arg.Any<bool>());
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_GivesAnAlternateTheSameDescriptiveMetadataAsThePrimary()
+        {
+            // An alternate used to carry only enough to be identified and played, on the reasoning
+            // that being linked hides it from every listing so its artwork would never be displayed.
+            // That premise is too narrow: the playback history and resume rows show the item actually
+            // played, which is the alternate. Everything descriptive therefore matches the primary,
+            // and only the name and the id differ.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000066";
+            const string still = "https://example.test/still.jpg";
+
+            var video = TieredVideo(vodId);
+            video.Description = "What the video is about.";
+            video.ThumbnailUrl = still;
+            video.Extras = video.Extras with
+            {
+                Tags = ["space", "cosmos"],
+                Categories = ["Education"],
+                Channels = ["Kosmo"]
+            };
+
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+            var created = new List<BaseItem>();
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created.Add(call.ArgAt<BaseItem>(0)));
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            var anchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [],
+                new SourceRecord { Url = "https://example.com/source" },
+                SourceMode.Movies, "Test", [video],
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            var primary = Assert.Single(created, c => c.Name == "A Video Title");
+            var alternate = Assert.Single(created, c => c.Name == "[1080p] A Video Title");
+
+            Assert.Equal(primary.Overview, alternate.Overview);
+            Assert.NotNull(alternate.Overview);
+            Assert.Equal(primary.Tags, alternate.Tags);
+            Assert.Equal(primary.Genres, alternate.Genres);
+            Assert.Equal(primary.Studios, alternate.Studios);
+            Assert.Equal(primary.ProductionYear, alternate.ProductionYear);
+            Assert.Equal(still, alternate.GetImageInfo(ImageType.Primary, 0)?.Path);
+            Assert.Equal(still, alternate.GetImageInfo(ImageType.Thumb, 0)?.Path);
+            Assert.Equal(still, alternate.GetImageInfo(ImageType.Backdrop, 0)?.Path);
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_AsksForAlternateVersions_WhenReadingWhatIsAlreadyPublished()
+        {
+            // Jellyfin hides every item carrying a PrimaryVersionId from any query that does not ask
+            // for alternates (BaseItemRepository.TranslateQuery -> ApplyAlternateVersionFiltering);
+            // its own comment there says the library scan keeps them "so a merged version is not
+            // mistaken for a new item", which is exactly the failure. Without the flag this sweep
+            // never sees the alternates it published: it recreates them on every pass, and the orphan
+            // loop below can never reap one whose tier the upstream dropped. A substituted
+            // ILibraryManager applies no such filter, so only the flag itself can be pinned here.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000065";
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            var anchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+            var source = new SourceRecord { Url = "https://example.com/source" };
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                [TieredVideo(vodId)],
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            // TopParentIds distinguishes the published-items sweep from any other query the pass makes.
+            _library.Received().GetItemList(Arg.Is<InternalItemsQuery>(
+                q => q.TopParentIds.Length > 0 && q.IncludeAlternateVersions));
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_WritesNothingForAlternates_WhenTheSecondPassFindsNothingChanged()
+        {
+            // Mirrors ReconcileAsync_WritesNothing_WhenTheSecondPassFindsNothingChanged but for a
+            // tiered video, and in the state production reaches: pass 1 links the tiers, so pass 2
+            // compares a primary that already carries its links against alternates whose
+            // PresentationUniqueKey SetPrimaryVersionId has already rewritten. Jellyfin hydrates
+            // both from the repository (BaseItemMapper.cs:170 for PrimaryVersionId, and
+            // LinkedChildEntities for the list queries), which is what makes a second pass able to
+            // see its own work and leave it alone.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000059";
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+
+            var anchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+            var source = new SourceRecord { Url = "https://example.com/source" };
+            var video = TieredVideo(vodId);
+
+            var allCreated = new List<BaseItem>();
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => allCreated.Add(call.ArgAt<BaseItem>(0)));
+            ResolveCreatedItems(allCreated);
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                [video],
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            Assert.Equal(3, allCreated.Count);
+
+            // The linking step really ran, so the comparisons pass 2 relies on are the live ones.
+            var primaryId = _library.GetNewItemId(_publisher.ItemKeyFor(vodId), typeof(Movie));
+            var primary = Assert.IsType<Movie>(allCreated.Single(c => c.Id.Equals(primaryId)));
+            var alternates = allCreated.OfType<Movie>().Where(c => !c.Id.Equals(primaryId)).ToList();
+            Assert.Equal(2, primary.LinkedAlternateVersions.Length);
+            Assert.Equal(2, alternates.Count);
+            Assert.All(alternates, a => Assert.Equal(primaryId, a.PrimaryVersionId));
+
+            // Second pass: the library now holds exactly what the first pass published.
+            _library.ClearReceivedCalls();
+            _library.GetItemList(Arg.Any<InternalItemsQuery>())
+                .Returns(new List<BaseItem>(allCreated));
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                [video],
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            await _library.DidNotReceive().UpdateItemAsync(
+                Arg.Any<BaseItem>(), Arg.Any<BaseItem>(), Arg.Any<ItemUpdateType>(),
+                Arg.Any<CancellationToken>());
+            _library.DidNotReceive().CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>());
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_LinksTheAlternatesToThePrimary()
+        {
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000060";
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+            var created = new List<BaseItem>();
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created.Add(call.ArgAt<BaseItem>(0)));
+            ResolveCreatedItems(created);
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            var anchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+            var source = new SourceRecord { Url = "https://example.com/source" };
+            var video = TieredVideo(vodId);
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                [video],
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            var members = _publisher.MembersFor(video, "http://localhost:8096");
+            var primaryId = _library.GetNewItemId(members[0].ItemKey, typeof(Movie));
+
+            var primary = Assert.IsType<Movie>(created.Single(c => c.Id.Equals(primaryId)));
+            var alternates = created
+                .OfType<Movie>()
+                .Where(c => !c.Id.Equals(primaryId))
+                .ToList();
+
+            Assert.Equal(2, alternates.Count);
+            Assert.All(alternates, a => Assert.Equal(primaryId, a.PrimaryVersionId));
+            Assert.Equal(2, primary.LinkedAlternateVersions.Length);
+            Assert.Null(primary.PrimaryVersionId);
+
+            // Jellyfin's own hiding mechanism: a linked alternate's presentation key becomes the
+            // primary's Guid, which is why the publisher must store the computed key rather than a
+            // string of its own. Nothing else in the suite pins that.
+            var primaryKey = primaryId.ToString("N", System.Globalization.CultureInfo.InvariantCulture);
+            Assert.All(alternates, a => Assert.Equal(primaryKey, a.PresentationUniqueKey));
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_LinksThroughTheCommittedPrimary_WhenTheCachedCopyIsStale()
+        {
+            // Inside one Jellyfin process the two lookups disagree. GetItemList returns repository
+            // instances (LibraryManager.cs:1757) and is what the publisher upserts, while
+            // GetItemById answers from the LRU cache first (LibraryManager.cs:1697) and
+            // UpdateItemsAsync never re-registers what it saved (LibraryManager.cs:2713-2719), so
+            // the cache can still hold the copy from the pass that created the item. Writing the
+            // links through that copy saves the whole stale entity and reverts the metadata an
+            // earlier pass committed.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000065";
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+
+            var anchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+            var source = new SourceRecord { Url = "https://example.com/source" };
+            var video = TieredVideo(vodId);
+            var members = _publisher.MembersFor(video, "http://localhost:8096");
+            var primaryId = _library.GetNewItemId(members[0].ItemKey, typeof(Movie));
+
+            // What the repository holds, and therefore what the upsert mutates and commits.
+            var fresh = new Movie
+            {
+                Id = primaryId,
+                Name = video.Title,
+                ParentId = anchor.Id,
+                Path = members[0].Path
+            };
+            fresh.SetProviderId("VOD", vodId);
+
+            // What the cache would hand back: same id, the title and parent of an earlier pass.
+            var stale = new Movie
+            {
+                Id = primaryId,
+                Name = "A title two passes ago",
+                ParentId = Guid.NewGuid(),
+                Path = members[0].Path
+            };
+            stale.SetProviderId("VOD", vodId);
+
+            var created = new List<BaseItem>();
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created.Add(call.ArgAt<BaseItem>(0)));
+
+            // Captured by reference: BaseItem.Equals compares ids only (BaseItem.cs:3085), so an
+            // NSubstitute argument matcher cannot tell these two instances apart.
+            var saved = new List<BaseItem>();
+            _library.When(l => l.UpdateItemAsync(
+                    Arg.Any<BaseItem>(), Arg.Any<BaseItem>(), Arg.Any<ItemUpdateType>(),
+                    Arg.Any<CancellationToken>()))
+                .Do(call => saved.Add(call.ArgAt<BaseItem>(0)));
+
+            _library.GetItemById(Arg.Any<Guid>()).Returns(call =>
+                call.Arg<Guid>().Equals(primaryId)
+                    ? stale
+                    : created.FirstOrDefault(c => c.Id.Equals(call.Arg<Guid>())));
+
+            // Only the primary exists; its two tiers are published by this pass, so the expected
+            // links differ from the stored ones and the linking step has to write.
+            _library.GetItemList(Arg.Any<InternalItemsQuery>())
+                .Returns(new List<BaseItem> { fresh });
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                [video],
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            Assert.NotSame(fresh, stale);
+            Assert.Equal(2, fresh.LinkedAlternateVersions.Length);
+            Assert.Empty(stale.LinkedAlternateVersions);
+
+            // The stale copy must never reach the repository: UpdateToRepositoryAsync saves the
+            // whole entity, so one write of it undoes every field a later pass had corrected.
+            Assert.DoesNotContain(saved, s => ReferenceEquals(s, stale));
+            Assert.Contains(saved, s => ReferenceEquals(s, fresh));
+            Assert.Equal("A title two passes ago", stale.Name);
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_OrdersTheLinkedAlternatesByAscendingHeight()
+        {
+            // Measured on the test instance: the menu follows the primary, then this list in order.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000061";
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+            var created = new List<BaseItem>();
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created.Add(call.ArgAt<BaseItem>(0)));
+            ResolveCreatedItems(created);
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            var anchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+            var source = new SourceRecord { Url = "https://example.com/source" };
+            var video = TieredVideo(vodId);
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                [video],
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            var members = _publisher.MembersFor(video, "http://localhost:8096");
+            var primaryId = _library.GetNewItemId(members[0].ItemKey, typeof(Movie));
+            var primary = Assert.IsType<Movie>(created.Single(c => c.Id.Equals(primaryId)));
+
+            // LinkedChild.ItemId is a Guid?, hence the unwrap: comparing it to a Guid directly
+            // leaves the generic argument ambiguous.
+            Assert.Equal(
+                _library.GetNewItemId(members[1].ItemKey, typeof(Movie)),
+                primary.LinkedAlternateVersions[0].ItemId!.Value);
+            Assert.Equal(
+                _library.GetNewItemId(members[2].ItemKey, typeof(Movie)),
+                primary.LinkedAlternateVersions[1].ItemId!.Value);
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_LinksNothing_WhenTheVideoHasNoTiers()
+        {
+            // An empty ladder must leave the primary exactly as it was before version groups
+            // existed: no links, no alternates, playback unchanged.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000062";
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+            var created = new List<BaseItem>();
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created.Add(call.ArgAt<BaseItem>(0)));
+            ResolveCreatedItems(created);
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            var anchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+            var source = new SourceRecord { Url = "https://example.com/source" };
+
+            var video = new VideoRecord
+            {
+                Id = vodId,
+                Title = "A Video Title",
+                VideoUrl = "https://example.com/watch?v=abc",
+                SourceUrl = "https://example.com/channel",
+                Extras = new VideoExtras()
+            };
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                [video],
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            var primary = Assert.IsType<Movie>(Assert.Single(created));
+            Assert.Empty(primary.LinkedAlternateVersions);
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_UnlinksAVanishedTier_BeforeDeletingIt()
+        {
+            // The upstream dropped 2160p. The alternate must leave the primary's list first: a link
+            // pointing at a deleted item would leave a dead entry in the version menu. The primary
+            // keeps its id, and therefore its watch state.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000063";
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+
+            var before = TieredVideo(vodId);
+            var stale = _publisher.MembersFor(before, "http://localhost:8096")[2];
+            var staleId = _library.GetNewItemId(stale.ItemKey, typeof(Movie));
+
+            var staleItem = new Movie { Id = staleId, Name = stale.Name, Path = stale.Path };
+            staleItem.SetProviderId("VOD", vodId);
+            var created = new List<BaseItem>();
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created.Add(call.ArgAt<BaseItem>(0)));
+            ResolveCreatedItems(created);
+            _library.GetItemList(Arg.Any<InternalItemsQuery>())
+                .Returns(new List<BaseItem> { staleItem });
+
+            var after = TieredVideo(vodId, qualities: [new VideoQuality(1080, "h264", 30)]);
+
+            var anchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+            var source = new SourceRecord { Url = "https://example.com/source" };
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                [after],
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            var members = _publisher.MembersFor(after, "http://localhost:8096");
+            var primaryId = _library.GetNewItemId(members[0].ItemKey, typeof(Movie));
+            var primary = Assert.IsType<Movie>(created.Single(c => c.Id.Equals(primaryId)));
+
+            // One tier left, so one link, and it is not the vanished one.
+            Assert.Single(primary.LinkedAlternateVersions);
+            Assert.DoesNotContain(
+                staleId, primary.LinkedAlternateVersions.Select(l => l.ItemId!.Value));
+            _library.Received().DeleteItem(staleItem, Arg.Any<DeleteOptions>(), true);
+        }
+
+        /// <summary>
+        /// On a real library AddChild makes the item retrievable by id; a substitute returns null
+        /// for every id, so a pass would run against a library that has forgotten everything it was
+        /// just given — including the parent <c>BaseItem.GetParent()</c> resolves when an item is
+        /// saved. Route that lookup through the items the publisher asked the library to create.
+        /// </summary>
+        private void ResolveCreatedItems(List<BaseItem> created)
+            => _library.GetItemById(Arg.Any<Guid>())
+                .Returns(call => created.FirstOrDefault(c => c.Id.Equals(call.Arg<Guid>())));
     }
 }

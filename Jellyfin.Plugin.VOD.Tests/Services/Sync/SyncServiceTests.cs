@@ -14,6 +14,7 @@ using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.Movies;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Entities;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
 using Xunit;
@@ -223,6 +224,136 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
 
             Assert.Equal(1, count);
             _library.Received(1).DeleteItem(item, Arg.Any<DeleteOptions>(), Arg.Any<bool>());
+        }
+    }
+
+    /// <summary>
+    /// I4: HasPayload is internal so the skip predicate can be unit-tested without running yt-dlp.
+    /// </summary>
+    public sealed class SyncServiceHasPayloadTests
+    {
+        [Fact]
+        public void HasPayload_ReturnsFalse_ForARowThatHasNeverBeenGivenOne()
+        {
+            // What a NULL extras column reads back as: a row written before the column existed, or
+            // one whose value no longer parses. It must NOT be in the skip set, so it is probed once.
+            Assert.False(SyncService.HasPayload(VideoExtras.NoPayload));
+        }
+
+        [Fact]
+        public void HasPayload_ReturnsTrue_ForAnEmptyPayload()
+        {
+            // Empty is an answer, not a gap: the platform offered no formats, tags, categories,
+            // channels or subtitles. Probing it again would cost one yt-dlp process per sync for ever.
+            Assert.True(SyncService.HasPayload(new VideoExtras()));
+        }
+
+        [Fact]
+        public void HasPayload_ReturnsTrue_WhenQualitiesIsPopulated()
+        {
+            var extras = new VideoExtras
+            {
+                Qualities = [new VideoQuality(1080, "h264", null)]
+            };
+            Assert.True(SyncService.HasPayload(extras));
+        }
+    }
+
+    /// <summary>
+    /// The skip decision against a real database, because it turns on what the row hands back, not
+    /// on what was put in it. A payload-less row must be probed once and never again: the full
+    /// metadata fetch is one yt-dlp process per row per sync.
+    /// </summary>
+    public sealed class SyncServiceSkipDecisionTests : IDisposable
+    {
+        private const string SourceUrl = "https://example.test/src";
+        private readonly string _dbPath = Path.GetTempFileName();
+        private readonly VodDatabase _db;
+
+        public SyncServiceSkipDecisionTests()
+        {
+            _db = new VodDatabase(_dbPath, NullLogger<VodDatabase>.Instance);
+            _db.EnsureCreated();
+            _db.UpsertSource(new SourceRecord { Url = SourceUrl });
+        }
+
+        public void Dispose()
+        {
+            _db.Dispose();
+            if (File.Exists(_dbPath))
+            {
+                File.Delete(_dbPath);
+            }
+        }
+
+        private VideoRecord Stored(string uuid, VideoExtras extras)
+        {
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = uuid,
+                SourceUrl = SourceUrl,
+                NativeId = uuid,
+                VideoUrl = "https://example.test/v/" + uuid,
+                SyncedAt = DateTimeOffset.UnixEpoch,
+                Extras = extras
+            });
+            return _db.GetVideoByUuid(uuid)!;
+        }
+
+        /// <summary>Makes the row look like one written before the extras column existed.</summary>
+        private void ClearExtrasColumn(string uuid)
+        {
+            using var conn = new SqliteConnection($"Data Source={_dbPath}");
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE videos SET extras = NULL WHERE id = $id";
+            cmd.Parameters.AddWithValue("$id", uuid);
+            cmd.ExecuteNonQuery();
+        }
+
+        [Fact]
+        public void HasPayload_IsTrue_ForAnEmptyPayloadTheRowHasBeenGiven()
+        {
+            // A video yt-dlp resolves but reports nothing for: no HLS formats, no tags, no
+            // categories, no channels, no subtitles. The row has been given a payload — this is
+            // what the platform offers — so the next sync must not spend a process on it again.
+            var read = Stored("aaaaaaaa-0000-0000-0000-000000000001", new VideoExtras());
+
+            Assert.True(SyncService.HasPayload(read.Extras));
+        }
+
+        [Fact]
+        public void HasPayload_IsFalse_ForARowWrittenBeforeTheExtrasColumnExisted()
+        {
+            // The behaviour being protected: such a row has never been given a payload, so it must
+            // still be probed, and a video that still resolves still gets its real payload.
+            const string uuid = "aaaaaaaa-0000-0000-0000-000000000002";
+            Stored(uuid, new VideoExtras());
+            ClearExtrasColumn(uuid);
+
+            Assert.False(SyncService.HasPayload(_db.GetVideoByUuid(uuid)!.Extras));
+        }
+
+        [Fact]
+        public void HasPayload_IsTrue_OnceAPayloadlessRowHasBeenRefetchedAndStored()
+        {
+            // The production path for a row that predates the extras column and still resolves:
+            // ProcessEntries mutates the payload it read with a `with` expression, which carries the
+            // "never given a payload" version 0 along with it, and stores the result. The write
+            // boundary has to stamp the current shape version there, or a fetch that reports nothing
+            // would be indistinguishable from never having fetched and the row would be probed for
+            // ever even though it has just been answered.
+            const string uuid = "aaaaaaaa-0000-0000-0000-000000000003";
+            Stored(uuid, new VideoExtras());
+            ClearExtrasColumn(uuid);
+
+            var refetched = _db.GetVideoByUuid(uuid)!;
+            Assert.False(SyncService.HasPayload(refetched.Extras));
+
+            refetched.Extras = refetched.Extras with { Tags = [], Qualities = [] };
+            _db.UpsertVideo(refetched);
+
+            Assert.True(SyncService.HasPayload(_db.GetVideoByUuid(uuid)!.Extras));
         }
     }
 }

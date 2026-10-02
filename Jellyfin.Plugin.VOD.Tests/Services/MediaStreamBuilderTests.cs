@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using Jellyfin.Plugin.VOD.Services;
 using MediaBrowser.Model.Entities;
 using Xunit;
@@ -18,15 +19,23 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
             """;
 
         [Fact]
-        public void Build_VideoFirst_ThenAudio_ThenSubtitles()
+        public void Build_IndexesInPlaylistOrder_BecauseThatIsWhatFfmpegNumbers()
         {
+            // These indices become ffmpeg's -map arguments, and ffmpeg numbers an HLS master's
+            // streams in the order the playlist declares them: renditions first, the variant last.
+            // Measured on the test instance, where declaring the video at 0 cost the picture outright:
+            //   input    #0:0 Audio(fr-FR), #0:1 Audio(en-US), #0:2 Video(h264)
+            //   Jellyfin -map 0:0 -map 0:1
+            //   output   #0:0 Audio, #0:1 Audio      <- two audio streams, no video
+            // So the order is read from the playlist rather than imposed: a bucket-and-concatenate
+            // pass would discard the one fact that makes the indices mean anything.
             var streams = MediaStreamBuilder.Build(FullMaster);
 
             Assert.Equal(4, streams.Count);
-            Assert.Equal(MediaStreamType.Video, streams[0].Type);
+            Assert.Equal(MediaStreamType.Audio, streams[0].Type);
             Assert.Equal(MediaStreamType.Audio, streams[1].Type);
-            Assert.Equal(MediaStreamType.Audio, streams[2].Type);
-            Assert.Equal(MediaStreamType.Subtitle, streams[3].Type);
+            Assert.Equal(MediaStreamType.Subtitle, streams[2].Type);
+            Assert.Equal(MediaStreamType.Video, streams[3].Type);
         }
 
         [Fact]
@@ -40,79 +49,84 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
             }
         }
 
+        // Selected by type rather than by position: the position is pinned once, by
+        // Build_IndexesInPlaylistOrder_BecauseThatIsWhatFfmpegNumbers, and these tests are about what
+        // each stream carries. Hard-coded offsets here would turn one ordering change into a dozen
+        // unrelated failures.
+        private static MediaStream OnlyVideo(IReadOnlyList<MediaStream> streams)
+            => Assert.Single(streams, s => s.Type == MediaStreamType.Video);
+
+        private static List<MediaStream> AudioOf(IReadOnlyList<MediaStream> streams)
+            => [.. streams.Where(s => s.Type == MediaStreamType.Audio)];
+
+        private static MediaStream OnlySubtitle(IReadOnlyList<MediaStream> streams)
+            => Assert.Single(streams, s => s.Type == MediaStreamType.Subtitle);
+
         [Fact]
         public void Build_AudioStream_PreservesNameAndLanguage()
         {
-            var streams = MediaStreamBuilder.Build(FullMaster);
+            var audio = AudioOf(MediaStreamBuilder.Build(FullMaster));
 
-            // streams[1] is the first audio track (order follows #EXT-X-MEDIA declaration order)
-            Assert.Equal("français (confort audio)", streams[1].Title);
-            Assert.Equal("fr", streams[1].Language);
+            // In #EXT-X-MEDIA declaration order.
+            Assert.Equal("français (confort audio)", audio[0].Title);
+            Assert.Equal("fr", audio[0].Language);
 
-            Assert.Equal("English - original", streams[2].Title);
-            Assert.Equal("en", streams[2].Language);
+            Assert.Equal("English - original", audio[1].Title);
+            Assert.Equal("en", audio[1].Language);
         }
 
         [Fact]
         public void Build_SubtitleStream_PreservesNameAndLanguage()
         {
-            var streams = MediaStreamBuilder.Build(FullMaster);
+            var subtitle = OnlySubtitle(MediaStreamBuilder.Build(FullMaster));
 
-            Assert.Equal("Français", streams[3].Title);
-            Assert.Equal("fr", streams[3].Language);
+            Assert.Equal("Français", subtitle.Title);
+            Assert.Equal("fr", subtitle.Language);
         }
 
         [Fact]
         public void Build_VideoStream_ResolutionParsed()
         {
-            var streams = MediaStreamBuilder.Build(FullMaster);
+            var video = OnlyVideo(MediaStreamBuilder.Build(FullMaster));
 
-            Assert.Equal(1920, streams[0].Width);
-            Assert.Equal(1080, streams[0].Height);
+            Assert.Equal(1920, video.Width);
+            Assert.Equal(1080, video.Height);
         }
 
         [Fact]
         public void Build_VideoStream_BandwidthParsed()
         {
-            var streams = MediaStreamBuilder.Build(FullMaster);
-
-            Assert.Equal(2000000, streams[0].BitRate);
+            Assert.Equal(2000000, OnlyVideo(MediaStreamBuilder.Build(FullMaster)).BitRate);
         }
 
         [Fact]
         public void Build_VideoCodecNormalised_Avc1ToH264()
         {
-            var streams = MediaStreamBuilder.Build(FullMaster);
-
-            Assert.Equal("h264", streams[0].Codec);
+            Assert.Equal("h264", OnlyVideo(MediaStreamBuilder.Build(FullMaster)).Codec);
         }
 
         [Fact]
         public void Build_AudioCodecNormalised_Mp4aToAac()
         {
-            var streams = MediaStreamBuilder.Build(FullMaster);
-
-            // All audio streams share the codec from the first CODECS attribute
-            Assert.Equal("aac", streams[1].Codec);
-            Assert.Equal("aac", streams[2].Codec);
+            // All audio streams share the codec from the second CODECS entry.
+            Assert.All(AudioOf(MediaStreamBuilder.Build(FullMaster)), s => Assert.Equal("aac", s.Codec));
         }
 
         [Fact]
         public void Build_SubtitleCodecIsWebvtt()
         {
-            var streams = MediaStreamBuilder.Build(FullMaster);
-
-            Assert.Equal("webvtt", streams[3].Codec);
+            Assert.Equal("webvtt", OnlySubtitle(MediaStreamBuilder.Build(FullMaster)).Codec);
         }
 
         [Fact]
         public void Build_DefaultAndForcedFlags()
         {
             var streams = MediaStreamBuilder.Build(FullMaster);
+            var audio = AudioOf(streams);
 
-            Assert.True(streams[1].IsDefault);   // fr audio: DEFAULT=YES
-            Assert.False(streams[2].IsDefault);  // en audio: DEFAULT=NO
-            Assert.False(streams[3].IsForced);   // subtitle: FORCED=NO
+            Assert.True(audio[0].IsDefault);   // fr audio: DEFAULT=YES
+            Assert.False(audio[1].IsDefault);  // en audio: DEFAULT=NO
+            Assert.False(OnlySubtitle(streams).IsForced);  // subtitle: FORCED=NO
         }
 
         [Fact]
@@ -194,6 +208,53 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
 
             Assert.Null(streams[0].Width);
             Assert.Null(streams[0].Height);
+        }
+
+        [Fact]
+        public void Build_OnAMuxedVariant_SynthesisesTheAudioStream()
+        {
+            // Twitch ships muxed variants: the audio codec is declared in CODECS with no separate
+            // #EXT-X-MEDIA rendition. Declaring video only would hide a track the stream carries,
+            // and mislead Jellyfin's track selection and transcoding decisions.
+            const string muxed = """
+                #EXTM3U
+                #EXT-X-STREAM-INF:BANDWIDTH=9168232,RESOLUTION=1920x1080,CODECS="avc1.64002A,mp4a.40.2"
+                https://cdn.test/1080p60.m3u8
+                """;
+
+            var streams = MediaStreamBuilder.Build(muxed);
+
+            Assert.Equal(2, streams.Count);
+            Assert.Equal(MediaStreamType.Video, streams[0].Type);
+            Assert.Equal("h264", streams[0].Codec);
+            Assert.Equal(MediaStreamType.Audio, streams[1].Type);
+            Assert.Equal("aac", streams[1].Codec);
+            Assert.True(streams[1].IsDefault);
+            Assert.Equal(1, streams[1].Index);
+        }
+
+        [Fact]
+        public void Build_OnSeparateRenditions_DoesNotSynthesiseAnExtraTrack()
+        {
+            const string separate = """
+                #EXTM3U
+                #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="français (confort audio)",LANGUAGE="fr",DEFAULT=YES,URI="fr.m3u8"
+                #EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2",AUDIO="a"
+                https://cdn.test/1080.m3u8
+                """;
+
+            var streams = MediaStreamBuilder.Build(separate);
+
+            // One audio stream, and it is the declared rendition rather than a synthesised stand-in:
+            // only the rendition carries NAME and LANGUAGE. It precedes the video, as the playlist
+            // declares it — the contrast with Build_OnAMuxedVariant_SynthesisesTheAudioStream, where
+            // the synthesised track follows the variant because that is where ffmpeg finds it.
+            Assert.Equal(2, streams.Count);
+            var audio = Assert.Single(streams, s => s.Type == MediaStreamType.Audio);
+            Assert.Equal("français (confort audio)", audio.Title);
+            Assert.Equal("fr", audio.Language);
+            Assert.Equal(0, audio.Index);
+            Assert.Equal(MediaStreamType.Video, streams[1].Type);
         }
     }
 }

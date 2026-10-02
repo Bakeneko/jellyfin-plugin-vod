@@ -373,7 +373,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
             using var cmd = conn.CreateCommand();
             cmd.CommandText = "PRAGMA user_version";
 
-            Assert.Equal(4L, (long)cmd.ExecuteScalar()!);
+            Assert.Equal(5L, (long)cmd.ExecuteScalar()!);
         }
 
         [Fact]
@@ -411,11 +411,15 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                     cmd.CommandText = """
                         CREATE TABLE sources (url TEXT PRIMARY KEY, name TEXT);
                         CREATE TABLE videos (
-                            id         TEXT PRIMARY KEY,
-                            source_url TEXT NOT NULL,
-                            video_url  TEXT NOT NULL,
-                            synced_at  TEXT NOT NULL,
-                            channels   TEXT
+                            id             TEXT PRIMARY KEY,
+                            source_url     TEXT NOT NULL,
+                            video_url      TEXT NOT NULL,
+                            synced_at      TEXT NOT NULL,
+                            audio_langs    TEXT,
+                            subtitle_langs TEXT,
+                            tags           TEXT,
+                            categories     TEXT,
+                            channels       TEXT
                         );
                         INSERT INTO videos (id, source_url, video_url, synced_at)
                         VALUES ('legacy', 'https://example.test/s', 'https://example.test/v',
@@ -433,7 +437,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
 
                 using var version = conn.CreateCommand();
                 version.CommandText = "PRAGMA user_version";
-                Assert.Equal(4L, (long)version.ExecuteScalar()!);
+                Assert.Equal(5L, (long)version.ExecuteScalar()!);
 
                 using var backfilled = conn.CreateCommand();
                 backfilled.CommandText = "SELECT first_seen_at FROM videos WHERE id = 'legacy'";
@@ -497,7 +501,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
         /// and step 2 adds it.
         /// </summary>
         [Fact]
-        public void Channels_RoundTripThroughTheV2Column()
+        public void Channels_RoundTripThroughTheExtrasPayload()
         {
             _db.UpsertSource(new SourceRecord { Url = "https://example.test/c" });
             _db.UpsertVideo(new VideoRecord
@@ -506,14 +510,14 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                 SourceUrl = "https://example.test/c",
                 VideoUrl = "https://example.test/v",
                 ExtractorKey = "Youtube",
-                Channels = """["Terrapodia"]""",
+                Extras = new VideoExtras { Channels = ["Terrapodia"] },
                 SyncedAt = DateTimeOffset.UtcNow
             });
 
             var retrieved = _db.GetVideoByUuid("uuid-channels");
 
             Assert.NotNull(retrieved);
-            Assert.Equal("""["Terrapodia"]""", retrieved.Channels);
+            Assert.Equal(["Terrapodia"], retrieved.Extras.Channels);
         }
 
         /// <summary>
@@ -540,10 +544,14 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                     cmd.CommandText = """
                         CREATE TABLE sources (url TEXT PRIMARY KEY, name TEXT);
                         CREATE TABLE videos (
-                            id         TEXT PRIMARY KEY,
-                            source_url TEXT NOT NULL,
-                            video_url  TEXT NOT NULL,
-                            synced_at  TEXT NOT NULL
+                            id             TEXT PRIMARY KEY,
+                            source_url     TEXT NOT NULL,
+                            video_url      TEXT NOT NULL,
+                            synced_at      TEXT NOT NULL,
+                            audio_langs    TEXT,
+                            subtitle_langs TEXT,
+                            tags           TEXT,
+                            categories     TEXT
                         );
                         PRAGMA user_version = 1;
                         """;
@@ -558,11 +566,11 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
 
                 using var version = conn.CreateCommand();
                 version.CommandText = "PRAGMA user_version";
-                Assert.Equal(4L, (long)version.ExecuteScalar()!);
+                Assert.Equal(5L, (long)version.ExecuteScalar()!);
 
                 using var columns = conn.CreateCommand();
-                columns.CommandText = "SELECT name FROM pragma_table_info('videos') WHERE name = 'channels'";
-                Assert.Equal("channels", columns.ExecuteScalar());
+                columns.CommandText = "SELECT name FROM pragma_table_info('videos') WHERE name = 'extras'";
+                Assert.Equal("extras", columns.ExecuteScalar());
             }
             finally
             {
@@ -574,7 +582,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
         }
 
         [Fact]
-        public void Channels_DefaultToNullWhenNotSet()
+        public void Channels_DefaultToEmptyWhenNotSet()
         {
             _db.UpsertSource(new SourceRecord { Url = "https://example.test/d" });
             _db.UpsertVideo(new VideoRecord
@@ -585,7 +593,204 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                 SyncedAt = DateTimeOffset.UtcNow
             });
 
-            Assert.Null(_db.GetVideoByUuid("uuid-no-channels")!.Channels);
+            Assert.Empty(_db.GetVideoByUuid("uuid-no-channels")!.Extras.Channels);
+        }
+
+        [Fact]
+        public void UpsertVideo_RoundTripsExtras()
+        {
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/src" });
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = "aaaaaaaa-0000-0000-0000-000000000001",
+                SourceUrl = "https://example.test/src",
+                VideoUrl = "https://example.test/v/1",
+                SyncedAt = DateTimeOffset.UnixEpoch,
+                Extras = new VideoExtras
+                {
+                    Tags = ["nature", "océan"],
+                    Categories = ["Documentaire"],
+                    Channels = ["Arte"],
+                    SubtitleLanguages = ["fr", "de"],
+                    // I5: Qualities and AudioTracks are positional records — System.Text.Json must
+                    // match constructor parameters to deserialize them. Null Fps and null Language
+                    // exercise the nullable members.
+                    Qualities =
+                    [
+                        new VideoQuality(1080, "h264", null),
+                        new VideoQuality(720, "vp9", 60)
+                    ],
+                    AudioTracks =
+                    [
+                        new AudioTrack(null, "vf"),
+                        new AudioTrack("fr", null)
+                    ]
+                }
+            });
+
+            var read = _db.GetVideoByUuid("aaaaaaaa-0000-0000-0000-000000000001");
+
+            Assert.NotNull(read);
+            Assert.Equal(["nature", "océan"], read.Extras.Tags);
+            Assert.Equal(["Documentaire"], read.Extras.Categories);
+            Assert.Equal(["Arte"], read.Extras.Channels);
+            Assert.Equal(["fr", "de"], read.Extras.SubtitleLanguages);
+
+            // Qualities round-trip — including null Fps
+            Assert.Equal(2, read.Extras.Qualities.Count);
+            Assert.Equal(1080, read.Extras.Qualities[0].Height);
+            Assert.Equal("h264", read.Extras.Qualities[0].Codec);
+            Assert.Null(read.Extras.Qualities[0].Fps);
+            Assert.Equal(720, read.Extras.Qualities[1].Height);
+            Assert.Equal("vp9", read.Extras.Qualities[1].Codec);
+            Assert.Equal(60, read.Extras.Qualities[1].Fps);
+
+            // AudioTracks round-trip — including null Language and null Label
+            Assert.Equal(2, read.Extras.AudioTracks.Count);
+            Assert.Null(read.Extras.AudioTracks[0].Language);
+            Assert.Equal("vf", read.Extras.AudioTracks[0].Label);
+            Assert.Equal("fr", read.Extras.AudioTracks[1].Language);
+            Assert.Null(read.Extras.AudioTracks[1].Label);
+        }
+
+        [Fact]
+        public void EnsureCreated_DropsTheConsolidatedColumns()
+        {
+            using var conn = new SqliteConnection($"Data Source={_dbPath}");
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT name FROM pragma_table_info('videos')";
+            var columns = new List<string>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) columns.Add(r.GetString(0));
+
+            Assert.DoesNotContain("audio_langs", columns);
+            Assert.DoesNotContain("subtitle_langs", columns);
+            Assert.DoesNotContain("tags", columns);
+            Assert.DoesNotContain("categories", columns);
+            Assert.DoesNotContain("channels", columns);
+            Assert.Contains("extras", columns);
+        }
+
+        [Fact]
+        public void EnsureCreated_RemovesTheDebugSentinelRow()
+        {
+            // Inserted by migration v1 then filtered out of every listing: it existed only to be excluded.
+            using var conn = new SqliteConnection($"Data Source={_dbPath}");
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM sources WHERE url = '__debug__'";
+            Assert.Equal(0L, (long)cmd.ExecuteScalar()!);
+        }
+
+        /// <summary>
+        /// C2: a pre-v5 database that carries a video row with source_url = '__debug__' must
+        /// survive migration. Without the fix (children deleted before parent), the DELETE on
+        /// sources raises SQLITE_CONSTRAINT and the plugin is stuck at user_version = 4 forever.
+        /// </summary>
+        [Fact]
+        public void EnsureCreated_MigrationV5_DeletesChildVideosBeforeParentSource()
+        {
+            var path = Path.GetTempFileName();
+            try
+            {
+                // Seed a v4 schema that looks like a real pre-v5 installation: the debug source
+                // row (inserted by v1) and one video referencing it (as a debug session could
+                // leave behind). Migration v5 must delete the video before the source.
+                using (var seed = new SqliteConnection($"Data Source={path}"))
+                {
+                    seed.Open();
+                    using var pragma = seed.CreateCommand();
+                    pragma.CommandText = "PRAGMA foreign_keys=OFF";
+                    pragma.ExecuteNonQuery();
+
+                    using var cmd = seed.CreateCommand();
+                    cmd.CommandText = """
+                        CREATE TABLE sources (
+                            url                  TEXT PRIMARY KEY,
+                            name                 TEXT,
+                            series_thumbnail_url TEXT,
+                            series_banner_url    TEXT,
+                            tags                 TEXT,
+                            published_image_url  TEXT,
+                            published_banner_url TEXT,
+                            series_synopsis      TEXT,
+                            last_synced_at       TEXT,
+                            last_error           TEXT,
+                            video_count          INTEGER NOT NULL DEFAULT 0,
+                            published_anchor_id  TEXT
+                        );
+                        CREATE TABLE videos (
+                            id               TEXT PRIMARY KEY,
+                            source_url       TEXT NOT NULL REFERENCES sources(url),
+                            video_url        TEXT NOT NULL,
+                            synced_at        TEXT NOT NULL,
+                            audio_langs      TEXT,
+                            subtitle_langs   TEXT,
+                            tags             TEXT,
+                            categories       TEXT,
+                            channels         TEXT,
+                            first_seen_at    TEXT
+                        );
+                        INSERT INTO sources (url, name) VALUES ('__debug__', 'Debug (internal)');
+                        INSERT INTO videos  (id, source_url, video_url, synced_at)
+                            VALUES ('dbg-vid-1', '__debug__', 'https://example.test/v', '2026-01-01T00:00:00Z');
+                        PRAGMA user_version = 4;
+                        """;
+                    cmd.ExecuteNonQuery();
+                }
+
+                // Without the fix this throws SQLITE_CONSTRAINT (FOREIGN KEY violation) and the
+                // database stays at user_version = 4, breaking every subsequent start.
+                using var upgraded = new VodDatabase(path, NullLogger<VodDatabase>.Instance);
+                var ex = Record.Exception(upgraded.EnsureCreated);
+                Assert.Null(ex);
+
+                using var conn = new SqliteConnection($"Data Source={path}");
+                conn.Open();
+                using var version = conn.CreateCommand();
+                version.CommandText = "PRAGMA user_version";
+                Assert.Equal(5L, (long)version.ExecuteScalar()!);
+            }
+            finally
+            {
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+        }
+
+        /// <summary>
+        /// A hand-edited or truncated payload must not take the whole video down: the row still reads,
+        /// with an empty payload. Review Focus item 1.
+        /// </summary>
+        [Fact]
+        public void GetVideoByUuid_OnCorruptExtras_ReturnsAnEmptyPayload()
+        {
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/src" });
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = "aaaaaaaa-0000-0000-0000-000000000002",
+                SourceUrl = "https://example.test/src",
+                VideoUrl = "https://example.test/v/2",
+                SyncedAt = DateTimeOffset.UnixEpoch
+            });
+
+            using (var conn = new SqliteConnection($"Data Source={_dbPath}"))
+            {
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "UPDATE videos SET extras = '{not json' WHERE id = $id";
+                cmd.Parameters.AddWithValue("$id", "aaaaaaaa-0000-0000-0000-000000000002");
+                cmd.ExecuteNonQuery();
+            }
+
+            var read = _db.GetVideoByUuid("aaaaaaaa-0000-0000-0000-000000000002");
+
+            Assert.NotNull(read);
+            Assert.Empty(read.Extras.Tags);
+            Assert.Empty(read.Extras.Qualities);
         }
 
         [Fact]
@@ -659,12 +864,16 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                             video_count          INTEGER NOT NULL DEFAULT 0
                         );
                         CREATE TABLE videos (
-                            id            TEXT PRIMARY KEY,
-                            source_url    TEXT NOT NULL,
-                            video_url     TEXT NOT NULL,
-                            synced_at     TEXT NOT NULL,
-                            channels      TEXT,
-                            first_seen_at TEXT
+                            id             TEXT PRIMARY KEY,
+                            source_url     TEXT NOT NULL,
+                            video_url      TEXT NOT NULL,
+                            synced_at      TEXT NOT NULL,
+                            audio_langs    TEXT,
+                            subtitle_langs TEXT,
+                            tags           TEXT,
+                            categories     TEXT,
+                            channels       TEXT,
+                            first_seen_at  TEXT
                         );
                         PRAGMA user_version = 3;
                         """;

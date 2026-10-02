@@ -17,16 +17,23 @@ namespace Jellyfin.Plugin.VOD.Services
     public static class MediaStreamBuilder
     {
         /// <summary>
-        /// Builds the stream list described by a filtered master playlist.
-        /// Returns video first, then audio, then subtitles, indexed in that order.
+        /// Builds the stream list described by a filtered master playlist, indexed in the order the
+        /// playlist declares them.
         /// </summary>
+        /// <remarks>
+        /// Playlist order is not a presentation choice: these indices become ffmpeg's <c>-map</c>
+        /// arguments, and ffmpeg numbers an HLS master's streams in declaration order — renditions
+        /// first, the variant last. Imposing any other order silently maps the wrong stream. Measured
+        /// on a YouTube video carrying two audio renditions, where declaring the video at index 0 made
+        /// Jellyfin emit <c>-map 0:0 -map 0:1</c> and produce two audio streams and no picture at all.
+        /// </remarks>
         public static IReadOnlyList<MediaStream> Build(string master)
         {
             ArgumentNullException.ThrowIfNull(master);
 
             var streams = new List<MediaStream>();
-            var audio = new List<MediaStream>();
-            var subtitles = new List<MediaStream>();
+            var sawVariant = false;
+            var sawRendition = false;
             var lines = master.Split('\n', StringSplitOptions.TrimEntries);
 
             // The variant tag carries audio+video codecs but is written after renditions, so read it first.
@@ -45,12 +52,13 @@ namespace Jellyfin.Plugin.VOD.Services
                     streams.Add(new MediaStream
                     {
                         Type = MediaStreamType.Video,
-                        Codec = NormaliseCodec(codecs.Length > 0 ? codecs[0] : null),
+                        Codec = CodecNames.Normalise(codecs.Length > 0 ? codecs[0] : null),
                         Width = res.Length == 2 ? ParseInt(res[0]) : null,
                         Height = res.Length == 2 ? ParseInt(res[1]) : null,
                         BitRate = ParseInt(HlsPlaylistFilter.Attribute(line, "BANDWIDTH")),
                         IsDefault = true
                     });
+                    sawVariant = true;
                     continue;
                 }
 
@@ -66,9 +74,12 @@ namespace Jellyfin.Plugin.VOD.Services
                     continue;
                 }
 
-                var stream = new MediaStream
+                streams.Add(new MediaStream
                 {
                     Type = isAudio ? MediaStreamType.Audio : MediaStreamType.Subtitle,
+                    Codec = isAudio
+                        ? CodecNames.Normalise(codecs.Length > 1 ? codecs[1] : null)
+                        : "webvtt",
                     Language = HlsPlaylistFilter.Attribute(line, "LANGUAGE"),
                     Title = HlsPlaylistFilter.Attribute(line, "NAME"),
                     IsDefault = string.Equals(
@@ -77,54 +88,36 @@ namespace Jellyfin.Plugin.VOD.Services
                     IsForced = string.Equals(
                         HlsPlaylistFilter.Attribute(line, "FORCED"), "YES",
                         StringComparison.OrdinalIgnoreCase)
-                };
-
-                if (isAudio)
-                {
-                    stream.Codec = NormaliseCodec(codecs.Length > 1 ? codecs[1] : null);
-                    audio.Add(stream);
-                }
-                else
-                {
-                    stream.Codec = "webvtt";
-                    subtitles.Add(stream);
-                }
+                });
+                sawRendition = true;
             }
 
-            if (streams.Count == 0)
+            if (!sawVariant)
             {
                 return [];
             }
 
-            streams.AddRange(audio);
-            streams.AddRange(subtitles);
+            // A muxed variant declares its audio codec in CODECS but ships no #EXT-X-MEDIA
+            // rendition — Twitch's shape. Without this the stream list would claim the video has
+            // no audio at all. It goes after the variant because that is where ffmpeg finds it:
+            // inside the same program, numbered behind the video.
+            if (!sawRendition && codecs.Length > 1
+                && CodecNames.Normalise(codecs[1]) is { } muxedCodec)
+            {
+                streams.Add(new MediaStream
+                {
+                    Type = MediaStreamType.Audio,
+                    Codec = muxedCodec,
+                    IsDefault = true
+                });
+            }
+
             for (var i = 0; i < streams.Count; i++)
             {
                 streams[i].Index = i;
             }
 
             return streams;
-        }
-
-        private static string? NormaliseCodec(string? codec)
-        {
-            if (string.IsNullOrWhiteSpace(codec))
-            {
-                return null;
-            }
-
-            return codec.Split('.')[0].ToLowerInvariant() switch
-            {
-                "avc1" or "avc3" => "h264",
-                "hev1" or "hvc1" => "hevc",
-                "vp09" => "vp9",
-                "av01" => "av1",
-                "mp4a" => "aac",
-                "opus" => "opus",
-                "ec-3" => "eac3",
-                "ac-3" => "ac3",
-                var other => other
-            };
         }
 
         private static int? ParseInt(string? value)

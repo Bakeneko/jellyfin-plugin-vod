@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text.Json;
 using System.Threading;
 using Jellyfin.Plugin.VOD.Data.Models;
 using Microsoft.Data.Sqlite;
@@ -43,7 +44,7 @@ namespace Jellyfin.Plugin.VOD.Data
         /// Schema version this build expects, tracked in SQLite's <c>user_version</c>.
         /// Bump it and add the matching case to <see cref="Migrate"/> whenever the schema changes.
         /// </summary>
-        private const int SchemaVersion = 4;
+        private const int SchemaVersion = 5;
 
         /// <inheritdoc />
         public void EnsureCreated()
@@ -159,6 +160,31 @@ namespace Jellyfin.Plugin.VOD.Data
                         """;
                     break;
 
+                case 5:
+                    // The five JSON columns collapse into one typed payload; none of them was ever
+                    // used in a predicate, an ORDER BY or a targeted UPDATE, so none needs a column.
+                    // No backfill: a resync repopulates, and the project is not released.
+                    // The '__debug__' source row was inserted by v1 and filtered out of every
+                    // listing ever since — it existed only to be excluded.
+                    // videos.source_url is a foreign key onto sources.url (PRAGMA foreign_keys=ON),
+                    // so the children must be deleted before the parent — same order as DeleteSource.
+                    // Reversing the order raises SQLITE_CONSTRAINT and strands the database at v4.
+                    cmd.CommandText = """
+                        ALTER TABLE videos ADD COLUMN extras TEXT;
+
+                        DELETE FROM videos  WHERE source_url = '__debug__';
+                        DELETE FROM sources WHERE url        = '__debug__';
+
+                        ALTER TABLE videos DROP COLUMN audio_langs;
+                        ALTER TABLE videos DROP COLUMN subtitle_langs;
+                        ALTER TABLE videos DROP COLUMN tags;
+                        ALTER TABLE videos DROP COLUMN categories;
+                        ALTER TABLE videos DROP COLUMN channels;
+
+                        PRAGMA user_version = 5;
+                        """;
+                    break;
+
                 default:
                     throw new InvalidOperationException(
                         $"No migration defined for schema version {version}");
@@ -233,7 +259,7 @@ namespace Jellyfin.Plugin.VOD.Data
             lock (_sync)
             {
                 using var cmd = Connection.CreateCommand();
-                cmd.CommandText = "SELECT * FROM sources WHERE url != '__debug__' ORDER BY url";
+                cmd.CommandText = "SELECT * FROM sources ORDER BY url";
                 using var r = cmd.ExecuteReader();
                 var list = new List<SourceRecord>();
                 while (r.Read())
@@ -256,13 +282,13 @@ namespace Jellyfin.Plugin.VOD.Data
                         (id, source_url, extractor_key, native_id, video_url, title,
                          published_at, duration_seconds,
                          season_number, episode_number, synced_at,
-                         audio_langs, subtitle_langs, thumbnail_url, tags, categories, channels,
+                         thumbnail_url, extras,
                          description, is_live, first_seen_at)
                     VALUES
                         ($id, $sourceUrl, $extractorKey, $nativeId, $videoUrl, $title,
                          $publishedAt, $durationSeconds,
                          $seasonNumber, $episodeNumber, $syncedAt,
-                         $audioLangs, $subtitleLangs, $thumbnailUrl, $tags, $categories, $channels,
+                         $thumbnailUrl, $extras,
                          $description, $isLive, $firstSeenAt)
                     ON CONFLICT(id) DO UPDATE SET
                         source_url       = excluded.source_url,
@@ -275,12 +301,8 @@ namespace Jellyfin.Plugin.VOD.Data
                         season_number    = excluded.season_number,
                         episode_number   = excluded.episode_number,
                         synced_at        = excluded.synced_at,
-                        audio_langs      = excluded.audio_langs,
-                        subtitle_langs   = excluded.subtitle_langs,
                         thumbnail_url    = excluded.thumbnail_url,
-                        tags             = excluded.tags,
-                        categories       = excluded.categories,
-                        channels         = excluded.channels,
+                        extras           = excluded.extras,
                         description      = excluded.description,
                         is_live          = excluded.is_live,
                         -- Never overwritten: an existing discovery date always beats the one the new
@@ -493,12 +515,8 @@ namespace Jellyfin.Plugin.VOD.Data
             cmd.Parameters.AddWithValue("$seasonNumber", (object?)v.SeasonNumber ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$episodeNumber", (object?)v.EpisodeNumber ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$syncedAt", v.SyncedAt.ToString("O"));
-            cmd.Parameters.AddWithValue("$audioLangs", (object?)v.AudioLangs ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$subtitleLangs", (object?)v.SubtitleLangs ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$thumbnailUrl", (object?)v.ThumbnailUrl ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$tags", (object?)v.Tags ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$categories", (object?)v.Categories ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$channels", (object?)v.Channels ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$extras", SerializeExtras(v.Extras));
             cmd.Parameters.AddWithValue("$firstSeenAt", (object?)v.FirstSeenAt?.ToString("O") ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$description", (object?)v.Description ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$isLive", v.IsLive ? 1 : 0);
@@ -576,18 +594,57 @@ namespace Jellyfin.Plugin.VOD.Data
                 SyncedAt = DateTimeOffset.Parse(
                     r.GetString(r.GetOrdinal("synced_at")), null,
                     System.Globalization.DateTimeStyles.RoundtripKind),
-                AudioLangs = S("audio_langs"),
-                SubtitleLangs = S("subtitle_langs"),
                 ThumbnailUrl = S("thumbnail_url"),
-                Tags = S("tags"),
-                Categories = S("categories"),
-                Channels = S("channels"),
+                Extras = ReadExtras(S("extras")),
                 FirstSeenAt = D("first_seen_at"),
                 PublishedImageUrl = S("published_image_url"),
                 Description = S("description"),
                 IsLive = r.GetInt32(r.GetOrdinal("is_live")) != 0
             };
         }
+
+        /// <summary>
+        /// Reads the extras payload, answering <see cref="VideoExtras.NoPayload"/> when the row has
+        /// never been given one. A hand-edited or truncated value must not take the whole row down —
+        /// the video is still playable without it — and is reported the same way, since what the
+        /// column held cannot be known.
+        /// </summary>
+        /// <remarks>
+        /// The distinction the caller needs is "this row has never been given a payload" versus "its
+        /// payload is empty", which is a real answer from the platform. The column being NULL is the
+        /// only thing that carries it, so it is surfaced here rather than inferred from content:
+        /// a row whose payload is empty because nothing was offered would otherwise be refetched on
+        /// every sync for ever.
+        /// </remarks>
+        private static VideoExtras ReadExtras(string? json)
+        {
+            if (string.IsNullOrWhiteSpace(json))
+                return VideoExtras.NoPayload;
+
+            try
+            {
+                return JsonSerializer.Deserialize<VideoExtras>(json) ?? VideoExtras.NoPayload;
+            }
+            catch (JsonException)
+            {
+                return VideoExtras.NoPayload;
+            }
+        }
+
+        /// <summary>
+        /// Serialises the payload for storage, stamping the current shape version on one that has
+        /// none.
+        /// </summary>
+        /// <remarks>
+        /// Version 0 is the read side's marker for "never given a payload", so it must not reach the
+        /// column: a row written back as it was read — which is what a probe that resolved nothing
+        /// does — has to come back as a stored payload, or it is probed again on every sync for ever.
+        /// Normalising at the single write boundary keeps that unrepresentable, whatever the caller
+        /// hands over.
+        /// </remarks>
+        private static string SerializeExtras(VideoExtras extras)
+            => JsonSerializer.Serialize(
+                extras.Version > 0 ? extras : extras with { Version = VideoExtras.CurrentVersion });
 
         [LoggerMessage(EventId = 100, Level = LogLevel.Information,
             Message = "VOD database schema ready at {DbPath}")]
