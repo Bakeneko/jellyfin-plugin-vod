@@ -110,6 +110,12 @@
         <Rule Id="CA1308" Action="None" />
         <!-- disable warning CA1848: Use the LoggerMessage delegates -->
         <Rule Id="CA1848" Action="None" />
+        <!-- demote CA1873: Avoid potentially expensive logging, as Jellyfin does. Disabling CA1848
+             alone does not allow a direct _logger.LogX call: CA1873 fires on any argument that is
+             not a constant, even a property read, and TreatWarningsAsErrors turns it into an error.
+             Structured logging stays enforced by CA2254 and CA1727. Where an argument really is
+             costly, guard with _logger.IsEnabled or keep a [LoggerMessage] method. -->
+        <Rule Id="CA1873" Action="Info" />
         <!-- disable warning CA2101: Specify marshaling for P/Invoke string arguments -->
         <Rule Id="CA2101" Action="None" />
         <!-- disable warning CA2234: Pass System.Uri objects instead of strings -->
