@@ -154,6 +154,27 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
         }
 
         [Fact]
+        public void TryWrite_WritesEveryItemServingTheTier_NotJustTheFirstFound()
+        {
+            // Two sources can publish the same video in different modes — a Movie in one library, an
+            // Episode in another — so two items carry the same VOD id and the same tier path. Stopping
+            // at the first match left the other without streams, and which one won depended on the
+            // order the database returned them in.
+            var path = $"http://localhost:8096/VOD/stream/{Uuid}.m3u8?height=1080&codec=h264";
+            var asMovie = Item(Guid.NewGuid(), path);
+            var asEpisode = Item(Guid.NewGuid(), path);
+            LibraryHolds(asMovie, asEpisode);
+            AlreadyProbed();
+
+            Assert.True(_writer.TryWrite(Uuid, 1080, "h264", Streams, CancellationToken.None));
+
+            _repository.Received(1).SaveMediaStreams(
+                asMovie.Id, Arg.Any<IReadOnlyList<MediaStream>>(), Arg.Any<CancellationToken>());
+            _repository.Received(1).SaveMediaStreams(
+                asEpisode.Id, Arg.Any<IReadOnlyList<MediaStream>>(), Arg.Any<CancellationToken>());
+        }
+
+        [Fact]
         public void TryWrite_SavesNothing_WhenTheProbedTitlesAlreadyMatch()
         {
             // This runs on every playback. Re-saving an unchanged list would churn the item and

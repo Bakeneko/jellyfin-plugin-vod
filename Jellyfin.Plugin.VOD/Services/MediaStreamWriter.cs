@@ -50,8 +50,8 @@ namespace Jellyfin.Plugin.VOD.Services
         }
 
         /// <summary>
-        /// Labels the streams of the item that serves the given tier, using
-        /// <paramref name="streams"/>, or stores them whole when that item has none yet.
+        /// Labels the streams of every item that serves the given tier, using
+        /// <paramref name="streams"/>, or stores them whole on an item that has none yet.
         /// </summary>
         /// <param name="vodUuid">The opaque VOD UUID to look up in the library.</param>
         /// <param name="height">The served tier's height, or null for the primary.</param>
@@ -62,8 +62,9 @@ namespace Jellyfin.Plugin.VOD.Services
         /// matched — this runs on every playback, so an unchanged list is left alone.</returns>
         /// <remarks>
         /// Every member of a version group carries the same VOD provider id, so the query returns
-        /// the whole group — at most three items. The tier is then read off each candidate's own
-        /// path, which is the only thing that determines what that item actually serves.
+        /// the whole group — and one group per source that publishes this video, since two sources
+        /// can publish it in different modes. The tier is then read off each candidate's own path,
+        /// which is the only thing that determines what that item actually serves.
         /// </remarks>
         public bool TryWrite(
             string vodUuid,
@@ -97,29 +98,43 @@ namespace Jellyfin.Plugin.VOD.Services
                 return false;
             }
 
-            BaseItem? match = null;
+            // Every match, not the first: two sources can publish the same video in different modes,
+            // so a Movie in one library and an Episode in another share this VOD id and this path.
+            var matched = false;
+            var wrote = false;
             foreach (var candidate in items)
             {
                 var (candidateHeight, candidateCodec) = VersionGroup.TierOf(candidate.Path);
                 if (candidateHeight == height
                     && string.Equals(candidateCodec, codec, StringComparison.Ordinal))
                 {
-                    match = candidate;
-                    break;
+                    matched = true;
+                    wrote |= WriteTo(candidate, streams, cancellationToken);
                 }
             }
 
-            if (match is null)
+            if (!matched)
             {
                 LogNoTier(vodUuid, height, codec);
-                return false;
             }
 
-            var probed = _repository.GetMediaStreams(new MediaStreamQuery { ItemId = match.Id });
+            return wrote;
+        }
+
+        /// <summary>
+        /// Labels one item's probed streams, or stores the derived list whole when it has none yet.
+        /// </summary>
+        /// <param name="item">An item that serves the requested tier.</param>
+        /// <param name="streams">The streams derived from the filtered master.</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        /// <returns><see langword="true"/> when something was saved.</returns>
+        private bool WriteTo(BaseItem item, IReadOnlyList<MediaStream> streams, CancellationToken cancellationToken)
+        {
+            var probed = _repository.GetMediaStreams(new MediaStreamQuery { ItemId = item.Id });
             if (probed.Count == 0)
             {
-                _repository.SaveMediaStreams(match.Id, streams, cancellationToken);
-                LogWrote(match.Name, streams.Count);
+                _repository.SaveMediaStreams(item.Id, streams, cancellationToken);
+                LogWrote(item.Name, streams.Count);
                 return true;
             }
 
@@ -129,8 +144,8 @@ namespace Jellyfin.Plugin.VOD.Services
                 return false;
             }
 
-            _repository.SaveMediaStreams(match.Id, probed, cancellationToken);
-            LogTitled(match.Name, titled);
+            _repository.SaveMediaStreams(item.Id, probed, cancellationToken);
+            LogTitled(item.Name, titled);
             return true;
         }
 

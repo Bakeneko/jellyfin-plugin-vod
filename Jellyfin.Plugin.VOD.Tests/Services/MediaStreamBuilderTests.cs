@@ -63,6 +63,24 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
             => Assert.Single(streams, s => s.Type == MediaStreamType.Subtitle);
 
         [Fact]
+        public void Build_ReadsTheCodecsByKind_WhenCodecsListsAudioFirst()
+        {
+            // Position 0 of CODECS used to be taken as the video codec and position 1 as the audio
+            // one, so an audio-first list labelled the picture "aac" and the sound "h264".
+            const string audioFirst = """
+                #EXTM3U
+                #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",LANGUAGE="fr",NAME="français",URI="fr.m3u8"
+                #EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1920x1080,CODECS="mp4a.40.2,avc1.640028",AUDIO="a"
+                https://cdn.test/1080.m3u8
+                """;
+
+            var streams = MediaStreamBuilder.Build(audioFirst);
+
+            Assert.Equal("h264", OnlyVideo(streams).Codec);
+            Assert.Equal("aac", Assert.Single(AudioOf(streams)).Codec);
+        }
+
+        [Fact]
         public void Build_AudioStream_PreservesNameAndLanguage()
         {
             var audio = AudioOf(MediaStreamBuilder.Build(FullMaster));

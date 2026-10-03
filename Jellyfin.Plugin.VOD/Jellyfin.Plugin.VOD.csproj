@@ -11,8 +11,19 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Jellyfin.Controller" Version="12.1.0" />
+    <!-- Compile-time only: the server provides these assemblies. PluginManager loads every *.dll it
+         finds in the plugin folder into the plugin's own load context, so a shipped copy of
+         MediaBrowser.Controller would sit beside the server's, and an ILibraryManager the plugin
+         asks for would no longer be the type the server's DI hands out. -->
+    <PackageReference Include="Jellyfin.Controller" Version="12.1.0" ExcludeAssets="runtime" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
+    <!-- Ships the managed SQLite assemblies but not the native library. Native code is always
+         resolved from the server, because PluginLoadContext overrides Load but not
+         LoadUnmanagedDll. Worse than useless, too: PluginManager's *.dll scan is recursive, so
+         runtimes/win-*/native/e_sqlite3.dll would be loaded as a managed assembly, fail, and mark
+         the plugin Malfunctioned on every platform. Pinned at the version Microsoft.Data.Sqlite
+         pulls transitively. -->
+    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.12" ExcludeAssets="native" />
     <!-- Compile-time only: the server already loads SkiaSharp and its native library from
          /jellyfin, so shipping our own copy would duplicate it and risk two versions in one
          process. "runtime" keeps the managed assembly out of the published plugin; "native" is

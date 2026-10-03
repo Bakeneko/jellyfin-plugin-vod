@@ -76,6 +76,48 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
         }
 
         [Fact]
+        public void FilterMaster_FindsTheExactTier_WhenCodecsListsAudioFirst()
+        {
+            // RFC 8216 does not order CODECS. Reading the video codec off position 0 turned this
+            // variant into "aac", so no exact tier matched and every menu entry but the primary 503ed.
+            const string audioFirst = """
+                #EXTM3U
+                #EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1920x1080,CODECS="mp4a.40.2,avc1.640028"
+                https://cdn.test/1080-h264.m3u8
+                #EXT-X-STREAM-INF:BANDWIDTH=9000000,RESOLUTION=3840x2160,CODECS="mp4a.40.2,vp09.00.50.08"
+                https://cdn.test/2160-vp9.m3u8
+                """;
+
+            var result = HlsPlaylistFilter.FilterMaster(
+                audioFirst, new Uri("https://cdn.test/master.m3u8"), 1080, "h264", [], []);
+
+            Assert.NotNull(result);
+            Assert.Contains("1080-h264.m3u8", result, StringComparison.Ordinal);
+        }
+
+        [Fact]
+        public void FilterMaster_DefaultsToAnAvc3Variant_AsItDoesForAvc1()
+        {
+            // avc3 is H.264 too, and QualityLadder already elects the reference tier on the
+            // normalised codec. Recognising only "avc1" here made the default fall back to the VP9
+            // variant, so the "reference tier" label named a tier the primary did not serve.
+            const string avc3 = """
+                #EXTM3U
+                #EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1920x1080,CODECS="avc3.640028"
+                https://cdn.test/1080-avc3.m3u8
+                #EXT-X-STREAM-INF:BANDWIDTH=4000000,RESOLUTION=1920x1080,CODECS="vp09.00.40.08"
+                https://cdn.test/1080-vp9.m3u8
+                """;
+
+            var result = HlsPlaylistFilter.FilterMaster(
+                avc3, new Uri("https://cdn.test/master.m3u8"), null, null, [], []);
+
+            Assert.NotNull(result);
+            Assert.Contains("1080-avc3.m3u8", result, StringComparison.Ordinal);
+            Assert.DoesNotContain("1080-vp9.m3u8", result, StringComparison.Ordinal);
+        }
+
+        [Fact]
         public void FilterMaster_WhenTheSelectedTierIsGone_ReturnsNull()
         {
             // The upstream may have dropped a tier since the sync captured it. Serving something

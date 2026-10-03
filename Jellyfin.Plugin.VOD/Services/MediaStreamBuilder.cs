@@ -39,8 +39,8 @@ namespace Jellyfin.Plugin.VOD.Services
             // The variant tag carries audio+video codecs but is written after renditions, so read it first.
             var variant = Array.Find(lines,
                 l => l.StartsWith("#EXT-X-STREAM-INF:", StringComparison.Ordinal));
-            var codecs = (HlsPlaylistFilter.Attribute(variant ?? string.Empty, "CODECS") ?? string.Empty)
-                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var (videoCodec, audioCodec) = CodecNames.Split(
+                HlsPlaylistFilter.Attribute(variant ?? string.Empty, "CODECS"));
 
             foreach (var line in lines)
             {
@@ -52,7 +52,7 @@ namespace Jellyfin.Plugin.VOD.Services
                     streams.Add(new MediaStream
                     {
                         Type = MediaStreamType.Video,
-                        Codec = CodecNames.Normalise(codecs.Length > 0 ? codecs[0] : null),
+                        Codec = CodecNames.Normalise(videoCodec),
                         Width = res.Length == 2 ? ParseInt(res[0]) : null,
                         Height = res.Length == 2 ? ParseInt(res[1]) : null,
                         BitRate = ParseInt(HlsPlaylistFilter.Attribute(line, "BANDWIDTH")),
@@ -78,7 +78,7 @@ namespace Jellyfin.Plugin.VOD.Services
                 {
                     Type = isAudio ? MediaStreamType.Audio : MediaStreamType.Subtitle,
                     Codec = isAudio
-                        ? CodecNames.Normalise(codecs.Length > 1 ? codecs[1] : null)
+                        ? CodecNames.Normalise(audioCodec)
                         : "webvtt",
                     Language = HlsPlaylistFilter.Attribute(line, "LANGUAGE"),
                     Title = HlsPlaylistFilter.Attribute(line, "NAME"),
@@ -101,8 +101,7 @@ namespace Jellyfin.Plugin.VOD.Services
             // rendition — Twitch's shape. Without this the stream list would claim the video has
             // no audio at all. It goes after the variant because that is where ffmpeg finds it:
             // inside the same program, numbered behind the video.
-            if (!sawRendition && codecs.Length > 1
-                && CodecNames.Normalise(codecs[1]) is { } muxedCodec)
+            if (!sawRendition && CodecNames.Normalise(audioCodec) is { } muxedCodec)
             {
                 streams.Add(new MediaStream
                 {

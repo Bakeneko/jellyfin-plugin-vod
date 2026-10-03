@@ -90,11 +90,15 @@ namespace Jellyfin.Plugin.VOD.Services
                     var uri = NextUri(lines, i);
                     if (uri is not null)
                     {
+                        var videoCodec = CodecNames.Split(Attribute(line, "CODECS")).Video;
                         variants.Add(new Variant(
                             ParseBandwidth(line),
                             ParseHeight(line),
-                            line.Contains("avc1", StringComparison.OrdinalIgnoreCase),
-                            FirstCodec(line),
+                            // Normalised rather than matched on "avc1", so avc3 counts as H.264
+                            // here exactly as it does in QualityLadder's reference-tier election.
+                            string.Equals(
+                                CodecNames.Normalise(videoCodec), "h264", StringComparison.Ordinal),
+                            videoCodec,
                             Attribute(line, "AUDIO"),
                             Attribute(line, "SUBTITLES"),
                             line,
@@ -237,12 +241,6 @@ namespace Jellyfin.Plugin.VOD.Services
             return (capped.Count > 0 ? capped : variants)
                 .OrderByDescending(v => v.Bandwidth).First();
         }
-
-        /// <summary>The variant's video codec, which CODECS lists first.</summary>
-        private static string? FirstCodec(string streamInf)
-            => (Attribute(streamInf, "CODECS") ?? string.Empty)
-                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .FirstOrDefault();
 
         private static string ForceDefault(string line, bool isDefault)
         {

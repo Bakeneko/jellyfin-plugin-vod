@@ -15,6 +15,10 @@
          The test host has no server, so it brings its own copy plus the native library. -->
     <PackageReference Include="SkiaSharp" Version="3.119.4" />
     <PackageReference Include="SkiaSharp.NativeAssets.Linux" Version="3.119.4" />
+    <!-- Same reason: the plugin references Jellyfin.Controller compile-time only, and that exclusion
+         flows through the project reference, so without this the test host cannot load
+         MediaBrowser.Controller or MediaBrowser.Model at all. Kept on the plugin's version. -->
+    <PackageReference Include="Jellyfin.Controller" Version="12.1.0" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="4.0.0">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>

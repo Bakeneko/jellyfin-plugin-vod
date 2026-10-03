@@ -20,7 +20,7 @@ namespace Jellyfin.Plugin.VOD.Services
     /// called and what it serves.
     /// </summary>
     /// <remarks>
-    /// Both the publisher and MediaStreamWriter derive from this, which is what keeps a member's
+    /// Both the publisher and MediaStreamWriter call into this, which is what keeps a member's
     /// name, path and id key from drifting apart between the two.
     /// </remarks>
     internal static class VersionGroup
