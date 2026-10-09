@@ -82,5 +82,19 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             Assert.Equal("My playlist",
                 SeriesNaming.Resolve("https://www.youtube.com/watch?v=abc&list=PLxxx", playlist));
         }
+
+        [Theory]
+        [InlineData("https://www.twitch.tv/otplol_/videos", "otplol_ - All Videos sorted by Date")]
+        [InlineData("https://www.twitch.tv/otplol_", "otplol_ (live) 2026-10-08 09:25")]
+        public void TwitchChannel_TakesTheHandleFromTheUrl(string url, string playlistTitle)
+        {
+            // Twitch reports no "channel" field on either form, measured 2026-10-08, so the playlist
+            // title used to win: the tab's generic label for /videos, and for the root a title with
+            // the sync's own time in it, which renamed the series on every pass. The handle in the
+            // URL is the one name both forms agree on, and the one the probe already derives.
+            var playlist = new PlaylistInfo { Title = playlistTitle, ChannelName = null };
+
+            Assert.Equal("otplol_", SeriesNaming.Resolve(url, playlist));
+        }
     }
 }

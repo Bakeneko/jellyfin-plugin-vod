@@ -28,6 +28,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 "Youtube" or "YoutubeTab" => $"youtube_v_{nativeId}",
                 "ArteTV" => $"arte_v_{nativeId}",
                 "FranceTV" => $"ftv_v_{nativeId}",
+                "Twitch" => $"twitch_v_{nativeId}",
                 _ => null
             };
         }
@@ -83,6 +84,12 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             // france.tv: https://www.france.tv/documentaires/doc/8808888-le-titre.html
             m = FranceTvVideoRegex().Match(sourceUrl);
             if (m.Success) return $"ftv_v_{m.Groups[1].Value}";
+
+            // Twitch channel: both the root and the /videos tab derive the same channel key.
+            // "twitch.tv/videos", which names no channel, deliberately derives none — IsChannel
+            // would otherwise be true for a URL with no channel to be named after.
+            if (TwitchUrls.ChannelFrom(sourceUrl) is { } twitchChannel)
+                return $"twitch_ch_{twitchChannel}";
 
             return null;
         }

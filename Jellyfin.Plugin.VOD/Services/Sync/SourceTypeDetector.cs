@@ -68,6 +68,26 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             if (host.EndsWith("france.tv", StringComparison.OrdinalIgnoreCase))
                 return SourceType.FranceTvVideo;
 
+            // ── Twitch ────────────────────────────────────────────────────────
+            if (TwitchUrls.IsTwitchHost(host))
+            {
+                var segments = path.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+                if (segments.Length == 0)
+                    return SourceType.Generic;
+
+                // /videos/{id} is one VOD; {channel}/videos is a channel's archive. The leading
+                // segment tells them apart.
+                if (string.Equals(segments[0], "videos", StringComparison.OrdinalIgnoreCase))
+                    return segments.Length > 1 ? SourceType.TwitchVideo : SourceType.Generic;
+
+                if (segments.Length == 1)
+                    return SourceType.TwitchChannelLive;
+
+                return string.Equals(segments[1], "videos", StringComparison.OrdinalIgnoreCase)
+                    ? SourceType.TwitchVideos
+                    : SourceType.Generic;
+            }
+
             return SourceType.Generic;
         }
     }

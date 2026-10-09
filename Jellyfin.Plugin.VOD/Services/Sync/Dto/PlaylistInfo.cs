@@ -217,7 +217,11 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
                 VideoUrl = url,
                 Title = ReadString(el, "title"),
                 IeKey = ieKey,
-                Duration = duration
+                Duration = duration,
+                LiveStatus = LiveStatusParser.FromYtDlp(
+                    el.TryGetProperty("live_status", out var els) && els.ValueKind == JsonValueKind.String
+                        ? els.GetString()
+                        : null)
             };
         }
 

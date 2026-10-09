@@ -36,5 +36,33 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             Assert.Equal(SourceType.Generic, SourceTypeDetector.Detect("not-a-url"));
             Assert.Equal(SourceType.Generic, SourceTypeDetector.Detect(string.Empty));
         }
+
+        [Theory]
+        [InlineData("https://www.twitch.tv/otplol_", SourceType.TwitchChannelLive)]
+        [InlineData("https://twitch.tv/otplol_/", SourceType.TwitchChannelLive)]
+        [InlineData("https://www.twitch.tv/otplol_/videos", SourceType.TwitchVideos)]
+        [InlineData("https://www.twitch.tv/otplol_/videos?filter=archives", SourceType.TwitchVideos)]
+        public void Detect_RecognisesTheTwoTwitchSourceForms(string url, SourceType expected)
+        {
+            // The root is Twitch's live page, so it means "live only"; /videos holds the archive and,
+            // while broadcasting, the in-progress VOD too.
+            Assert.Equal(expected, SourceTypeDetector.Detect(url));
+        }
+
+        [Theory]
+        [InlineData("https://mytwitch.tv/otplol_")]
+        [InlineData("https://nottwitch.tv/otplol_/videos")]
+        public void Detect_RejectsAHostThatMerelyEndsWithTwitchTv(string url)
+        {
+            // A Twitch source type is what admits a source to the live probe, deletion branch
+            // included, so a host that is not Twitch must never be given one.
+            Assert.Equal(SourceType.Generic, SourceTypeDetector.Detect(url));
+        }
+
+        [Fact]
+        public void Detect_TreatsASingleTwitchVodAsAVideo()
+        {
+            Assert.Equal(SourceType.TwitchVideo, SourceTypeDetector.Detect("https://www.twitch.tv/videos/2890554613"));
+        }
     }
 }

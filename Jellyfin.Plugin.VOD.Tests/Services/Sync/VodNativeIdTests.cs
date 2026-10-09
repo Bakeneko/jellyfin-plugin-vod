@@ -75,5 +75,53 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         [InlineData("https://example.com/some/path")]
         public void ForSource_UnknownOrNull_ReturnsNull(string? url)
             => Assert.Null(VodNativeId.ForSource(url));
+
+        // ── Twitch ────────────────────────────────────────────────────────────
+
+        [Fact]
+        public void ForVideo_PrefixesATwitchVideo()
+        {
+            Assert.Equal("twitch_v_2890554613", VodNativeId.ForVideo("Twitch", "2890554613"));
+        }
+
+        [Theory]
+        [InlineData("https://www.twitch.tv/otplol_", "twitch_ch_otplol_")]
+        [InlineData("https://www.twitch.tv/otplol_/videos", "twitch_ch_otplol_")]
+        public void ForSource_DerivesTheSameChannelKeyFromBothTwitchForms(string url, string expected)
+        {
+            // Both forms describe one channel: the key must not depend on which one was declared.
+            Assert.Equal(expected, VodNativeId.ForSource(url));
+        }
+
+        [Fact]
+        public void ForSource_NamesNoChannel_ForTwitchsVideosPathItself()
+        {
+            // Deliberate, not a side effect of sharing the host rule: "twitch.tv/videos" names no
+            // channel, and Detect calls it Generic. The old pattern answered "twitch_ch_videos",
+            // which made IsChannel true and sent SeriesNaming down the channel-name path for a URL
+            // that has no channel to be named after.
+            Assert.Null(VodNativeId.ForSource("https://twitch.tv/videos"));
+            Assert.Equal(SourceType.Generic, SourceTypeDetector.Detect("https://twitch.tv/videos"));
+        }
+
+        [Fact]
+        public void ForSource_AndDetect_AgreeThatALookalikeHostIsNotTwitch()
+        {
+            // The host rule is shared, so the two cannot disagree about "mytwitch.tv" — which they
+            // did, and which was enough to route a stranger's page into the probe.
+            const string Lookalike = "https://mytwitch.tv/otplol_";
+            Assert.Equal(SourceType.Generic, SourceTypeDetector.Detect(Lookalike));
+            Assert.Null(VodNativeId.ForSource(Lookalike));
+        }
+
+        [Fact]
+        public void ForSource_AndDetect_AgreeOnMobileTwitchUrl()
+        {
+            // Detect accepts any subdomain of twitch.tv; ForSource must match the same host set so
+            // a URL copied from the Twitch mobile app yields the same channel key as its www form.
+            const string MobileUrl = "https://m.twitch.tv/otplol_";
+            Assert.Equal(SourceType.TwitchChannelLive, SourceTypeDetector.Detect(MobileUrl));
+            Assert.Equal("twitch_ch_otplol_", VodNativeId.ForSource(MobileUrl));
+        }
     }
 }

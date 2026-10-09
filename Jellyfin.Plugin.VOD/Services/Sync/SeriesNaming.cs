@@ -23,6 +23,14 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         {
             ArgumentNullException.ThrowIfNull(playlist);
 
+            // Twitch reports no "channel" field on either source form (measured 2026-10-08), so the
+            // playlist title used to win: the /videos tab's generic "… - All Videos sorted by Date",
+            // and for the channel root a title carrying the sync's own time, which renamed the series
+            // on every pass. The handle in the URL is stable, and it is the name the live probe
+            // already derives for a source that has never synced.
+            if (TwitchUrls.ChannelFrom(url) is { } handle)
+                return handle;
+
             // yt-dlp names a channel's playlist after the TAB rather than the channel — "Le
             // Fossoyeur de Films - Videos", "… - Live", "… - Shorts" — so a channel takes its
             // "channel" field instead. A playlist reports that field too, but there it holds the

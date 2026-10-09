@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using Jellyfin.Plugin.VOD.Data;
 using Jellyfin.Plugin.VOD.Data.Models;
+using Jellyfin.Plugin.VOD.Services.Sync;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
@@ -159,6 +160,91 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
             Assert.Equal("old-uuid", orphans[0]);
         }
 
+        [Theory]
+        [InlineData(LiveStatus.Live)]
+        [InlineData(LiveStatus.Upcoming)]
+        public void GetOrphanedVideoUuids_ExemptsARowThatIsBroadcastingOrScheduled(LiveStatus status)
+        {
+            // The probe writes rows the sync's listing does not carry: on a subscriber-only channel
+            // it stores the STREAM id, which no /videos entry mentions, and for a live-only source
+            // the sync and the probe publish different ids for the same broadcast. TouchVideos only
+            // reaches enumerated ids, so the sweep deleted the row — and the reconcile its library
+            // item — in the middle of the broadcast.
+            _db.UpsertSource(new SourceRecord { Url = "https://example.com" });
+            var syncStart = DateTimeOffset.UtcNow;
+
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = "live-uuid",
+                SourceUrl = "https://example.com",
+                VideoUrl = "https://example.com/v/live",
+                SyncedAt = syncStart.AddMinutes(-3),
+                LiveStatus = status
+            });
+
+            Assert.DoesNotContain("live-uuid", _db.GetOrphanedVideoUuids("https://example.com", syncStart));
+        }
+
+        [Theory]
+        [InlineData(LiveStatus.Live)]
+        [InlineData(LiveStatus.Upcoming)]
+        public void GetOrphanedVideoUuids_SweepsAStaleLiveRowButNotAFreshlyProbedOne(LiveStatus status)
+        {
+            // The exemption needs an escape, or one Twitch path leaves a permanent phantom: a
+            // /videos source on a subscriber-only channel stores the fallback row under the STREAM
+            // id, with the channel root as its URL. When the broadcast ends, yt-dlp stops answering
+            // for that URL, so the re-fetch never returns and the row never reaches NotLive; and the
+            // stream id is absent from the /videos listing, so neither TouchVideos nor the sync's
+            // refetch set ever sees it. Nothing would collect it.
+            //
+            // Freshness is what tells the two apart: a real broadcast is written on every probe
+            // pass, while a stuck row stops being written the moment its re-fetch starts failing.
+            _db.UpsertSource(new SourceRecord { Url = "https://example.com" });
+            var syncStart = DateTimeOffset.UtcNow;
+
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = "fresh-uuid",
+                SourceUrl = "https://example.com",
+                VideoUrl = "https://example.com/v/fresh",
+                SyncedAt = syncStart.AddMinutes(-3),
+                LiveStatus = status
+            });
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = "stale-uuid",
+                SourceUrl = "https://example.com",
+                VideoUrl = "https://example.com/v/stale",
+                SyncedAt = syncStart.AddDays(-30),
+                LiveStatus = status
+            });
+
+            var orphans = _db.GetOrphanedVideoUuids("https://example.com", syncStart);
+
+            Assert.DoesNotContain("fresh-uuid", orphans);
+            Assert.Contains("stale-uuid", orphans);
+        }
+
+        [Fact]
+        public void GetOrphanedVideoUuids_StillSweepsAFinishedBroadcast()
+        {
+            // The exemption lasts exactly as long as the broadcast: once the video is a normal one,
+            // disappearing from the source means the same as for any other video.
+            _db.UpsertSource(new SourceRecord { Url = "https://example.com" });
+            var syncStart = DateTimeOffset.UtcNow;
+
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = "was-live-uuid",
+                SourceUrl = "https://example.com",
+                VideoUrl = "https://example.com/v/was-live",
+                SyncedAt = syncStart.AddMinutes(-3),
+                LiveStatus = LiveStatus.NotLive
+            });
+
+            Assert.Contains("was-live-uuid", _db.GetOrphanedVideoUuids("https://example.com", syncStart));
+        }
+
         [Fact]
         public void TouchVideos_UpdatesSyncedAt()
         {
@@ -281,14 +367,14 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                 Id = "live-uuid",
                 SourceUrl = "https://www.youtube.com/@live",
                 VideoUrl = "https://www.youtube.com/watch?v=live123",
-                IsLive = true,
+                LiveStatus = LiveStatus.Live,
                 SyncedAt = DateTimeOffset.UtcNow
             });
 
             var r = _db.GetVideoByUuid("live-uuid");
 
             Assert.NotNull(r);
-            Assert.True(r.IsLive);
+            Assert.Equal(LiveStatus.Live, r.LiveStatus);
         }
 
         [Fact]
@@ -303,7 +389,6 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                 Id = "idempotent-uuid",
                 SourceUrl = "https://example.com",
                 VideoUrl = "https://example.com/v/1",
-                IsLive = false,
                 SyncedAt = DateTimeOffset.UtcNow
             });
 
@@ -366,14 +451,63 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
         }
 
         [Fact]
-        public void EnsureCreated_StampsSchemaVersion()
+        public void UpsertVideo_RoundTripsLiveStatus()
+        {
+            _db.UpsertSource(new SourceRecord { Url = "https://example.com/s" });
+
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = "11111111-1111-1111-1111-111111111111",
+                SourceUrl = "https://example.com/s",
+                VideoUrl = "https://example.com/v",
+                SyncedAt = DateTimeOffset.UtcNow,
+                LiveStatus = LiveStatus.Upcoming
+            });
+
+            var read = _db.GetVideoByUuid("11111111-1111-1111-1111-111111111111");
+            Assert.NotNull(read);
+            Assert.Equal(LiveStatus.Upcoming, read.LiveStatus);
+        }
+
+        [Fact]
+        public void GetVideoByUuid_OnUnknownLiveStatusValue_ReadsBackAsNotLive()
+        {
+            // Enum.TryParse accepts numeric strings, so a hand-edited '7' would parse to (LiveStatus)7
+            // without the IsDefined guard — an out-of-defined-range value that is neither NotLive,
+            // Live nor Upcoming and misleads MembersFor and BuildVideoOverview.
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/src2" });
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = "22222222-2222-2222-2222-222222222222",
+                SourceUrl = "https://example.test/src2",
+                VideoUrl = "https://example.test/v2",
+                SyncedAt = DateTimeOffset.UtcNow
+            });
+
+            // Directly corrupt the column with a numeric value outside the enum's range.
+            using (var conn = new SqliteConnection($"Data Source={_dbPath}"))
+            {
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "UPDATE videos SET live_status = '7' WHERE id = $id";
+                cmd.Parameters.AddWithValue("$id", "22222222-2222-2222-2222-222222222222");
+                cmd.ExecuteNonQuery();
+            }
+
+            var corrupted = _db.GetVideoByUuid("22222222-2222-2222-2222-222222222222");
+            Assert.NotNull(corrupted);
+            Assert.Equal(LiveStatus.NotLive, corrupted.LiveStatus);
+        }
+
+        [Fact]
+        public void EnsureCreated_LeavesTheSchemaAtVersion6()
         {
             using var conn = new SqliteConnection($"Data Source={_dbPath}");
             conn.Open();
             using var cmd = conn.CreateCommand();
             cmd.CommandText = "PRAGMA user_version";
 
-            Assert.Equal(5L, (long)cmd.ExecuteScalar()!);
+            Assert.Equal(6L, (long)cmd.ExecuteScalar()!);
         }
 
         [Fact]
@@ -419,7 +553,8 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                             subtitle_langs TEXT,
                             tags           TEXT,
                             categories     TEXT,
-                            channels       TEXT
+                            channels       TEXT,
+                            is_live        INTEGER NOT NULL DEFAULT 0
                         );
                         INSERT INTO videos (id, source_url, video_url, synced_at)
                         VALUES ('legacy', 'https://example.test/s', 'https://example.test/v',
@@ -437,7 +572,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
 
                 using var version = conn.CreateCommand();
                 version.CommandText = "PRAGMA user_version";
-                Assert.Equal(5L, (long)version.ExecuteScalar()!);
+                Assert.Equal(6L, (long)version.ExecuteScalar()!);
 
                 using var backfilled = conn.CreateCommand();
                 backfilled.CommandText = "SELECT first_seen_at FROM videos WHERE id = 'legacy'";
@@ -551,7 +686,8 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                             audio_langs    TEXT,
                             subtitle_langs TEXT,
                             tags           TEXT,
-                            categories     TEXT
+                            categories     TEXT,
+                            is_live        INTEGER NOT NULL DEFAULT 0
                         );
                         PRAGMA user_version = 1;
                         """;
@@ -566,7 +702,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
 
                 using var version = conn.CreateCommand();
                 version.CommandText = "PRAGMA user_version";
-                Assert.Equal(5L, (long)version.ExecuteScalar()!);
+                Assert.Equal(6L, (long)version.ExecuteScalar()!);
 
                 using var columns = conn.CreateCommand();
                 columns.CommandText = "SELECT name FROM pragma_table_info('videos') WHERE name = 'extras'";
@@ -730,7 +866,8 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                             tags             TEXT,
                             categories       TEXT,
                             channels         TEXT,
-                            first_seen_at    TEXT
+                            first_seen_at    TEXT,
+                            is_live          INTEGER NOT NULL DEFAULT 0
                         );
                         INSERT INTO sources (url, name) VALUES ('__debug__', 'Debug (internal)');
                         INSERT INTO videos  (id, source_url, video_url, synced_at)
@@ -750,7 +887,86 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                 conn.Open();
                 using var version = conn.CreateCommand();
                 version.CommandText = "PRAGMA user_version";
-                Assert.Equal(5L, (long)version.ExecuteScalar()!);
+                Assert.Equal(6L, (long)version.ExecuteScalar()!);
+            }
+            finally
+            {
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+        }
+
+        /// <summary>
+        /// C3: a v5 database that has the <c>is_live</c> column must gain <c>live_status</c> and
+        /// lose <c>is_live</c> after migration v6. This covers the upgrade path every existing
+        /// installation takes; a fresh database created from scratch is covered by
+        /// <see cref="EnsureCreated_LeavesTheSchemaAtVersion6"/>.
+        /// </summary>
+        [Fact]
+        public void EnsureCreated_MigrationV6_ReplacesIsLiveColumnWithLiveStatus()
+        {
+            var path = Path.GetTempFileName();
+            try
+            {
+                // Seed a v5 schema: extras column present, is_live present, no live_status.
+                using (var seed = new SqliteConnection($"Data Source={path}"))
+                {
+                    seed.Open();
+                    using var cmd = seed.CreateCommand();
+                    cmd.CommandText = """
+                        CREATE TABLE sources (
+                            url         TEXT PRIMARY KEY,
+                            name        TEXT,
+                            video_count INTEGER NOT NULL DEFAULT 0
+                        );
+                        CREATE TABLE videos (
+                            id               TEXT PRIMARY KEY,
+                            source_url       TEXT NOT NULL REFERENCES sources(url),
+                            video_url        TEXT NOT NULL,
+                            synced_at        TEXT NOT NULL,
+                            extras           TEXT,
+                            description      TEXT,
+                            first_seen_at    TEXT,
+                            published_image_url TEXT,
+                            thumbnail_url    TEXT,
+                            extractor_key    TEXT,
+                            native_id        TEXT,
+                            published_at     TEXT,
+                            duration_seconds INTEGER,
+                            season_number    INTEGER,
+                            episode_number   INTEGER,
+                            is_live          INTEGER NOT NULL DEFAULT 0
+                        );
+                        INSERT INTO sources (url, name) VALUES ('https://example.test/src', 'Test');
+                        INSERT INTO videos (id, source_url, video_url, synced_at, is_live)
+                        VALUES ('v5-row', 'https://example.test/src', 'https://example.test/v',
+                                '2026-01-01T00:00:00+00:00', 1);
+                        PRAGMA user_version = 5;
+                        """;
+                    cmd.ExecuteNonQuery();
+                }
+
+                using var upgraded = new VodDatabase(path, NullLogger<VodDatabase>.Instance);
+                upgraded.EnsureCreated();
+
+                using var conn = new SqliteConnection($"Data Source={path}");
+                conn.Open();
+
+                using var version = conn.CreateCommand();
+                version.CommandText = "PRAGMA user_version";
+                Assert.Equal(6L, (long)version.ExecuteScalar()!);
+
+                // live_status must be present (default 'NotLive' applied to the pre-existing row).
+                using var liveStatus = conn.CreateCommand();
+                liveStatus.CommandText = "SELECT live_status FROM videos WHERE id = 'v5-row'";
+                Assert.Equal("NotLive", liveStatus.ExecuteScalar());
+
+                // is_live must be gone.
+                using var columns = conn.CreateCommand();
+                columns.CommandText = "SELECT name FROM pragma_table_info('videos') WHERE name = 'is_live'";
+                Assert.Null(columns.ExecuteScalar());
             }
             finally
             {
@@ -873,7 +1089,8 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                             tags           TEXT,
                             categories     TEXT,
                             channels       TEXT,
-                            first_seen_at  TEXT
+                            first_seen_at  TEXT,
+                            is_live        INTEGER NOT NULL DEFAULT 0
                         );
                         PRAGMA user_version = 3;
                         """;

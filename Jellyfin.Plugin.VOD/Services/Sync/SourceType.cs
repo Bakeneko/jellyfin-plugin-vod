@@ -21,6 +21,15 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// <summary>A single france.tv video URL.</summary>
         FranceTvVideo,
 
+        /// <summary>A Twitch channel root URL: live only, nothing published off air.</summary>
+        TwitchChannelLive,
+
+        /// <summary>A Twitch channel's /videos tab: the archive, plus the in-progress VOD while live.</summary>
+        TwitchVideos,
+
+        /// <summary>A single Twitch VOD URL (/videos/{numeric-id}).</summary>
+        TwitchVideo,
+
         /// <summary>An unrecognised URL — treated as a single video fetch.</summary>
         Generic
     }

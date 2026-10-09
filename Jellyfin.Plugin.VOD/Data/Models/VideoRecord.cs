@@ -1,4 +1,5 @@
 using System;
+using Jellyfin.Plugin.VOD.Services.Sync;
 
 namespace Jellyfin.Plugin.VOD.Data.Models
 {
@@ -70,7 +71,7 @@ namespace Jellyfin.Plugin.VOD.Data.Models
         /// <summary>Gets or sets the description / synopsis.</summary>
         public string? Description { get; set; }
 
-        /// <summary>Gets or sets a value indicating whether this is a live stream at the time of last sync.</summary>
-        public bool IsLive { get; set; }
+        /// <summary>Whether this video is broadcasting now, scheduled, or neither.</summary>
+        public LiveStatus LiveStatus { get; set; }
     }
 }

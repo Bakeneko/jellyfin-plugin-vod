@@ -185,70 +185,92 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
         }
 
         [Fact]
-        public void Build_VideoOnly_NoAudioNoSubtitle()
+        public void Build_DoesNotSynthesiseASubtitle_WhenAudioAndVideoAreDeclared()
         {
+            // Verifies that no subtitle stream is synthesised when the playlist declares audio and
+            // video renditions but no subtitle. The audio rendition also makes sawRendition true so
+            // the builder reaches its main path rather than the muxed-variant early return.
             var master = """
                 #EXTM3U
-                #EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=1280x720,CODECS="avc1.640028"
+                #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",LANGUAGE="en",NAME="English",DEFAULT=YES,URI="en.m3u8"
+                #EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=1280x720,AUDIO="a",CODECS="avc1.640028,mp4a.40.2"
                 https://cdn.example.com/video.m3u8
                 """;
 
             var streams = MediaStreamBuilder.Build(master);
 
-            Assert.Single(streams);
-            Assert.Equal(MediaStreamType.Video, streams[0].Type);
+            Assert.Equal(2, streams.Count);
+            Assert.Equal(MediaStreamType.Audio, streams[0].Type);
+            Assert.Equal(MediaStreamType.Video, streams[1].Type);
         }
 
         [Fact]
         public void Build_VideoCodecNormalised_Hevc()
         {
+            // An audio rendition is required: a rendition-free master is treated as a muxed variant
+            // and returns an empty list by design (spec F10 — container order is unknown from playlist).
             var master = """
                 #EXTM3U
-                #EXT-X-STREAM-INF:BANDWIDTH=4000000,RESOLUTION=3840x2160,CODECS="hev1.1.6.L150.90"
+                #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",LANGUAGE="en",NAME="English",DEFAULT=YES,URI="en.m3u8"
+                #EXT-X-STREAM-INF:BANDWIDTH=4000000,RESOLUTION=3840x2160,AUDIO="a",CODECS="hev1.1.6.L150.90,mp4a.40.2"
                 https://cdn.example.com/4k.m3u8
                 """;
 
             var streams = MediaStreamBuilder.Build(master);
 
-            Assert.Equal("hevc", streams[0].Codec);
+            Assert.Equal("hevc", OnlyVideo(streams).Codec);
         }
 
         [Fact]
         public void Build_MissingResolution_WidthAndHeightAreNull()
         {
+            // An audio rendition is required: a rendition-free master is treated as a muxed variant
+            // and returns an empty list by design (spec F10 — container order is unknown from playlist).
             var master = """
                 #EXTM3U
-                #EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS="avc1.640028"
+                #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",LANGUAGE="en",NAME="English",DEFAULT=YES,URI="en.m3u8"
+                #EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO="a",CODECS="avc1.640028,mp4a.40.2"
                 https://cdn.example.com/video.m3u8
                 """;
 
             var streams = MediaStreamBuilder.Build(master);
 
-            Assert.Null(streams[0].Width);
-            Assert.Null(streams[0].Height);
+            Assert.Null(OnlyVideo(streams).Width);
+            Assert.Null(OnlyVideo(streams).Height);
         }
 
         [Fact]
-        public void Build_OnAMuxedVariant_SynthesisesTheAudioStream()
+        public void Build_DeclaresNothing_ForAMuxedVariant()
         {
-            // Twitch ships muxed variants: the audio codec is declared in CODECS with no separate
-            // #EXT-X-MEDIA rendition. Declaring video only would hide a track the stream carries,
-            // and mislead Jellyfin's track selection and transcoding decisions.
+            // A muxed variant carries its streams inside the container, in an order the playlist does
+            // not state: a Twitch TS segment is audio, then video, then timed_id3 (spec F10). The
+            // previous behaviour declared video first, which is the inverse, and a wrong order costs
+            // the picture outright whenever this list wins the race against Jellyfin's own probe.
+            // A muxed variant also has no rendition NAMEs, which is the only thing this builder adds
+            // to a probe — so there is nothing to declare and nothing to lose.
             const string muxed = """
                 #EXTM3U
                 #EXT-X-STREAM-INF:BANDWIDTH=9168232,RESOLUTION=1920x1080,CODECS="avc1.64002A,mp4a.40.2"
                 https://cdn.test/1080p60.m3u8
                 """;
 
-            var streams = MediaStreamBuilder.Build(muxed);
+            Assert.Empty(MediaStreamBuilder.Build(muxed));
+        }
 
-            Assert.Equal(2, streams.Count);
-            Assert.Equal(MediaStreamType.Video, streams[0].Type);
-            Assert.Equal("h264", streams[0].Codec);
-            Assert.Equal(MediaStreamType.Audio, streams[1].Type);
-            Assert.Equal("aac", streams[1].Codec);
-            Assert.True(streams[1].IsDefault);
-            Assert.Equal(1, streams[1].Index);
+        [Fact]
+        public void Build_DeclaresNothing_ForAVideoOnlyVariant()
+        {
+            // A variant whose CODECS lists only a video codec — no audio codec at all — is a different
+            // input from the muxed case above (which carries both), but it reaches the same
+            // !sawRendition branch. This test guards against a future change that handles one input
+            // shape and not the other; without it the input the original test used to cover is dark.
+            const string videoOnly = """
+                #EXTM3U
+                #EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=1280x720,CODECS="avc1.640028"
+                https://cdn.example.com/video.m3u8
+                """;
+
+            Assert.Empty(MediaStreamBuilder.Build(videoOnly));
         }
 
         [Fact]
@@ -265,8 +287,8 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
 
             // One audio stream, and it is the declared rendition rather than a synthesised stand-in:
             // only the rendition carries NAME and LANGUAGE. It precedes the video, as the playlist
-            // declares it — the contrast with Build_OnAMuxedVariant_SynthesisesTheAudioStream, where
-            // the synthesised track follows the variant because that is where ffmpeg finds it.
+            // declares it — a muxed variant (no renditions at all) now returns empty instead of a
+            // synthesised track, because the container order cannot be read from the playlist.
             Assert.Equal(2, streams.Count);
             var audio = Assert.Single(streams, s => s.Type == MediaStreamType.Audio);
             Assert.Equal("français (confort audio)", audio.Title);

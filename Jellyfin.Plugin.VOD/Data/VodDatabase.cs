@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Text.Json;
 using System.Threading;
 using Jellyfin.Plugin.VOD.Data.Models;
+using Jellyfin.Plugin.VOD.Services.Sync;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 
@@ -44,7 +45,7 @@ namespace Jellyfin.Plugin.VOD.Data
         /// Schema version this build expects, tracked in SQLite's <c>user_version</c>.
         /// Bump it and add the matching case to <see cref="Migrate"/> whenever the schema changes.
         /// </summary>
-        private const int SchemaVersion = 5;
+        private const int SchemaVersion = 6;
 
         /// <inheritdoc />
         public void EnsureCreated()
@@ -185,6 +186,20 @@ namespace Jellyfin.Plugin.VOD.Data
                         """;
                     break;
 
+                case 6:
+                    // is_live could not tell a scheduled stream from a finished one. The replacement
+                    // is stored as text rather than an int because it is read back as an enum name,
+                    // and it is a column rather than an extras field because it is a predicate: the
+                    // sync's skip-set and the live probe both select on it.
+                    // No backfill: the project is not released, and the next pass over a row sets it.
+                    cmd.CommandText = """
+                        ALTER TABLE videos ADD COLUMN live_status TEXT NOT NULL DEFAULT 'NotLive';
+                        ALTER TABLE videos DROP COLUMN is_live;
+
+                        PRAGMA user_version = 6;
+                        """;
+                    break;
+
                 default:
                     throw new InvalidOperationException(
                         $"No migration defined for schema version {version}");
@@ -283,13 +298,13 @@ namespace Jellyfin.Plugin.VOD.Data
                          published_at, duration_seconds,
                          season_number, episode_number, synced_at,
                          thumbnail_url, extras,
-                         description, is_live, first_seen_at)
+                         description, live_status, first_seen_at)
                     VALUES
                         ($id, $sourceUrl, $extractorKey, $nativeId, $videoUrl, $title,
                          $publishedAt, $durationSeconds,
                          $seasonNumber, $episodeNumber, $syncedAt,
                          $thumbnailUrl, $extras,
-                         $description, $isLive, $firstSeenAt)
+                         $description, $liveStatus, $firstSeenAt)
                     ON CONFLICT(id) DO UPDATE SET
                         source_url       = excluded.source_url,
                         extractor_key    = excluded.extractor_key,
@@ -304,7 +319,7 @@ namespace Jellyfin.Plugin.VOD.Data
                         thumbnail_url    = excluded.thumbnail_url,
                         extras           = excluded.extras,
                         description      = excluded.description,
-                        is_live          = excluded.is_live,
+                        live_status      = excluded.live_status,
                         -- Never overwritten: an existing discovery date always beats the one the new
                         -- upsert proposes. This COALESCE is what enforces "set once, never updated".
                         first_seen_at    = COALESCE(videos.first_seen_at, excluded.first_seen_at);
@@ -477,18 +492,50 @@ namespace Jellyfin.Plugin.VOD.Data
             }
         }
 
+        /// <summary>
+        /// How long a row may claim to be broadcasting or scheduled without being written again
+        /// before the orphan sweep stops sparing it.
+        /// </summary>
+        /// <remarks>
+        /// The quantity this has to clear is not a broadcast's length — every probe pass rewrites a
+        /// live row's <c>synced_at</c>, so a week-long stream stays fresh throughout — but the
+        /// longest plausible gap between two successful writes of a row that is still live. A week
+        /// clears the longest broadcasts anyone runs (multi-day charity marathons), any sane probe
+        /// interval, and a long run of yt-dlp failures on top, while bounding a stuck row's life to
+        /// days rather than for ever. Sparing a live row wrongly removes something the user is
+        /// watching; sweeping a stale one wrongly costs one re-publication on the next pass, so the
+        /// bound is deliberately generous.
+        /// </remarks>
+        private static readonly TimeSpan LiveExemptionMaxAge = TimeSpan.FromDays(7);
+
         /// <inheritdoc />
         public IReadOnlyList<string> GetOrphanedVideoUuids(string sourceUrl, DateTimeOffset syncedBefore, DateTimeOffset? retentionCutoff = null)
         {
             lock (_sync)
             {
                 using var cmd = Connection.CreateCommand();
+                // A row that is broadcasting or scheduled is spared, but only while it is FRESH.
+                //
+                // Spared, because the probe publishes ids the sync's listing does not carry — the
+                // stream id on a subscriber-only channel, a different id per pass for a live-only
+                // source — so synced_at alone deleted the row, and with it the library item, in the
+                // middle of the broadcast.
+                //
+                // Only while fresh, because one such row can never return to NotLive: the fallback
+                // row's URL is the channel root, which yt-dlp answers for only while the channel is
+                // live, so once the broadcast ends its re-fetch fails for ever; and its stream id is
+                // absent from the /videos listing, so no sync touches it either. An unbounded
+                // exemption left one phantom per broadcast, accumulating. Freshness separates the
+                // two cases: a live row is rewritten on every probe pass, while a stuck row stops
+                // being written the moment its re-fetch starts failing.
                 var sql = retentionCutoff.HasValue
-                    ? "SELECT id FROM videos WHERE source_url = $url AND (synced_at < $cutoff OR (published_at IS NOT NULL AND published_at < $retention))"
-                    : "SELECT id FROM videos WHERE source_url = $url AND synced_at < $cutoff";
+                    ? "SELECT id FROM videos WHERE source_url = $url AND (live_status = $notLive OR synced_at < $stale) AND (synced_at < $cutoff OR (published_at IS NOT NULL AND published_at < $retention))"
+                    : "SELECT id FROM videos WHERE source_url = $url AND (live_status = $notLive OR synced_at < $stale) AND synced_at < $cutoff";
                 cmd.CommandText = sql;
                 cmd.Parameters.AddWithValue("$url", sourceUrl);
+                cmd.Parameters.AddWithValue("$notLive", nameof(LiveStatus.NotLive));
                 cmd.Parameters.AddWithValue("$cutoff", syncedBefore.ToString("O"));
+                cmd.Parameters.AddWithValue("$stale", syncedBefore.Subtract(LiveExemptionMaxAge).ToString("O"));
                 if (retentionCutoff.HasValue)
                     cmd.Parameters.AddWithValue("$retention", retentionCutoff.Value.ToString("O"));
                 using var r = cmd.ExecuteReader();
@@ -519,7 +566,7 @@ namespace Jellyfin.Plugin.VOD.Data
             cmd.Parameters.AddWithValue("$extras", SerializeExtras(v.Extras));
             cmd.Parameters.AddWithValue("$firstSeenAt", (object?)v.FirstSeenAt?.ToString("O") ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$description", (object?)v.Description ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$isLive", v.IsLive ? 1 : 0);
+            cmd.Parameters.AddWithValue("$liveStatus", v.LiveStatus.ToString());
         }
 
         private static SourceRecord MapSource(SqliteDataReader r)
@@ -599,7 +646,9 @@ namespace Jellyfin.Plugin.VOD.Data
                 FirstSeenAt = D("first_seen_at"),
                 PublishedImageUrl = S("published_image_url"),
                 Description = S("description"),
-                IsLive = r.GetInt32(r.GetOrdinal("is_live")) != 0
+                LiveStatus = Enum.TryParse<LiveStatus>(S("live_status"), out var ls) && Enum.IsDefined(ls)
+                    ? ls
+                    : LiveStatus.NotLive,
             };
         }
 

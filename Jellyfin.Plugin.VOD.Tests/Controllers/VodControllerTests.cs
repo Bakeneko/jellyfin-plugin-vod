@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Jellyfin.Plugin.VOD.Controllers;
 using Jellyfin.Plugin.VOD.Data.Models;
+using Jellyfin.Plugin.VOD.Services.Sync;
 using MediaBrowser.Model.Entities;
 using Xunit;
 
@@ -222,5 +223,20 @@ namespace Jellyfin.Plugin.VOD.Tests.Controllers
         [InlineData(null, "h264", false)]
         public void IsWellFormedSelection_RequiresBothOrNeither(int? height, string? codec, bool expected)
             => Assert.Equal(expected, VodController.IsWellFormedSelection(height, codec));
+
+        [Fact]
+        public void IsStreamable_ReturnsFalseForAnUpcomingBroadcast()
+        {
+            // A scheduled stream has no formats at all, so resolving it would fail deep in
+            // yt-dlp. Refusing at the controller keeps the failure readable.
+            var video = new VideoRecord
+            {
+                Id = "3f9a2b1c-0000-0000-0000-000000000077",
+                SourceUrl = "https://www.twitch.tv/channel",
+                VideoUrl = "https://www.twitch.tv/channel",
+                LiveStatus = LiveStatus.Upcoming
+            };
+            Assert.False(VodController.IsStreamable(video));
+        }
     }
 }

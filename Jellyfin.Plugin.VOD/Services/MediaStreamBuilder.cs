@@ -97,18 +97,14 @@ namespace Jellyfin.Plugin.VOD.Services
                 return [];
             }
 
-            // A muxed variant declares its audio codec in CODECS but ships no #EXT-X-MEDIA
-            // rendition — Twitch's shape. Without this the stream list would claim the video has
-            // no audio at all. It goes after the variant because that is where ffmpeg finds it:
-            // inside the same program, numbered behind the video.
-            if (!sawRendition && CodecNames.Normalise(audioCodec) is { } muxedCodec)
+            // A muxed variant's streams live inside the container, in an order the playlist does not
+            // state (a Twitch TS segment is audio, then video, then timed_id3 — spec F10), so any
+            // order declared here is a guess that costs the picture when it wins the race against
+            // Jellyfin's probe. It also has no rendition NAMEs, which is the only thing this builder
+            // contributes beyond a probe, so there is nothing to declare.
+            if (!sawRendition)
             {
-                streams.Add(new MediaStream
-                {
-                    Type = MediaStreamType.Audio,
-                    Codec = muxedCodec,
-                    IsDefault = true
-                });
+                return [];
             }
 
             for (var i = 0; i < streams.Count; i++)

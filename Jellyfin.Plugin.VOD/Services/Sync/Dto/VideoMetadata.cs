@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Text.Json;
 using Jellyfin.Plugin.VOD.Data.Models;
 using Jellyfin.Plugin.VOD.Services;
+using Jellyfin.Plugin.VOD.Services.Sync;
 
 namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
 {
@@ -26,6 +27,21 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
 
         /// <summary>Gets the primary title. For Arte episodes this is often the series name.</summary>
         public string? Title { get; init; }
+
+        /// <summary>The title without the date yt-dlp appends to a live broadcast.</summary>
+        public string? FullTitle { get; init; }
+
+        /// <summary>How many formats yt-dlp listed, whatever their kind.</summary>
+        public int FormatCount { get; init; }
+
+        /// <summary>Whether the extraction proves nothing can be played.</summary>
+        /// <remarks>
+        /// <c>--ignore-no-formats-error</c> is required to read a scheduled live, which has no format
+        /// until it starts, but it also turns "Private video" and its kin into a success carrying no
+        /// format at all — measured 2026-10-08 on ELa4xqlV8sw. A video with no format that is not
+        /// scheduled is therefore an anomaly to report, not a record to store.
+        /// </remarks>
+        public bool IsUnavailable => FormatCount == 0 && LiveStatus != LiveStatus.Upcoming;
 
         /// <summary>Gets the alternative title. For Arte episodes this is the episode title.</summary>
         public string? AltTitle { get; init; }
@@ -65,14 +81,8 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
         /// <summary>Gets the series name when the entry belongs to a series (Arte).</summary>
         public string? Series { get; init; }
 
-        /// <summary>Gets a value indicating whether this entry is a live stream currently in progress.</summary>
-        public bool IsLive { get; init; }
-
-        /// <summary>
-        /// Gets a value indicating whether this entry is a scheduled stream that has not yet started.
-        /// yt-dlp cannot resolve the stream URL for upcoming entries; playback will fail until the stream begins.
-        /// </summary>
-        public bool IsUpcoming { get; init; }
+        /// <summary>Whether the video is broadcasting now, scheduled, or neither.</summary>
+        public LiveStatus LiveStatus { get; init; }
 
         /// <summary>
         /// Gets the scheduled start time as Unix seconds (<c>release_timestamp</c>).
@@ -143,6 +153,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
                 // "acodec": null, so a predicate keyed on acodec dropped all of them.
                 var qualities = new List<VideoQuality>();
                 var audioTracks = new List<AudioTrack>();
+                var formatCount = 0;
                 var seenQualities = new HashSet<(int, string, int?)>();
 
                 if (root.TryGetProperty("formats", out var formats)
@@ -150,6 +161,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
                 {
                     foreach (var fmt in formats.EnumerateArray())
                     {
+                        formatCount++;
                         if (!IsHlsFormat(fmt))
                             continue;
 
@@ -189,6 +201,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
                 {
                     Id = id,
                     Title = root.TryGetProperty("title", out var title) ? title.GetString() : null,
+                    FullTitle = root.TryGetProperty("fulltitle", out var ft) ? ft.GetString() : null,
                     AltTitle = root.TryGetProperty("alt_title", out var alt) ? alt.GetString() : null,
                     Description = root.TryGetProperty("description", out var desc) ? desc.GetString() : null,
                     UploadDate = root.TryGetProperty("upload_date", out var ud) ? ud.GetString() : null,
@@ -205,10 +218,13 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
                     EpisodeNumber = root.TryGetProperty("episode_number", out var en) && en.ValueKind == JsonValueKind.Number
                         ? en.GetInt32() : null,
                     Series = root.TryGetProperty("series", out var series) ? series.GetString() : null,
-                    IsLive = root.TryGetProperty("is_live", out var il) && il.ValueKind == JsonValueKind.True,
-                    IsUpcoming = root.TryGetProperty("is_upcoming", out var iu) && iu.ValueKind == JsonValueKind.True,
+                    LiveStatus = LiveStatusParser.FromYtDlp(
+                        root.TryGetProperty("live_status", out var ls) && ls.ValueKind == JsonValueKind.String
+                            ? ls.GetString()
+                            : null),
                     ReleaseTimestamp = root.TryGetProperty("release_timestamp", out var rt) && rt.ValueKind == JsonValueKind.Number
                         ? rt.GetInt64() : null,
+                    FormatCount = formatCount,
                     Qualities = qualities,
                     AudioTracks = audioTracks,
                     SubtitleLanguages = subLangs,
@@ -216,6 +232,46 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
                     Categories = JsonArrays.ReadStrings(root, "categories", MaxTags),
                     Channels = ReadChannels(root)
                 };
+            }
+            catch (JsonException)
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Parses the JSON output of <c>yt-dlp -J --playlist-items 1</c> and returns the first entry's metadata.
+        /// Returns <see langword="null"/> when <c>entries</c> is absent, empty, or when its first value is null.
+        /// </summary>
+        /// <remarks>
+        /// A flat Twitch listing carries no live status, so a full extraction of the head via
+        /// <c>--playlist-items 1</c> answers both "is this channel live" and "what is the video" in a
+        /// single call; measured at 2.1 s (spec F4). Without cookies the first entry may be null (spec F2).
+        /// </remarks>
+        public static VideoMetadata? ParseFirstEntryJson(string json)
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(json);
+                var root = doc.RootElement;
+
+                if (!root.TryGetProperty("entries", out var entries)
+                    || entries.ValueKind != JsonValueKind.Array)
+                {
+                    return null;
+                }
+
+                foreach (var entry in entries.EnumerateArray())
+                {
+                    if (entry.ValueKind == JsonValueKind.Null)
+                        return null;
+
+                    // Re-serialise the entry element as a standalone JSON string and parse it via
+                    // the main parser, so the field mapping stays in a single place.
+                    return ParseJson(entry.GetRawText());
+                }
+
+                return null;
             }
             catch (JsonException)
             {

@@ -120,6 +120,13 @@ namespace Jellyfin.Plugin.VOD.Controllers
                 return NotFound(new { error = "Unknown video id", id });
             }
 
+            if (!IsStreamable(video))
+            {
+                // A scheduled stream has no formats at all, so resolving it would fail deep in
+                // yt-dlp. Refusing here keeps the failure readable.
+                return NotFound(new { error = "This broadcast has not started yet.", id });
+            }
+
             var cacheKey = string.Create(
                 System.Globalization.CultureInfo.InvariantCulture,
                 $"{id}|{format}|{height}|{codec}|{effectiveAudioLangs}|{effectiveSubLangs}");
@@ -434,6 +441,15 @@ namespace Jellyfin.Plugin.VOD.Controllers
         /// <param name="codec">The requested codec, or null for the default tier.</param>
         internal static bool IsWellFormedSelection(int? height, string? codec)
             => height.HasValue == !string.IsNullOrWhiteSpace(codec);
+
+        /// <summary>Whether a stream request for this video can be served.</summary>
+        /// <param name="video">The stored video record.</param>
+        /// <remarks>
+        /// A scheduled stream has no formats at all: refusing here keeps the failure readable
+        /// instead of letting it propagate deep into yt-dlp.
+        /// </remarks>
+        internal static bool IsStreamable(VideoRecord video)
+            => video.LiveStatus != LiveStatus.Upcoming;
 
         private async Task<string?> FilterUpstreamAsync(
             string masterUrl, int? height, string? codec, string audioLangs, string subLangs, CancellationToken cancellationToken)

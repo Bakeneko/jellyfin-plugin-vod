@@ -1,5 +1,6 @@
 using System.IO;
 using System.Linq;
+using Jellyfin.Plugin.VOD.Services.Sync;
 using Jellyfin.Plugin.VOD.Services.Sync.Dto;
 using Xunit;
 
@@ -96,6 +97,49 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             Assert.Single(meta.AudioTracks);
         }
 
+        [Fact]
+        public void ParseJson_ReadsLiveStatus_ForAScheduledStream()
+        {
+            // An upcoming stream has no formats at all and no duration; its scheduled start is only
+            // in release_timestamp. Shape measured on a real YouTube scheduled live (spec F14, F18).
+            const string json = """
+                {
+                  "id": "IZn15-Wg8Fo",
+                  "title": "A scheduled stream",
+                  "live_status": "is_upcoming",
+                  "release_timestamp": 1791128700,
+                  "upload_date": "20261003",
+                  "formats": []
+                }
+                """;
+
+            var meta = VideoMetadata.ParseJson(json);
+
+            Assert.NotNull(meta);
+            Assert.Equal(LiveStatus.Upcoming, meta.LiveStatus);
+            Assert.Equal(1791128700L, meta.ReleaseTimestamp);
+        }
+
+        [Fact]
+        public void ParseJson_ReadsLiveStatus_ForALiveStream()
+        {
+            const string json = """
+                {"id":"v1","title":"Live now","live_status":"is_live","formats":[]}
+                """;
+
+            Assert.Equal(LiveStatus.Live, VideoMetadata.ParseJson(json)!.LiveStatus);
+        }
+
+        [Fact]
+        public void ParseJson_DefaultsToNotLive_WhenLiveStatusIsAbsent()
+        {
+            const string json = """
+                {"id":"v1","title":"An ordinary video","formats":[]}
+                """;
+
+            Assert.Equal(LiveStatus.NotLive, VideoMetadata.ParseJson(json)!.LiveStatus);
+        }
+
         /// <summary>
         /// NTSC content reports 59.94 fps. Truncating it would label the tier "1080p59".
         /// </summary>
@@ -122,6 +166,85 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
 
             Assert.NotNull(meta);
             Assert.Equal(60, Assert.Single(meta.Qualities).Fps);
+        }
+
+        // ── ParseFirstEntryJson ───────────────────────────────────────────────────────────────────
+
+        [Fact]
+        public void ParseFirstEntryJson_ReturnsNull_WhenEntriesArrayIsEmpty()
+        {
+            var meta = VideoMetadata.ParseFirstEntryJson("{\"_type\":\"playlist\",\"entries\":[]}");
+
+            Assert.Null(meta);
+        }
+
+        [Fact]
+        public void ParseFirstEntryJson_ReturnsNull_WhenFirstEntryIsNull()
+        {
+            // yt-dlp emits a null first entry for a subscriber-only Twitch VOD when there are no
+            // accessible videos — measured (spec F2). The probe must treat that as "could not read",
+            // not as a valid answer.
+            var meta = VideoMetadata.ParseFirstEntryJson("{\"_type\":\"playlist\",\"entries\":[null]}");
+
+            Assert.Null(meta);
+        }
+
+        [Fact]
+        public void ParseFirstEntryJson_ReturnsFirstEntry_WhenItIsValid()
+        {
+            // The happy path: a Twitch channel that is broadcasting has a non-null first entry with
+            // a recognisable id and extractor key.
+            const string json = """
+                {
+                  "_type": "playlist",
+                  "entries": [
+                    {
+                      "id": "2890554613",
+                      "title": "DEMACIA CUP stream",
+                      "extractor_key": "TwitchVod",
+                      "live_status": "is_live"
+                    }
+                  ]
+                }
+                """;
+
+            var meta = VideoMetadata.ParseFirstEntryJson(json);
+
+            Assert.NotNull(meta);
+            Assert.Equal("2890554613", meta.Id);
+            Assert.Equal(LiveStatus.Live, meta.LiveStatus);
+        }
+
+        [Fact]
+        public void IsUnavailable_WhenTheExtractionCarriesNoFormatAtAll()
+        {
+            // A private video, measured 2026-10-08 on ELa4xqlV8sw: --ignore-no-formats-error turns
+            // yt-dlp's "Private video" error into a success with no format, no duration and no
+            // status, so the sync stored an empty record and reported nothing.
+            const string json = """{ "id": "ELa4xqlV8sw", "title": "A former live", "extractor_key": "Youtube" }""";
+
+            Assert.True(VideoMetadata.ParseJson(json)!.IsUnavailable);
+        }
+
+        [Fact]
+        public void IsAvailable_WhenAScheduledLiveHasNoFormatYet()
+        {
+            // The case the flag exists for: an upcoming live has no format until it starts.
+            const string json = """{ "id": "sKuVMM02LVM", "title": "Planète Rap", "live_status": "is_upcoming" }""";
+
+            Assert.False(VideoMetadata.ParseJson(json)!.IsUnavailable);
+        }
+
+        [Fact]
+        public void IsAvailable_WhenTheExtractionCarriesAFormat_EvenOneThisPluginCannotServe()
+        {
+            // Any format proves the video is reachable; which ones the plugin can serve is a
+            // separate question with its own answer.
+            const string json = """
+                { "id": "abc", "title": "A video", "formats": [ { "format_id": "sb0", "protocol": "mhtml" } ] }
+                """;
+
+            Assert.False(VideoMetadata.ParseJson(json)!.IsUnavailable);
         }
     }
 }

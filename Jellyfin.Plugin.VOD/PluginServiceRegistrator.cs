@@ -47,9 +47,11 @@ namespace Jellyfin.Plugin.VOD
             // Sync services
             serviceCollection.AddSingleton<LibraryPublisher>();
             serviceCollection.AddSingleton<SyncService>();
+            serviceCollection.AddSingleton<LiveProbeService>();
 
             // Scheduled tasks
             serviceCollection.AddSingleton<IScheduledTask, SyncTask>();
+            serviceCollection.AddSingleton<IScheduledTask, LiveProbeTask>();
         }
     }
 }

@@ -89,6 +89,18 @@ namespace Jellyfin.Plugin.VOD.Configuration
         [SuppressMessage("Performance", "CA1819:Properties should not return arrays", Justification = "string[] is required for Jellyfin XML serialization of BasePluginConfiguration.")]
         public string[] PreferredSubtitleLanguages { get; set; } = [];
 
+        // ── Sync ─────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Gets or sets how often, in minutes, sources are polled for a broadcast in progress.
+        /// Zero or less disables the probe.
+        /// </summary>
+        /// <remarks>
+        /// The sync alone cannot find a live in time: it runs per source at
+        /// <see cref="SourceDefinition.SyncIntervalMinutes"/>, 720 by default.
+        /// </remarks>
+        public int LiveProbeIntervalMinutes { get; set; } = 5;
+
         // ── Sources ───────────────────────────────────────────────────────────────
 
         /// <summary>Gets or sets the list of configured sync sources.</summary>

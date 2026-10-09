@@ -355,5 +355,53 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
 
             Assert.True(SyncService.HasPayload(_db.GetVideoByUuid(uuid)!.Extras));
         }
+
+        [Fact]
+        public void HasPayload_IsNotTheOnlySkipCondition_AnUpcomingRowIsAlwaysRefetched()
+        {
+            // A scheduled stream's metadata changes under it: it starts, or it is rescheduled. Both
+            // Live and Upcoming rows must leave the skip-set, where only IsLive used to.
+            Assert.True(SyncService.MustRefetch(LiveStatus.Live));
+            Assert.True(SyncService.MustRefetch(LiveStatus.Upcoming));
+            Assert.False(SyncService.MustRefetch(LiveStatus.NotLive));
+        }
+
+        [Fact]
+        public void PublishedAtForUpcoming_IsTheScheduledStart_AndFollowsAReschedule()
+        {
+            // ParseDate prefers upload_date, which for a scheduled stream is the day it was created,
+            // not when it will air (spec F18). And PublishedAt is normally frozen once set, which
+            // would pin a stale schedule.
+            var first = SyncService.PublishedAtFor(
+                LiveStatus.Upcoming,
+                releaseTimestamp: 1791128700,
+                parsed: new DateTimeOffset(2026, 10, 3, 0, 0, 0, TimeSpan.Zero),
+                stored: null,
+                syncStart: new DateTimeOffset(2026, 10, 3, 7, 0, 0, TimeSpan.Zero));
+            Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(1791128700), first);
+
+            var rescheduled = SyncService.PublishedAtFor(
+                LiveStatus.Upcoming,
+                releaseTimestamp: 1791215100,
+                parsed: new DateTimeOffset(2026, 10, 3, 0, 0, 0, TimeSpan.Zero),
+                stored: DateTimeOffset.FromUnixTimeSeconds(1791128700),
+                syncStart: new DateTimeOffset(2026, 10, 3, 7, 0, 0, TimeSpan.Zero));
+            Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(1791215100), rescheduled);
+        }
+
+        [Fact]
+        public void PublishedAtFor_KeepsTheStoredValue_ForAnOrdinaryVideo()
+        {
+            var stored = new DateTimeOffset(2026, 5, 10, 0, 0, 0, TimeSpan.Zero);
+
+            var result = SyncService.PublishedAtFor(
+                LiveStatus.NotLive,
+                releaseTimestamp: null,
+                parsed: new DateTimeOffset(2026, 9, 1, 0, 0, 0, TimeSpan.Zero),
+                stored: stored,
+                syncStart: new DateTimeOffset(2026, 10, 3, 7, 0, 0, TimeSpan.Zero));
+
+            Assert.Equal(stored, result);
+        }
     }
 }

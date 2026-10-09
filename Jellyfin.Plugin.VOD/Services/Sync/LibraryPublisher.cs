@@ -88,7 +88,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         {
             ArgumentNullException.ThrowIfNull(video);
 
-            return video.IsLive
+            return video.LiveStatus != LiveStatus.NotLive
                 ? [new VersionMember(
                     null, VersionGroup.KeyFor(video.Id, null), video.Title ?? string.Empty,
                     VersionGroup.PathFor(localBaseUrl, video.Id, null))]
@@ -583,7 +583,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             var movie = existing ?? new Movie { Id = itemId };
 
             var overview = BuildVideoOverview(video);
-            var premiereDate = video.PublishedAt?.UtcDateTime;
+            var premiereDate = PremiereDateFor(video);
             var productionYear = video.PublishedAt?.UtcDateTime.Year;
             var runTimeTicks = RunTimeTicks(video);
             var dateAdded = DateAddedFor(video, useReleaseDateAsDateAdded);
@@ -655,7 +655,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             var episode = existing ?? new Episode { Id = itemId };
 
             var overview = BuildVideoOverview(video);
-            var premiereDate = video.PublishedAt?.UtcDateTime;
+            var premiereDate = PremiereDateFor(video);
             var productionYear = video.PublishedAt?.UtcDateTime.Year;
             var runTimeTicks = RunTimeTicks(video);
             var dateAdded = DateAddedFor(video, useReleaseDateAsDateAdded);
@@ -751,7 +751,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             var item = existing ?? new T { Id = itemId };
 
             var runTimeTicks = RunTimeTicks(video);
-            var premiereDate = video.PublishedAt?.UtcDateTime;
+            var premiereDate = PremiereDateFor(video);
 
             var overview = BuildVideoOverview(video);
             var productionYear = video.PublishedAt?.UtcDateTime.Year;
@@ -1097,20 +1097,30 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         }
 
         /// <summary>
-        /// Builds a video's Overview: the source URL, then the live notice when it applies, then the
-        /// description.
+        /// Builds a video's Overview: the broadcast state first (if any), then the source URL, then
+        /// the description.
         /// </summary>
         /// <remarks>
-        /// The live mention is composed here rather than stored, so a stream that has ended stops
-        /// advertising itself as live as soon as the next sync clears the flag.
+        /// The broadcast state leads because it is why the viewer is looking at this item; the source
+        /// line is reference material. Composed here rather than stored, so a stream that has ended
+        /// stops advertising itself as live as soon as the next sync clears the flag.
         /// </remarks>
-        private string BuildVideoOverview(VideoRecord video)
+        internal string BuildVideoOverview(VideoRecord video)
         {
             var sb = new StringBuilder();
-            sb.Append(SourceLine(video.VideoUrl));
 
-            if (video.IsLive)
-                sb.Append("\n\n").Append(_localizer.Get("LiveNow"));
+            // The broadcast state leads: it is why the viewer is looking at this item, where the
+            // source line is reference material. User request 2026-10-03.
+            if (video.LiveStatus == LiveStatus.Live)
+                sb.Append(_localizer.Get("LiveNow")).Append("\n\n");
+            else if (video.LiveStatus == LiveStatus.Upcoming && video.PublishedAt.HasValue)
+                sb.Append(string.Format(
+                        CultureInfo.InvariantCulture,
+                        _localizer.Get("UpcomingBroadcast"),
+                        video.PublishedAt.Value.UtcDateTime.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture)))
+                  .Append("\n\n");
+
+            sb.Append(SourceLine(video.VideoUrl));
 
             if (!string.IsNullOrEmpty(video.Description))
                 sb.Append("\n\n").Append(video.Description);
@@ -1118,10 +1128,34 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             return sb.ToString();
         }
 
-        private static long? RunTimeTicks(VideoRecord video)
-            => video.DurationSeconds.HasValue
+        /// <summary>The duration to publish, or null while the source is still growing.</summary>
+        /// <remarks>
+        /// Jellyfin builds a frozen segment list from RunTimeTicks, so an item with a duration stops
+        /// playing at the length known when playback started. Without one, the client asks for
+        /// live.m3u8 and follows the growing source. Measured 2026-10-03 (spec F11).
+        /// </remarks>
+        internal static long? RunTimeTicks(VideoRecord video)
+            => video.LiveStatus == LiveStatus.NotLive && video.DurationSeconds.HasValue
                 ? video.DurationSeconds.Value * TimeSpan.TicksPerSecond
                 : null;
+
+        /// <summary>The release date to publish.</summary>
+        /// <remarks>
+        /// A broadcast keeps living, so it must stay first in the release-date sort too: while it is
+        /// live its date is the last pass that saw it, and while it is scheduled it is the airing
+        /// time, which is in the future. Both are computed here rather than stored, so the row keeps
+        /// the dates episode numbering and the eventual replay depend on.
+        /// </remarks>
+        internal static DateTime? PremiereDateFor(VideoRecord video)
+        {
+            ArgumentNullException.ThrowIfNull(video);
+            return video.LiveStatus switch
+            {
+                LiveStatus.Live => video.SyncedAt.UtcDateTime,
+                LiveStatus.Upcoming => video.PublishedAt?.UtcDateTime ?? video.SyncedAt.UtcDateTime,
+                _ => video.PublishedAt?.UtcDateTime
+            };
+        }
 
         private static bool ApplyVideoIds(BaseItem item, VideoRecord video)
         {
@@ -1167,6 +1201,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 "youtube" => "Youtube",
                 "arte" => "ArteTV",
                 "ftv" => "FranceTV",
+                "twitch" => "Twitch",
                 _ => null
             };
 
@@ -1294,15 +1329,28 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// sources survive in the database, so flipping the setting either way just republishes with
         /// the other value.
         /// <para>
-        /// Reads only fields that are set once. <see cref="VideoRecord.SyncedAt"/> is deliberately NOT
-        /// consulted as a fallback, however tempting: it is rewritten on every pass, so a date derived
-        /// from it would move every pass and rewrite the item for ever. A row with neither a discovery
-        /// nor a release date therefore yields null, and the item keeps whatever date it already
-        /// carries — stable, and honest about having nothing to say.
+        /// For a live or scheduled broadcast, <see cref="VideoRecord.SyncedAt"/> is returned
+        /// unconditionally: a broadcast keeps living, so it must stay first in "recently added" as
+        /// new videos arrive after it started. This is a deliberate exception to the rule below.
+        /// </para>
+        /// <para>
+        /// For an ordinary video (<c>NotLive</c>), only fields that are set once are read.
+        /// <see cref="VideoRecord.SyncedAt"/> is deliberately NOT consulted as a fallback, however
+        /// tempting: it is rewritten on every pass, so a date derived from it would move every pass
+        /// and rewrite the item for ever. A row with neither a discovery nor a release date therefore
+        /// yields null, and the item keeps whatever date it already carries — stable, and honest about
+        /// having nothing to say.
         /// </para>
         /// </remarks>
         internal static DateTime? DateAddedFor(VideoRecord video, bool useReleaseDate)
         {
+            // A live or scheduled stream must stay at the top of "recently added" while it lives, so
+            // its date added is the last pass that saw it in that state. Deliberate exception to the
+            // rule that the date added derives only from fields set once, and it outranks the
+            // release-date option, which would otherwise put a scheduled item in the future.
+            if (video.LiveStatus != LiveStatus.NotLive)
+                return video.SyncedAt.UtcDateTime;
+
             var released = video.PublishedAt?.UtcDateTime;
             var discovered = video.FirstSeenAt?.UtcDateTime;
             var chosen = useReleaseDate ? released ?? discovered : discovered;
@@ -1489,6 +1537,52 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             => anchorId == Guid.Empty ? null : _libraryManager.GetItemById(anchorId) as Folder;
 
         /// <summary>
+        /// The anchors other than a source's target that may still hold its items.
+        /// </summary>
+        /// <param name="config">The current plugin configuration.</param>
+        /// <param name="source">The source being published.</param>
+        /// <param name="record">The source's stored row, which remembers where it last published.</param>
+        /// <returns>The anchors to sweep alongside the target.</returns>
+        /// <remarks>
+        /// Shared by the sync and the live probe: both reconcile the same source, and a pass that
+        /// swept fewer anchors than the other left a duplicate behind until the other healed it.
+        /// <para>
+        /// Best effort by design: an anchor that no longer resolves is simply absent, because it
+        /// only ever serves cleanup. The stored anchor covers the one case the other configured
+        /// library cannot — changing a source's mode AND its library in the same edit leaves the old
+        /// target as neither of the two currently configured.
+        /// </para>
+        /// </remarks>
+        public IReadOnlyList<Folder> SweepAnchorsFor(
+            PluginConfiguration config, SourceDefinition source, SourceRecord record)
+        {
+            ArgumentNullException.ThrowIfNull(config);
+            ArgumentNullException.ThrowIfNull(source);
+            ArgumentNullException.ThrowIfNull(record);
+
+            var anchors = new List<Folder>();
+
+            var otherMode = source.Mode == SourceMode.Movies ? SourceMode.Series : SourceMode.Movies;
+            var otherName = LibraryRouting.NameFor(config, otherMode);
+            if (!string.IsNullOrWhiteSpace(otherName))
+            {
+                try
+                {
+                    anchors.Add(ResolveTarget(otherName).Anchor);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    LogSweepAnchorUnavailable(otherName, ex.Message);
+                }
+            }
+
+            if (record.PublishedAnchorId is { } anchorId && FindAnchorById(anchorId) is { } stored)
+                anchors.Add(stored);
+
+            return anchors;
+        }
+
+        /// <summary>
         /// Removes every trace of one source from the given anchors: its items, and the containers
         /// that held them.
         /// </summary>
@@ -1544,6 +1638,10 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         [LoggerMessage(EventId = 2, Level = LogLevel.Information,
             Message = "Library {LibraryName} has no indexed folder at {Location}; re-validating the top-level folders so Jellyfin indexes it")]
         private partial void LogIndexingLibrary(string libraryName, string location);
+
+        [LoggerMessage(EventId = 5, Level = LogLevel.Debug,
+            Message = "Not sweeping library '{LibraryName}', it does not resolve: {Reason}")]
+        private partial void LogSweepAnchorUnavailable(string libraryName, string reason);
 
         [LoggerMessage(EventId = 4, Level = LogLevel.Information,
             Message = "Purged source {SourceUrl}: {Removed} item(s) removed")]

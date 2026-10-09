@@ -126,6 +126,18 @@
                     </div>
 
                     <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="liveProbeIntervalMinutes">Live probe interval (minutes)</label>
+                        <input id="liveProbeIntervalMinutes" name="LiveProbeIntervalMinutes" type="number" min="0"
+                               is="emby-input" class="emby-input"
+                               placeholder="5" />
+                        <div class="fieldDescription">
+                            How often sources are polled for a broadcast in progress. Set to 0 to disable.
+                            The sync alone cannot find a live in time: it runs per source every 720 minutes by default.
+                            The task itself wakes every 5 minutes, so any value below 5 behaves as 5.
+                        </div>
+                    </div>
+
+                    <div class="inputContainer">
                         <label class="inputLabel inputLabelUnfocused" for="preferredAudioLanguages">Preferred audio languages</label>
                         <input id="preferredAudioLanguages" name="PreferredAudioLanguages" type="text"
                                is="emby-input" class="emby-input"
@@ -504,6 +516,7 @@
                             document.querySelector('#cookiesPath').value       = config.CookiesPath || '';
                             document.querySelector('#localBaseUrl').value      = config.LocalBaseUrl || 'http://localhost:8096';
                             document.querySelector('#cacheMinutes').value      = config.CacheMinutes || 5;
+                            document.querySelector('#liveProbeIntervalMinutes').value = config.LiveProbeIntervalMinutes != null ? config.LiveProbeIntervalMinutes : 5;
                             document.querySelector('#preferredAudioLanguages').value =
                                 (config.PreferredAudioLanguages || []).join(', ');
                             document.querySelector('#preferredSubtitleLanguages').value =
@@ -538,6 +551,7 @@
                             config.SeriesLibraryName = document.querySelector('#seriesLibraryName').value;
                             config.LocalBaseUrl    = document.querySelector('#localBaseUrl').value;
                             config.CacheMinutes    = parseInt(document.querySelector('#cacheMinutes').value, 10) || 5;
+                            config.LiveProbeIntervalMinutes = parseInt(document.querySelector('#liveProbeIntervalMinutes').value, 10) || 0;
                             config.PreferredAudioLanguages = document.querySelector('#preferredAudioLanguages').value
                                 .split(',').map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; });
                             config.PreferredSubtitleLanguages = document.querySelector('#preferredSubtitleLanguages').value

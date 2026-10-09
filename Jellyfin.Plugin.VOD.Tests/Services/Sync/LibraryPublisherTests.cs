@@ -1424,6 +1424,52 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         }
 
         [Fact]
+        public void SweepAnchorsFor_ListsTheOtherModesLibraryAndTheStoredAnchor()
+        {
+            // Both the sync and the live probe reconcile with these anchors. The probe used to pass
+            // none, so after a mode or library change it created a duplicate in the new anchor and
+            // left the old item standing until the next sync healed it.
+            var movies = new Folder { Id = Guid.NewGuid(), Path = "/media/Movies" };
+            var stored = new Folder { Id = Guid.NewGuid(), Path = "/media/Old" };
+            _library.GetVirtualFolders().Returns(
+            [
+                new VirtualFolderInfo
+                {
+                    Name = "Movies",
+                    ItemId = Guid.NewGuid().ToString("N"),
+                    Locations = ["/media/Movies"]
+                }
+            ]);
+            _library.FindByPath("/media/Movies", true).Returns(movies);
+            _library.GetItemById(stored.Id).Returns(stored);
+
+            var config = new PluginConfiguration { MoviesLibraryName = "Movies", SeriesLibraryName = "Series" };
+            var anchors = _publisher.SweepAnchorsFor(
+                config,
+                new SourceDefinition { Url = "https://example.com", Mode = SourceMode.Series },
+                new SourceRecord { Url = "https://example.com", PublishedAnchorId = stored.Id });
+
+            Assert.Equal(2, anchors.Count);
+            Assert.Contains(movies, anchors);
+            Assert.Contains(stored, anchors);
+        }
+
+        [Fact]
+        public void SweepAnchorsFor_SkipsAnAnchorThatNoLongerResolves()
+        {
+            // Best effort by design: these anchors only ever serve cleanup, so one that has gone
+            // must not fail a source whose own target is fine.
+            _library.GetVirtualFolders().Returns([]);
+
+            var anchors = _publisher.SweepAnchorsFor(
+                new PluginConfiguration { MoviesLibraryName = "Gone", SeriesLibraryName = "Series" },
+                new SourceDefinition { Url = "https://example.com", Mode = SourceMode.Series },
+                new SourceRecord { Url = "https://example.com" });
+
+            Assert.Empty(anchors);
+        }
+
+        [Fact]
         public void FindAnchorById_ReturnsNull_WhenTheAnchorIsGoneOrIsNotAFolder()
         {
             // Review focus 2. A stored anchor outlives the library it named. It only ever serves
@@ -1565,7 +1611,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         // `with` expression available: every variant is built here.
         private static VideoRecord TieredVideo(
             string vodId,
-            bool isLive = false,
+            LiveStatus liveStatus = LiveStatus.NotLive,
             int? seasonNumber = null,
             int? episodeNumber = null,
             VideoQuality[]? qualities = null) => new()
@@ -1574,7 +1620,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             Title = "A Video Title",
             VideoUrl = "https://example.com/watch?v=abc",
             SourceUrl = "https://example.com/channel",
-            IsLive = isLive,
+            LiveStatus = liveStatus,
             SeasonNumber = seasonNumber,
             EpisodeNumber = episodeNumber,
             Extras = new VideoExtras
@@ -1593,7 +1639,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             // A live ladder is volatile and its URLs rotate, so tiers captured at sync may already
             // be wrong. Offering none is the honest answer.
             var members = _publisher.MembersFor(
-                TieredVideo("3f9a2b1c-0000-0000-0000-000000000050", isLive: true),
+                TieredVideo("3f9a2b1c-0000-0000-0000-000000000050", liveStatus: LiveStatus.Live),
                 "http://localhost:8096");
 
             var primary = Assert.Single(members);
@@ -2284,6 +2330,95 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             Assert.DoesNotContain(
                 staleId, primary.LinkedAlternateVersions.Select(l => l.ItemId!.Value));
             _library.Received().DeleteItem(staleItem, Arg.Any<DeleteOptions>(), true);
+        }
+
+        [Fact]
+        public void RunTimeTicks_IsNullWhileBroadcastingOrScheduled()
+        {
+            // An item with a duration gets a frozen playlist computed from it, so playback would stop
+            // at the length known when it started. Without one, the client asks for live.m3u8 and
+            // follows the growing source. Measured 2026-10-03 (spec F11).
+            var live = TieredVideo("3f9a2b1c-0000-0000-0000-000000000070");
+            live.DurationSeconds = 2685;
+            live.LiveStatus = LiveStatus.Live;
+            Assert.Null(LibraryPublisher.RunTimeTicks(live));
+
+            var upcoming = TieredVideo("3f9a2b1c-0000-0000-0000-000000000071");
+            upcoming.DurationSeconds = 0;
+            upcoming.LiveStatus = LiveStatus.Upcoming;
+            Assert.Null(LibraryPublisher.RunTimeTicks(upcoming));
+
+            var finished = TieredVideo("3f9a2b1c-0000-0000-0000-000000000072");
+            finished.DurationSeconds = 48698;
+            finished.LiveStatus = LiveStatus.NotLive;
+            Assert.Equal(48698L * TimeSpan.TicksPerSecond, LibraryPublisher.RunTimeTicks(finished));
+        }
+
+        [Fact]
+        public void DateAddedAndPremiereDate_KeepALiveFirstInBothSortOrders()
+        {
+            // A live keeps living, so it must stay at the top of "recently added" and of the release
+            // date sort even as other videos arrive after it started. Both therefore track the last
+            // pass that saw it live, not when it was first seen.
+            var lastPass = new DateTimeOffset(2026, 10, 3, 9, 30, 0, TimeSpan.Zero);
+            var live = TieredVideo("3f9a2b1c-0000-0000-0000-000000000073");
+            live.LiveStatus = LiveStatus.Live;
+            live.FirstSeenAt = new DateTimeOffset(2026, 10, 1, 0, 0, 0, TimeSpan.Zero);
+            live.PublishedAt = new DateTimeOffset(2026, 10, 1, 0, 0, 0, TimeSpan.Zero);
+            live.SyncedAt = lastPass;
+
+            Assert.Equal(lastPass.UtcDateTime, LibraryPublisher.DateAddedFor(live, useReleaseDate: false));
+            Assert.Equal(lastPass.UtcDateTime, LibraryPublisher.DateAddedFor(live, useReleaseDate: true));
+            Assert.Equal(lastPass.UtcDateTime, LibraryPublisher.PremiereDateFor(live));
+        }
+
+        [Fact]
+        public void PremiereDate_OfAScheduledStreamIsItsScheduledStart()
+        {
+            // In the future, so it sorts first; and it follows a reschedule because PublishedAt is
+            // rewritten on every fetch while the stream is Upcoming.
+            var scheduled = new DateTimeOffset(2026, 10, 4, 15, 45, 0, TimeSpan.Zero);
+            var upcoming = TieredVideo("3f9a2b1c-0000-0000-0000-000000000074");
+            upcoming.LiveStatus = LiveStatus.Upcoming;
+            upcoming.PublishedAt = scheduled;
+            upcoming.SyncedAt = new DateTimeOffset(2026, 10, 3, 9, 30, 0, TimeSpan.Zero);
+
+            Assert.Equal(scheduled.UtcDateTime, LibraryPublisher.PremiereDateFor(upcoming));
+        }
+
+        [Fact]
+        public void BuildVideoOverview_LeadsWithTheBroadcastState()
+        {
+            // The state is why the viewer is looking at this item; the source line is reference
+            // material. User request 2026-10-03.
+            _localizer.Get("LiveNow").Returns("Diffusion en cours");
+            _localizer.Get("SourceLabel").Returns("Source : {0}");
+
+            var live = TieredVideo("3f9a2b1c-0000-0000-0000-000000000075");
+            live.LiveStatus = LiveStatus.Live;
+            live.Description = "A description.";
+
+            var overview = _publisher.BuildVideoOverview(live);
+
+            Assert.StartsWith("Diffusion en cours", overview, StringComparison.Ordinal);
+            Assert.Contains("Source : ", overview, StringComparison.Ordinal);
+            Assert.True(
+                overview.IndexOf("Diffusion en cours", StringComparison.Ordinal)
+                < overview.IndexOf("Source : ", StringComparison.Ordinal));
+        }
+
+        [Fact]
+        public void BuildVideoOverview_LeadsWithTheScheduledTime_ForAnUpcomingStream()
+        {
+            _localizer.Get("UpcomingBroadcast").Returns("Diffusion prévue : {0} UTC");
+
+            var upcoming = TieredVideo("3f9a2b1c-0000-0000-0000-000000000076");
+            upcoming.LiveStatus = LiveStatus.Upcoming;
+            upcoming.PublishedAt = new DateTimeOffset(2026, 10, 4, 15, 45, 0, TimeSpan.Zero);
+
+            var overview = _publisher.BuildVideoOverview(upcoming);
+
+            Assert.StartsWith("Diffusion prévue : 2026-10-04 15:45 UTC", overview, StringComparison.Ordinal);
         }
 
         /// <summary>

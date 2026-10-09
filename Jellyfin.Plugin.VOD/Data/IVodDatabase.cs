@@ -90,6 +90,13 @@ namespace Jellyfin.Plugin.VOD.Data
         /// before <paramref name="syncedBefore"/> (i.e. disappeared from the source), or whose
         /// <c>published_at</c> is older than <paramref name="retentionCutoff"/> when provided.
         /// </summary>
+        /// <remarks>
+        /// A video that is broadcasting or scheduled is spared while it is fresh: the probe publishes
+        /// ids the sync's listing does not carry, so a sweep on <c>synced_at</c> alone would delete a
+        /// live row, and its library item, in the middle of the broadcast. The exemption is bounded
+        /// by age, because one such row can never return to <c>NotLive</c> — see the implementation
+        /// for which, and for the bound.
+        /// </remarks>
         /// <param name="sourceUrl">The parent source URL.</param>
         /// <param name="syncedBefore">Videos synced strictly before this are considered orphaned.</param>
         /// <param name="retentionCutoff">When set, videos published before this date are also returned.</param>

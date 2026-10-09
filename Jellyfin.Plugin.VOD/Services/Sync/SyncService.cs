@@ -183,6 +183,12 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             var syncStart = DateTimeOffset.UtcNow;
             var sourceRecord = _db.GetSource(source.Url) ?? new SourceRecord { Url = source.Url };
 
+            // Hold the per-source lock for the full write path: SyncCoreAsync writes to the
+            // database and then reconciles (which deletes library items). Concurrent passes over
+            // the same source would fight over what exists.
+            using var hold = await SourceLock.AcquireAsync(source.Url, cancellationToken)
+                .ConfigureAwait(false);
+
             try
             {
                 await SyncCoreAsync(source, config, syncStart, sourceRecord, cancellationToken)
@@ -249,14 +255,14 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 .Select(v => v.NativeId!)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-            // A stored entry's metadata is immutable except while it is live: a stream that has
-            // since ended would keep IsLive set and its scheduled-broadcast synopsis forever.
+            // A stored entry's metadata is immutable except while it is live or scheduled: a stream
+            // that has since ended would keep its live_status and broadcast synopsis forever.
             // Rows that have never been given a payload (written before the extras column existed)
             // are excluded from the skip set, so they are probed on EVERY pass until a fetch
             // answers — one yt-dlp process per such row per sync. That recurring cost is accepted
             // deliberately; see HasPayload for why remembering a failure instead is worse.
             var skipMetadataIds = existingVideos
-                .Where(v => v.NativeId is not null && !v.IsLive && HasPayload(v.Extras))
+                .Where(v => v.NativeId is not null && !MustRefetch(v.LiveStatus) && HasPayload(v.Extras))
                 .Select(v => v.NativeId!)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
@@ -343,7 +349,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             // Step 7b: publish items to the Jellyfin library.
             // Resolved per sync: fails loudly when the library is missing or unscanned.
             var target = _publisher.ResolveTarget(LibraryRouting.NameFor(config, source.Mode));
-            var otherAnchors = SweepAnchorsFor(config, source, sourceRecord);
+            var otherAnchors = _publisher.SweepAnchorsFor(config, source, sourceRecord);
 
             // Publication is driven by what the database holds, not by what this pass happened
             // to re-fetch: entries already known are deliberately skipped for metadata, and
@@ -445,8 +451,15 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 var publishedAt = ParseDate(meta);
                 var existing = existingByNativeId.GetValueOrDefault(entry.Id);
 
-                // Resolve effective title (Arte: use alt_title when title == series name)
-                var effectiveTitle = ResolveTitle(meta, seriesName);
+                // Resolve effective title.
+                // Twitch extractors use their own field selection (TitleFor) and must never run
+                // through ResolveTitle: Arte's alt_title logic would fire on any Twitch video whose
+                // title happens to equal the series name, and value equality on the title cannot
+                // express that invariant safely (e.g. a TwitchVod with no fulltitle falls back to
+                // meta.Title, making them equal even when the Twitch rule applied).
+                var effectiveTitle = PlatformRules.IsTwitchExtractor(meta)
+                    ? (PlatformRules.TitleFor(meta) ?? meta.Id)
+                    : ResolveTitle(meta, seriesName);
 
                 // Build or update VideoRecord
                 // FirstSeenAt is the one property never refreshed below: it must keep the date of the
@@ -463,48 +476,97 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                     FirstSeenAt = syncStart
                 };
 
-                record.Title = effectiveTitle;
-                // Upcoming streams: prepend scheduled broadcast date to description
-                // The localized prefix is resolved via IVodLocalizer
-                record.Description = BuildDescription(meta, publishedAt, _localizer);
-                record.ThumbnailUrl = meta.Thumbnail;
-                record.Extras = record.Extras with
-                {
-                    Tags = meta.Tags,
-                    Categories = meta.Categories,
-                    Channels = meta.Channels,
-                    SubtitleLanguages = meta.SubtitleLanguages,
-                    Qualities = meta.Qualities,
-                    AudioTracks = meta.AudioTracks
-                };
-                record.DurationSeconds = meta.Duration.HasValue ? (int)meta.Duration.Value : null;
-                record.IsLive = meta.IsLive;
-                record.SyncedAt = syncStart;
-
-                // Preserve existing publication date (immutable once set)
-                record.PublishedAt ??= publishedAt ?? syncStart;
-
-                // Prefer native season/episode over date-based fallback, always overwriting
-                // a previously stored date-based value when a better source becomes available.
-                // Priority: (1) yt-dlp native fields, (2) title parsing, (3) date-based formula.
-                if (meta.SeasonNumber.HasValue && meta.EpisodeNumber.HasValue)
-                {
-                    record.SeasonNumber = meta.SeasonNumber.Value;
-                    record.EpisodeNumber = meta.EpisodeNumber.Value;
-                }
-                else if (TitleSeasonEpisodeParser.TryParse(effectiveTitle, out var parsedSeason, out var parsedEpisode))
-                {
-                    record.SeasonNumber = parsedSeason;
-                    record.EpisodeNumber = parsedEpisode;
-                }
-                else if (!record.SeasonNumber.HasValue && assignments.TryGetValue(entry.Id, out var ep))
-                {
-                    record.SeasonNumber = ep.season;
-                    record.EpisodeNumber = ep.episode;
-                }
+                FillVideoRecord(record, meta, source.Url, effectiveTitle, syncStart, publishedAt);
+                AssignNumbers(
+                    record,
+                    meta,
+                    effectiveTitle,
+                    assignments.TryGetValue(entry.Id, out var ep) ? ep : null);
 
                 _db.UpsertVideo(record);
             }
+        }
+
+        /// <summary>
+        /// Writes a video's season and episode numbers, from the best source available.
+        /// </summary>
+        /// <param name="record">The record to number.</param>
+        /// <param name="meta">The metadata yt-dlp returned.</param>
+        /// <param name="effectiveTitle">The title already resolved by the caller.</param>
+        /// <param name="dateBased">
+        /// The date-and-rank number to use when nothing better exists, or null when the video has no
+        /// date to compute one from.
+        /// </param>
+        /// <remarks>
+        /// Shared with the live probe, which numbers one video at a time. There is deliberately only
+        /// one implementation of this decision: two could disagree, and a video renumbered after
+        /// publication loses its watch state, since an episode's user-data key is built from these
+        /// two numbers.
+        /// <para>
+        /// Priority: yt-dlp's own fields, then the title, then the date formula. The first two
+        /// overwrite a stored date-based number, because they are better answers that may only have
+        /// become available now; the third never overwrites, so a number once published stays.
+        /// </para>
+        /// </remarks>
+        internal static void AssignNumbers(
+            VideoRecord record,
+            VideoMetadata meta,
+            string effectiveTitle,
+            (int season, int episode)? dateBased)
+        {
+            if (meta.SeasonNumber.HasValue && meta.EpisodeNumber.HasValue)
+            {
+                record.SeasonNumber = meta.SeasonNumber.Value;
+                record.EpisodeNumber = meta.EpisodeNumber.Value;
+            }
+            else if (TitleSeasonEpisodeParser.TryParse(effectiveTitle, out var parsedSeason, out var parsedEpisode))
+            {
+                record.SeasonNumber = parsedSeason;
+                record.EpisodeNumber = parsedEpisode;
+            }
+            else if (!record.SeasonNumber.HasValue && dateBased is { } ep)
+            {
+                record.SeasonNumber = ep.season;
+                record.EpisodeNumber = ep.episode;
+            }
+        }
+
+        /// <summary>
+        /// How many videos of a source already carry a number, per UTC day of publication.
+        /// </summary>
+        /// <param name="existingVideos">Every video the database holds for the source.</param>
+        /// <returns>A mutable tally, to be advanced by <see cref="NextDateBasedNumber"/>.</returns>
+        internal static Dictionary<DateOnly, int> NumberedPerDay(IReadOnlyList<VideoRecord> existingVideos)
+            => existingVideos
+                .Where(v => v.EpisodeNumber.HasValue && v.PublishedAt.HasValue)
+                .GroupBy(v => DateOnly.FromDateTime(v.PublishedAt!.Value.UtcDateTime.Date))
+                .ToDictionary(g => g.Key, g => g.Count());
+
+        /// <summary>
+        /// The next date-based number for a video published on <paramref name="publishedAt"/>,
+        /// advancing <paramref name="numberedPerDay"/> so the following video of the same day ranks
+        /// after it.
+        /// </summary>
+        /// <param name="numberedPerDay">The tally from <see cref="NumberedPerDay"/>.</param>
+        /// <param name="publishedAt">The video's publication date, or null when it has none.</param>
+        /// <returns>
+        /// The number, or null when the video has no date or the day is already full (rank > 999).
+        /// </returns>
+        internal static (int season, int episode)? NextDateBasedNumber(
+            Dictionary<DateOnly, int> numberedPerDay, DateTimeOffset? publishedAt)
+        {
+            ArgumentNullException.ThrowIfNull(numberedPerDay);
+
+            if (publishedAt is not { } date)
+                return null;
+
+            var day = DateOnly.FromDateTime(date.UtcDateTime.Date);
+            var rank = numberedPerDay.GetValueOrDefault(day) + 1;
+            var assignment = EpisodeNumberCalculator.TryCalculate(date, rank);
+            if (assignment is not null)
+                numberedPerDay[day] = rank;
+
+            return assignment;
         }
 
         private Dictionary<string, (int season, int episode)> AssignEpisodeNumbers(
@@ -537,25 +599,21 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             }
 
             // Rank continues after the entries already numbered on that same UTC day.
-            var numberedPerDay = existingVideos
-                .Where(v => v.EpisodeNumber.HasValue && v.PublishedAt.HasValue)
-                .GroupBy(v => DateOnly.FromDateTime(v.PublishedAt!.Value.UtcDateTime.Date))
-                .ToDictionary(g => g.Key, g => g.Count());
+            var numberedPerDay = NumberedPerDay(existingVideos);
 
             foreach (var (date, items) in newByDate)
             {
-                var rank = numberedPerDay.GetValueOrDefault(date) + 1;
                 // Sort new entries for this date by NativeId for determinism
                 foreach (var (entry, date2) in items.OrderBy(x => x.entry.Id, StringComparer.Ordinal))
                 {
-                    var assignment = EpisodeNumberCalculator.TryCalculate(date2, rank);
+                    var assignment = NextDateBasedNumber(numberedPerDay, date2);
                     if (assignment is null)
                     {
-                        LogRankOverflow(entry.VideoUrl, date, rank);
+                        LogRankOverflow(entry.VideoUrl, date, numberedPerDay.GetValueOrDefault(date) + 1);
                         break;
                     }
+
                     result[entry.Id] = assignment.Value;
-                    rank++;
                 }
             }
 
@@ -607,6 +665,36 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         internal static bool HasPayload(VideoExtras extras) => extras.Version > 0;
 
         /// <summary>
+        /// Whether a stored row's metadata must be fetched again even though it is already known.
+        /// </summary>
+        /// <remarks>
+        /// A broadcasting stream's synopsis and duration change under it, and a scheduled one may be
+        /// rescheduled or start, so neither can be trusted from a previous pass.
+        /// </remarks>
+        internal static bool MustRefetch(LiveStatus status) => status != LiveStatus.NotLive;
+
+        /// <summary>The published date to store for a row.</summary>
+        /// <remarks>
+        /// A scheduled stream's date is its airing time, read from release_timestamp and rewritten on
+        /// every fetch because a schedule can move. Two reasons it cannot come from the normal path:
+        /// ParseDate prefers upload_date, which for a scheduled stream is the day it was created
+        /// (spec F18), and PublishedAt is otherwise frozen once set, which would pin a stale
+        /// schedule. Every other video keeps the existing behaviour.
+        /// </remarks>
+        internal static DateTimeOffset? PublishedAtFor(
+            LiveStatus status,
+            long? releaseTimestamp,
+            DateTimeOffset? parsed,
+            DateTimeOffset? stored,
+            DateTimeOffset syncStart)
+        {
+            if (status == LiveStatus.Upcoming && releaseTimestamp.HasValue)
+                return DateTimeOffset.FromUnixTimeSeconds(releaseTimestamp.Value);
+
+            return stored ?? parsed ?? syncStart;
+        }
+
+        /// <summary>
         /// Picks the name a source's series carries.
         /// </summary>
         /// <remarks>
@@ -619,25 +707,6 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 ? source.Name
                 : SeriesNaming.Resolve(source.Url, playlist);
 
-        private static string? BuildDescription(
-            VideoMetadata meta,
-            DateTimeOffset? publishedAt,
-            IVodLocalizer localizer)
-        {
-            if (!meta.IsUpcoming || !publishedAt.HasValue)
-                return meta.Description;
-
-            var formatted = publishedAt.Value.ToString("yyyy-MM-dd HH:mm", System.Globalization.CultureInfo.InvariantCulture);
-            // Key "UpcomingBroadcast" → e.g. "Diffusion prévue : {0} UTC"
-            var prefix = string.Format(
-                System.Globalization.CultureInfo.InvariantCulture,
-                localizer.Get("UpcomingBroadcast"),
-                formatted);
-            return string.IsNullOrEmpty(meta.Description)
-                ? prefix
-                : $"{prefix}\n\n{meta.Description}";
-        }
-
         private static string ResolveTitle(VideoMetadata meta, string seriesName)
         {
             // Arte stores the series name in `title` and the episode title in `alt_title`
@@ -649,7 +718,44 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             return meta.Title ?? meta.Id;
         }
 
-        private static DateTimeOffset? ParseDate(VideoMetadata meta)
+        /// <summary>
+        /// Applies yt-dlp metadata to a <see cref="VideoRecord"/>, shared between the full sync path
+        /// and the live probe path so neither duplicates the field-mapping logic.
+        /// </summary>
+        /// <param name="record">The record to fill (already created or loaded from the database).</param>
+        /// <param name="meta">The metadata returned by yt-dlp.</param>
+        /// <param name="sourceUrl">The source URL the video belongs to.</param>
+        /// <param name="effectiveTitle">The title already resolved by the caller (platform-specific).</param>
+        /// <param name="syncedAt">The timestamp to record as the sync time.</param>
+        /// <param name="publishedAt">The video's parsed publication date, or null when absent.</param>
+        internal static void FillVideoRecord(
+            VideoRecord record,
+            VideoMetadata meta,
+            string sourceUrl,
+            string effectiveTitle,
+            DateTimeOffset syncedAt,
+            DateTimeOffset? publishedAt)
+        {
+            record.Title = effectiveTitle;
+            record.Description = meta.Description;
+            record.ThumbnailUrl = PlatformRules.LiveThumbnailFor(meta, sourceUrl);
+            record.Extras = record.Extras with
+            {
+                Tags = meta.Tags,
+                Categories = meta.Categories,
+                Channels = meta.Channels,
+                SubtitleLanguages = meta.SubtitleLanguages,
+                Qualities = meta.Qualities,
+                AudioTracks = meta.AudioTracks
+            };
+            record.DurationSeconds = meta.Duration.HasValue ? (int)meta.Duration.Value : null;
+            record.LiveStatus = meta.LiveStatus;
+            record.SyncedAt = syncedAt;
+            record.PublishedAt = PublishedAtFor(
+                meta.LiveStatus, meta.ReleaseTimestamp, publishedAt, record.PublishedAt, syncedAt);
+        }
+
+        internal static DateTimeOffset? ParseDate(VideoMetadata meta)
         {
             if (meta.UploadDate is { Length: 8 } ud
                 && int.TryParse(ud[..4], out var year)
@@ -699,43 +805,6 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         [LoggerMessage(EventId = 12, Level = LogLevel.Warning,
             Message = "Sync: cannot retire {SourceUrl} — no configured library resolves")]
         private partial void LogRetirementSkipped(string sourceUrl);
-
-        /// <summary>
-        /// The anchors other than the target that may still hold this source's items.
-        /// </summary>
-        /// <remarks>
-        /// Best effort by design: an anchor that no longer resolves is simply absent, because it only
-        /// ever serves cleanup. The stored anchor covers the one case the other configured library
-        /// cannot — changing a source's mode AND its library in the same edit leaves the old target as
-        /// neither of the two currently configured.
-        /// </remarks>
-        private List<Folder> SweepAnchorsFor(
-            PluginConfiguration config, SourceDefinition source, SourceRecord record)
-        {
-            var anchors = new List<Folder>();
-
-            var otherMode = source.Mode == SourceMode.Movies ? SourceMode.Series : SourceMode.Movies;
-            var otherName = LibraryRouting.NameFor(config, otherMode);
-            if (!string.IsNullOrWhiteSpace(otherName))
-            {
-                try
-                {
-                    anchors.Add(_publisher.ResolveTarget(otherName).Anchor);
-                }
-                catch (InvalidOperationException ex)
-                {
-                    LogSweepAnchorUnavailable(otherName, ex.Message);
-                }
-            }
-
-            if (record.PublishedAnchorId is { } anchorId
-                && _publisher.FindAnchorById(anchorId) is { } stored)
-            {
-                anchors.Add(stored);
-            }
-
-            return anchors;
-        }
 
         [LoggerMessage(EventId = 14, Level = LogLevel.Debug,
             Message = "Sync: not sweeping library '{LibraryName}', it does not resolve: {Reason}")]

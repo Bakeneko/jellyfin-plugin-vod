@@ -146,6 +146,25 @@ namespace Jellyfin.Plugin.VOD.Services
         public async Task<VideoMetadata?> GetVideoMetadataAsync(
             string url,
             CancellationToken cancellationToken)
+            => (await GetMetadataAsync(url, cancellationToken).ConfigureAwait(false)).Metadata;
+
+        /// <summary>
+        /// Runs the same call as <see cref="GetVideoMetadataAsync"/> and additionally says WHY no
+        /// metadata came back.
+        /// </summary>
+        /// <param name="url">The video or channel page URL.</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        /// <returns>The metadata, or the reason there is none.</returns>
+        /// <remarks>
+        /// A channel that is off air has no metadata to return — yt-dlp exits 1 with "The channel is
+        /// not currently live" and prints no JSON, and <c>--ignore-no-formats-error</c> does not
+        /// suppress it. Callers that must tell that apart from a rate limit or a network failure
+        /// need this overload: the live probe concludes "nothing is broadcasting" from the former
+        /// and refuses to conclude anything from the latter.
+        /// </remarks>
+        public async Task<MetadataResult> GetMetadataAsync(
+            string url,
+            CancellationToken cancellationToken)
         {
             var startInfo = BuildBaseStartInfo();
             using var cookies = await _cookies.AcquireAsync(cancellationToken).ConfigureAwait(false);
@@ -155,16 +174,106 @@ namespace Jellyfin.Plugin.VOD.Services
             startInfo.ArgumentList.Add("-J");
             startInfo.ArgumentList.Add("--no-playlist");
             startInfo.ArgumentList.Add("--no-warnings");
+            // A scheduled live has no formats, and yt-dlp exits non-zero on it without this flag, so
+            // its metadata would never arrive. Measured 2026-10-03 (spec F14).
+            startInfo.ArgumentList.Add("--ignore-no-formats-error");
             startInfo.ArgumentList.Add(url);
 
-            var stdout = await RunProcessAsync(startInfo, Timeout, cancellationToken)
+            var run = await RunProcessRawAsync(startInfo, Timeout, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (run.ExitCode != 0)
+            {
+                if (IndicatesChannelOffAir(run.StdErr))
+                {
+                    LogChannelOffAir(url);
+                    return MetadataResult.ChannelOffAir;
+                }
+
+                LogResolveFailed(url, run.ExitCode, run.StdErr.Trim());
+                return MetadataResult.Failed;
+            }
+
+            var meta = VideoMetadata.ParseJson(run.Stdout);
+            if (meta is null)
+            {
+                LogParseFailed(url, "video metadata");
+                return MetadataResult.Failed;
+            }
+
+            if (meta.IsUnavailable)
+            {
+                LogUnavailable(url);
+                return MetadataResult.Failed;
+            }
+
+            return MetadataResult.From(meta);
+        }
+
+        /// <summary>
+        /// Whether yt-dlp's standard error says the channel is simply not broadcasting.
+        /// </summary>
+        /// <param name="stderr">Everything yt-dlp wrote to standard error.</param>
+        /// <returns><see langword="true"/> only for yt-dlp's own not-live wording.</returns>
+        /// <remarks>
+        /// Deliberately one phrase: the message yt-dlp's <c>UserNotLive</c> carries, measured on
+        /// 2026-10-04 as "ERROR: [twitch:stream] riotgames: The channel is not currently live".
+        /// Anything else stays a failure. Widening this to "a non-zero exit means absent" would let
+        /// a rate-limited call retract a broadcast that is still running, and the probe deletes
+        /// library items on that conclusion.
+        /// </remarks>
+        internal static bool IndicatesChannelOffAir(string? stderr)
+            => stderr is not null
+               && stderr.Contains(NotLiveSignal, StringComparison.OrdinalIgnoreCase);
+
+        // yt-dlp's UserNotLive message, verbatim.
+        private const string NotLiveSignal = "The channel is not currently live";
+
+        /// <summary>
+        /// Runs <c>yt-dlp -J --playlist-items 1</c> and returns the first entry's full metadata.
+        /// Returns <see langword="null"/> when yt-dlp exits non-zero or the output cannot be parsed.
+        /// </summary>
+        /// <param name="url">A playlist or channel-tab URL.</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        /// <remarks>
+        /// Deliberately not <c>--flat-playlist</c>: a flat Twitch listing carries no live status, so
+        /// one full extraction of the head answers "is this channel broadcasting, and what is the
+        /// video" in a single call. Measured at 2.1 s (spec F4).
+        /// </remarks>
+        public async Task<VideoMetadata?> GetFirstEntryMetadataAsync(
+            string url,
+            CancellationToken cancellationToken)
+        {
+            var startInfo = BuildBaseStartInfo();
+            using var cookies = await _cookies.AcquireAsync(cancellationToken).ConfigureAwait(false);
+            ApplyCookies(startInfo, cookies);
+            ApplyJsRuntime(startInfo);
+
+            startInfo.ArgumentList.Add("-J");
+            startInfo.ArgumentList.Add("--playlist-items");
+            startInfo.ArgumentList.Add("1");
+            startInfo.ArgumentList.Add("--no-warnings");
+            startInfo.ArgumentList.Add("--ignore-no-formats-error");
+            startInfo.ArgumentList.Add(url);
+
+            var stdout = await RunProcessAsync(startInfo, PlaylistTimeout, cancellationToken)
                 .ConfigureAwait(false);
             if (stdout is null)
                 return null;
 
-            var meta = VideoMetadata.ParseJson(stdout);
+            var meta = VideoMetadata.ParseFirstEntryJson(stdout);
             if (meta is null)
-                LogParseFailed(url, "video metadata");
+            {
+                LogParseFailed(url, "first playlist entry");
+                return null;
+            }
+
+            if (meta.IsUnavailable)
+            {
+                LogUnavailable(url);
+                return null;
+            }
+
             return meta;
         }
 
@@ -233,8 +342,32 @@ namespace Jellyfin.Plugin.VOD.Services
             }
         }
 
+        /// <summary>What one yt-dlp process left behind.</summary>
+        private readonly record struct ProcessRun(int ExitCode, string Stdout, string StdErr);
+
         /// <summary>Runs a yt-dlp process and returns stdout, or null on non-zero exit.</summary>
         private async Task<string?> RunProcessAsync(
+            ProcessStartInfo startInfo,
+            TimeSpan timeout,
+            CancellationToken cancellationToken)
+        {
+            var run = await RunProcessRawAsync(startInfo, timeout, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (run.ExitCode != 0)
+            {
+                LogResolveFailed(startInfo.ArgumentList[^1], run.ExitCode, run.StdErr.Trim());
+                return null;
+            }
+
+            return run.Stdout;
+        }
+
+        /// <summary>
+        /// Runs a yt-dlp process and hands back its exit code and both streams, so a caller that
+        /// can read meaning into a specific failure gets the chance to.
+        /// </summary>
+        private async Task<ProcessRun> RunProcessRawAsync(
             ProcessStartInfo startInfo,
             TimeSpan timeout,
             CancellationToken cancellationToken)
@@ -265,13 +398,7 @@ namespace Jellyfin.Plugin.VOD.Services
             var stdout = await stdoutTask.ConfigureAwait(false);
             var stderr = await stderrTask.ConfigureAwait(false);
 
-            if (process.ExitCode != 0)
-            {
-                LogResolveFailed(startInfo.ArgumentList[^1], process.ExitCode, stderr.Trim());
-                return null;
-            }
-
-            return stdout;
+            return new ProcessRun(process.ExitCode, stdout, stderr);
         }
 
         private void TryKill(Process process)
@@ -296,5 +423,13 @@ namespace Jellyfin.Plugin.VOD.Services
         [LoggerMessage(EventId = 4, Level = LogLevel.Warning,
             Message = "yt-dlp output for {Url} ({Mode}) could not be parsed as JSON")]
         private partial void LogParseFailed(string url, string mode);
+
+        [LoggerMessage(EventId = 5, Level = LogLevel.Debug,
+            Message = "yt-dlp reports {Url} is not broadcasting")]
+        private partial void LogChannelOffAir(string url);
+
+        [LoggerMessage(EventId = 6, Level = LogLevel.Warning,
+            Message = "yt-dlp lists no format for {Url}: the video is private, removed or otherwise unavailable")]
+        private partial void LogUnavailable(string url);
     }
 }
