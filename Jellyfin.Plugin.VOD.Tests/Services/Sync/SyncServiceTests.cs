@@ -10,10 +10,12 @@ using Jellyfin.Plugin.VOD.Imaging;
 using Jellyfin.Plugin.VOD.Localization;
 using Jellyfin.Plugin.VOD.Services;
 using Jellyfin.Plugin.VOD.Services.Sync;
+using Jellyfin.Plugin.VOD.Services.Sync.Dto;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.Movies;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Entities;
+using MediaBrowser.Model.Tasks;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
@@ -30,6 +32,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         private readonly ILibraryManager _library = Substitute.For<ILibraryManager>();
         private readonly IVodDatabase _db = Substitute.For<IVodDatabase>();
         private readonly IVodLocalizer _localizer = Substitute.For<IVodLocalizer>();
+        private readonly ITaskManager _tasks = Substitute.For<ITaskManager>();
         private readonly List<VirtualFolderInfo> _folders = [];
         private readonly string _root = Directory.CreateTempSubdirectory("vod-sync-tests").FullName;
         private readonly SyncService _service;
@@ -53,7 +56,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 new YtDlpService(
                     new CookieJar(NullLogger<CookieJar>.Instance),
                     NullLogger<YtDlpService>.Instance),
-                publisher, _localizer, NullLogger<SyncService>.Instance);
+                publisher, _localizer, NullLogger<SyncService>.Instance, _tasks);
         }
 
         public void Dispose() => Directory.Delete(_root, recursive: true);
@@ -402,6 +405,127 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 syncStart: new DateTimeOffset(2026, 10, 3, 7, 0, 0, TimeSpan.Zero));
 
             Assert.Equal(stored, result);
+        }
+    }
+
+    /// <summary>
+    /// ProcessEntries returns the count of records created (not updated) in a pass.
+    /// </summary>
+    public sealed class SyncServiceProcessEntriesTests : IDisposable
+    {
+        private const string SourceUrl = "https://example.test/pe";
+        private readonly IVodDatabase _db = Substitute.For<IVodDatabase>();
+        private readonly IVodLocalizer _localizer = Substitute.For<IVodLocalizer>();
+        private readonly ILibraryManager _library = Substitute.For<ILibraryManager>();
+        private readonly ITaskManager _tasks = Substitute.For<ITaskManager>();
+        private readonly string _root = Directory.CreateTempSubdirectory("vod-pe-tests").FullName;
+        private readonly SyncService _service;
+
+        public SyncServiceProcessEntriesTests()
+        {
+            var publisher = new LibraryPublisher(
+                _library, _db,
+                new ArtworkStore(Path.Combine(Path.GetTempPath(), "vod-tests-artwork")),
+                _localizer, NullLogger<LibraryPublisher>.Instance);
+
+            _service = new SyncService(
+                _db,
+                new YtDlpService(
+                    new CookieJar(NullLogger<CookieJar>.Instance),
+                    NullLogger<YtDlpService>.Instance),
+                publisher, _localizer, NullLogger<SyncService>.Instance, _tasks);
+        }
+
+        public void Dispose() => Directory.Delete(_root, recursive: true);
+
+        /// <summary>Builds a playlist entry and its corresponding full metadata with the given id.</summary>
+        private static (PlaylistEntry Entry, VideoMetadata Meta) EntryWithMeta(string id) => (
+            new PlaylistEntry { Id = id, VideoUrl = "https://example.test/v/" + id },
+            new VideoMetadata { Id = id, Title = "Video " + id });
+
+        /// <summary>Builds a stored video record with the given nativeId, as if already synced.</summary>
+        private static VideoRecord StoredVideo(string nativeId) => new VideoRecord
+        {
+            Id = Guid.NewGuid().ToString(),
+            SourceUrl = SourceUrl,
+            NativeId = nativeId,
+            VideoUrl = "https://example.test/v/" + nativeId,
+            SyncedAt = DateTimeOffset.UnixEpoch,
+            Extras = new VideoExtras()
+        };
+
+        [Fact]
+        public void ProcessEntries_ReturnsTwoWhenTwoOfThreeEntriesAreNew()
+        {
+            // Three entries: "a" is already in the database, "b" and "c" are new.
+            var (entryA, metaA) = EntryWithMeta("a");
+            var (entryB, metaB) = EntryWithMeta("b");
+            var (entryC, metaC) = EntryWithMeta("c");
+
+            var entries = new List<PlaylistEntry> { entryA, entryB, entryC };
+            var metadataMap = new Dictionary<string, VideoMetadata>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["a"] = metaA,
+                ["b"] = metaB,
+                ["c"] = metaC,
+            };
+            var existingVideos = new List<VideoRecord> { StoredVideo("a") };
+            var source = new SourceDefinition { Url = SourceUrl };
+
+            var created = _service.ProcessEntries(
+                source, entries, metadataMap, existingVideos,
+                seriesName: string.Empty,
+                syncStart: DateTimeOffset.UtcNow,
+                CancellationToken.None);
+
+            Assert.Equal(2, created);
+        }
+    }
+
+    /// <summary>
+    /// QueueDescriptionIfCreated queues the stream description task exactly when the pass created
+    /// at least one video, and stays silent when it created nothing.
+    /// </summary>
+    public sealed class SyncServiceQueueDescriptionIfCreatedTests : IDisposable
+    {
+        private readonly IVodDatabase _db = Substitute.For<IVodDatabase>();
+        private readonly IVodLocalizer _localizer = Substitute.For<IVodLocalizer>();
+        private readonly ILibraryManager _library = Substitute.For<ILibraryManager>();
+        private readonly ITaskManager _tasks = Substitute.For<ITaskManager>();
+        private readonly string _root = Directory.CreateTempSubdirectory("vod-qd-tests").FullName;
+        private readonly SyncService _service;
+
+        public SyncServiceQueueDescriptionIfCreatedTests()
+        {
+            var publisher = new LibraryPublisher(
+                _library, _db,
+                new ArtworkStore(Path.Combine(Path.GetTempPath(), "vod-tests-artwork")),
+                _localizer, NullLogger<LibraryPublisher>.Instance);
+
+            _service = new SyncService(
+                _db,
+                new YtDlpService(
+                    new CookieJar(NullLogger<CookieJar>.Instance),
+                    NullLogger<YtDlpService>.Instance),
+                publisher, _localizer, NullLogger<SyncService>.Instance, _tasks);
+        }
+
+        public void Dispose() => Directory.Delete(_root, recursive: true);
+
+        [Fact]
+        public void QueueDescriptionIfCreated_QueuesTask_WhenCreatedIsPositive()
+        {
+            _service.QueueDescriptionIfCreated(1);
+
+            _tasks.Received(1).QueueIfNotRunning<StreamDescriptionTask>();
+        }
+
+        [Fact]
+        public void QueueDescriptionIfCreated_DoesNotQueueTask_WhenCreatedIsZero()
+        {
+            _service.QueueDescriptionIfCreated(0);
+
+            _tasks.DidNotReceive().QueueIfNotRunning<StreamDescriptionTask>();
         }
     }
 }

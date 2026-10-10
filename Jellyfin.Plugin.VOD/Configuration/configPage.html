@@ -138,6 +138,28 @@
                     </div>
 
                     <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="streamDescriptionBatchSize">Stream descriptions per pass</label>
+                        <input id="streamDescriptionBatchSize" name="StreamDescriptionBatchSize" type="number" min="0"
+                               is="emby-input" class="emby-input"
+                               placeholder="10" />
+                        <div class="fieldDescription">
+                            How many videos the stream description task describes each time it runs, every 15 minutes.
+                            Set to 0 to disable the task; descriptions still happen when something is played.
+                            Each video costs one yt-dlp call and at most one probe, so a high value risks an anti-bot answer.
+                        </div>
+                    </div>
+
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="streamDescriptionRetryHours">Retry a failed description after (hours)</label>
+                        <input id="streamDescriptionRetryHours" name="StreamDescriptionRetryHours" type="number" min="0"
+                               is="emby-input" class="emby-input"
+                               placeholder="24" />
+                        <div class="fieldDescription">
+                            How long a video whose description failed is left alone before another pass tries it again.
+                        </div>
+                    </div>
+
+                    <div class="inputContainer">
                         <label class="inputLabel inputLabelUnfocused" for="preferredAudioLanguages">Preferred audio languages</label>
                         <input id="preferredAudioLanguages" name="PreferredAudioLanguages" type="text"
                                is="emby-input" class="emby-input"
@@ -517,6 +539,8 @@
                             document.querySelector('#localBaseUrl').value      = config.LocalBaseUrl || 'http://localhost:8096';
                             document.querySelector('#cacheMinutes').value      = config.CacheMinutes || 5;
                             document.querySelector('#liveProbeIntervalMinutes').value = config.LiveProbeIntervalMinutes != null ? config.LiveProbeIntervalMinutes : 5;
+                            document.querySelector('#streamDescriptionBatchSize').value = config.StreamDescriptionBatchSize != null ? config.StreamDescriptionBatchSize : 10;
+                            document.querySelector('#streamDescriptionRetryHours').value = config.StreamDescriptionRetryHours != null ? config.StreamDescriptionRetryHours : 24;
                             document.querySelector('#preferredAudioLanguages').value =
                                 (config.PreferredAudioLanguages || []).join(', ');
                             document.querySelector('#preferredSubtitleLanguages').value =
@@ -552,6 +576,10 @@
                             config.LocalBaseUrl    = document.querySelector('#localBaseUrl').value;
                             config.CacheMinutes    = parseInt(document.querySelector('#cacheMinutes').value, 10) || 5;
                             config.LiveProbeIntervalMinutes = parseInt(document.querySelector('#liveProbeIntervalMinutes').value, 10) || 0;
+                            var descriptionBatchSize = parseInt(document.querySelector('#streamDescriptionBatchSize').value, 10);
+                            config.StreamDescriptionBatchSize = isNaN(descriptionBatchSize) ? 10 : descriptionBatchSize;
+                            var descriptionRetryHours = parseInt(document.querySelector('#streamDescriptionRetryHours').value, 10);
+                            config.StreamDescriptionRetryHours = isNaN(descriptionRetryHours) ? 24 : descriptionRetryHours;
                             config.PreferredAudioLanguages = document.querySelector('#preferredAudioLanguages').value
                                 .split(',').map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; });
                             config.PreferredSubtitleLanguages = document.querySelector('#preferredSubtitleLanguages').value

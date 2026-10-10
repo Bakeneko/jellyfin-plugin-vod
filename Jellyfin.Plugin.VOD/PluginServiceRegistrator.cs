@@ -35,7 +35,9 @@ namespace Jellyfin.Plugin.VOD
             serviceCollection.AddSingleton<CookieJar>();
             serviceCollection.AddSingleton<YtDlpService>();
             serviceCollection.AddSingleton<PlaylistCache>();
+            serviceCollection.AddSingleton<SubtitleTokens>();
             serviceCollection.AddSingleton<MediaStreamWriter>();
+            serviceCollection.AddSingleton<StreamDescriber>();
 
             // Localisation
             serviceCollection.AddSingleton<IVodLocalizer, VodLocalizer>();
@@ -48,10 +50,12 @@ namespace Jellyfin.Plugin.VOD
             serviceCollection.AddSingleton<LibraryPublisher>();
             serviceCollection.AddSingleton<SyncService>();
             serviceCollection.AddSingleton<LiveProbeService>();
+            serviceCollection.AddSingleton<StreamDescriptionService>();
 
             // Scheduled tasks
             serviceCollection.AddSingleton<IScheduledTask, SyncTask>();
             serviceCollection.AddSingleton<IScheduledTask, LiveProbeTask>();
+            serviceCollection.AddSingleton<IScheduledTask, StreamDescriptionTask>();
         }
     }
 }

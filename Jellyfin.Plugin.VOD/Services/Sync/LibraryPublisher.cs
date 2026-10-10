@@ -101,6 +101,9 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         private const string KeepMarkerContent =
             "Prevent Jellyfin from skipping empty library folders needed for virtual libraries";
 
+        /// <summary>The container Jellyfin's probe reports for a stream route, and what every item declares.</summary>
+        private const string HlsContainer = "hls";
+
         /// <summary>
         /// Returns the library's virtual folder. Resolves against the configuration only, so it
         /// answers whether the library exists without asking whether Jellyfin has indexed it.
@@ -605,6 +608,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             movie.ProductionYear = productionYear;
             movie.RunTimeTicks = runTimeTicks;
             changed |= ApplyDateAdded(movie, dateAdded);
+            changed |= ApplyContainer(movie);
             changed |= ApplyVideoIds(movie, video);
             changed |= ApplyTags(movie, video.Extras.Tags, video.Extras.Categories);
             changed |= ApplyStudios(movie, StudiosFor(video));
@@ -693,6 +697,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             episode.SeriesName = series.Name;
             episode.SeriesPresentationUniqueKey = seriesKey;
             changed |= ApplyDateAdded(episode, dateAdded);
+            changed |= ApplyContainer(episode);
             changed |= ApplyVideoIds(episode, video);
             changed |= ApplyTags(episode, video.Extras.Tags, video.Extras.Categories);
             changed |= ApplyStudios(episode, StudiosFor(video));
@@ -772,6 +777,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             item.PremiereDate = premiereDate;
             item.ProductionYear = productionYear;
             item.RunTimeTicks = runTimeTicks;
+            changed |= ApplyContainer(item);
             changed |= ApplyVideoIds(item, video);
             changed |= ApplyTags(item, video.Extras.Tags, video.Extras.Categories);
             changed |= ApplyStudios(item, StudiosFor(video));
@@ -1422,6 +1428,26 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
             var changed = item.DateCreated != dateAdded.Value;
             item.DateCreated = dateAdded.Value;
+
+            return changed;
+        }
+
+        /// <summary>
+        /// Declares the item's container as HLS, which every item's path — a stream route of this
+        /// plugin — serves.
+        /// </summary>
+        /// <remarks>
+        /// Jellyfin reads it as the media source container, and only adds <c>aac_adtstoasc</c> to a
+        /// copied AAC track when that container is ts, aac or hls
+        /// (<c>EncodingHelper.GetAudioBitStreamArguments</c>). Without it the mp4 muxer rejects the
+        /// audio and the client falls back to a full transcode. Jellyfin's probe would set it, but a
+        /// described item is never probed. Returns a flag for the reason given on
+        /// <see cref="ApplyTags"/>.
+        /// </remarks>
+        private static bool ApplyContainer(BaseItem item)
+        {
+            var changed = !string.Equals(item.Container, HlsContainer, StringComparison.Ordinal);
+            item.Container = HlsContainer;
 
             return changed;
         }

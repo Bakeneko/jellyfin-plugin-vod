@@ -10,6 +10,7 @@ using Jellyfin.Plugin.VOD.Data.Models;
 using Jellyfin.Plugin.VOD.Localization;
 using Jellyfin.Plugin.VOD.Services.Sync.Dto;
 using MediaBrowser.Controller.Entities;
+using MediaBrowser.Model.Tasks;
 using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Plugin.VOD.Services.Sync
@@ -27,20 +28,29 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         private readonly LibraryPublisher _publisher;
         private readonly IVodLocalizer _localizer;
         private readonly ILogger<SyncService> _logger;
+        private readonly ITaskManager _tasks;
 
         /// <summary>Initializes a new instance of the <see cref="SyncService"/> class.</summary>
+        /// <param name="db">The VOD database.</param>
+        /// <param name="ytDlp">The yt-dlp wrapper used to enumerate and fetch metadata.</param>
+        /// <param name="publisher">The library publisher that reconciles items in Jellyfin.</param>
+        /// <param name="localizer">Provides localized strings for published items.</param>
+        /// <param name="logger">The logger for this service.</param>
+        /// <param name="tasks">Used to wake the stream description task when a pass created something.</param>
         public SyncService(
             IVodDatabase db,
             YtDlpService ytDlp,
             LibraryPublisher publisher,
             IVodLocalizer localizer,
-            ILogger<SyncService> logger)
+            ILogger<SyncService> logger,
+            ITaskManager tasks)
         {
             _db = db;
             _ytDlp = ytDlp;
             _publisher = publisher;
             _localizer = localizer;
             _logger = logger;
+            _tasks = tasks;
         }
 
         /// <summary>
@@ -168,7 +178,8 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// <param name="config">The current plugin configuration.</param>
         /// <param name="source">The source to sync.</param>
         /// <param name="cancellationToken">A token to cancel the operation.</param>
-        public async Task SyncSourceAsync(
+        /// <returns>The number of videos the pass created; zero when it was skipped or failed.</returns>
+        public async Task<int> SyncSourceAsync(
             PluginConfiguration config, SourceDefinition source, CancellationToken cancellationToken)
         {
             ArgumentNullException.ThrowIfNull(config);
@@ -177,7 +188,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             if (string.IsNullOrWhiteSpace(LibraryRouting.NameFor(config, source.Mode)))
             {
                 LogSkippedNoConfig(source.Url);
-                return;
+                return 0;
             }
 
             var syncStart = DateTimeOffset.UtcNow;
@@ -191,7 +202,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
             try
             {
-                await SyncCoreAsync(source, config, syncStart, sourceRecord, cancellationToken)
+                return await SyncCoreAsync(source, config, syncStart, sourceRecord, cancellationToken)
                     .ConfigureAwait(false);
             }
             catch (OperationCanceledException)
@@ -203,10 +214,11 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 sourceRecord.LastError = ex.Message;
                 _db.UpsertSource(sourceRecord);
                 LogSyncFailed(source.Url, ex);
+                return 0;
             }
         }
 
-        private async Task SyncCoreAsync(
+        private async Task<int> SyncCoreAsync(
             SourceDefinition source,
             PluginConfiguration config,
             DateTimeOffset syncStart,
@@ -334,7 +346,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             }
 
             // Step 5 + 6 + 7: assign episode numbers, upsert DB
-            ProcessEntries(
+            var created = ProcessEntries(
                 source, playlist.Entries, metadataMap, existingVideos,
                 seriesName, syncStart, ct);
 
@@ -370,6 +382,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             _db.UpsertSource(sourceRecord);
 
             LogSyncFinished(source.Url, videoCount);
+            return created;
         }
 
         private async Task<(PlaylistInfo? info, Dictionary<string, VideoMetadata> preloaded)> FetchPlaylistAsync(
@@ -423,7 +436,19 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             return (playlist, preloaded);
         }
 
-        private void ProcessEntries(
+        /// <summary>
+        /// Upserts database records for every entry in the playlist, and returns the count of
+        /// records that were created (as opposed to updated) this pass.
+        /// </summary>
+        /// <param name="source">The source being synced.</param>
+        /// <param name="entries">The flat-playlist entries returned by yt-dlp.</param>
+        /// <param name="metadataMap">Full metadata keyed by native video id, fetched in parallel.</param>
+        /// <param name="existingVideos">Every video the database already holds for this source.</param>
+        /// <param name="seriesName">The resolved series name, used for Arte episode title selection.</param>
+        /// <param name="syncStart">The timestamp recorded as the sync time for new records.</param>
+        /// <param name="ct">A token to cancel the operation.</param>
+        /// <returns>The number of video records created (not updated) by this pass.</returns>
+        internal int ProcessEntries(
             SourceDefinition source,
             IReadOnlyList<PlaylistEntry> entries,
             Dictionary<string, VideoMetadata> metadataMap,
@@ -441,6 +466,8 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             // Key: nativeId → (season, episode)
             var assignments = AssignEpisodeNumbers(entries, metadataMap, existingByNativeId, existingVideos);
 
+            var created = 0;
+
             foreach (var entry in entries)
             {
                 ct.ThrowIfCancellationRequested();
@@ -450,6 +477,11 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
                 var publishedAt = ParseDate(meta);
                 var existing = existingByNativeId.GetValueOrDefault(entry.Id);
+
+                if (existing is null)
+                {
+                    created++;
+                }
 
                 // Resolve effective title.
                 // Twitch extractors use their own field selection (TitleFor) and must never run
@@ -484,6 +516,27 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                     assignments.TryGetValue(entry.Id, out var ep) ? ep : null);
 
                 _db.UpsertVideo(record);
+            }
+
+            return created;
+        }
+
+        /// <summary>
+        /// Queues the <see cref="StreamDescriptionTask"/> when <paramref name="created"/> is
+        /// positive, and does nothing otherwise.
+        /// </summary>
+        /// <param name="created">The number of video records the whole sync created.</param>
+        /// <remarks>
+        /// Called once per sync, after its last source: queued per source, the task started on the
+        /// first creation, overlapped the remaining sources' yt-dlp work, and the creations made
+        /// while it ran were dropped by <c>QueueIfNotRunning</c>. Queued, not run: the description
+        /// task paces itself, and a sync that created nothing has nothing for it to do.
+        /// </remarks>
+        internal void QueueDescriptionIfCreated(int created)
+        {
+            if (created > 0)
+            {
+                _tasks.QueueIfNotRunning<StreamDescriptionTask>();
             }
         }
 

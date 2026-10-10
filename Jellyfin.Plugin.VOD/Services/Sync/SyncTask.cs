@@ -97,6 +97,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 return;
             }
 
+            var created = 0;
             for (var i = 0; i < sources.Count; i++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -113,10 +114,11 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
                 LogSyncingSource(i + 1, sources.Count, sources[i].Url);
 
-                await _syncService.SyncSourceAsync(config, sources[i], cancellationToken)
+                created += await _syncService.SyncSourceAsync(config, sources[i], cancellationToken)
                     .ConfigureAwait(false);
             }
 
+            _syncService.QueueDescriptionIfCreated(created);
             progress.Report(100);
         }
 

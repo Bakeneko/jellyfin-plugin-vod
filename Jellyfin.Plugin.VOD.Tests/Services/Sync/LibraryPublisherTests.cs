@@ -1998,6 +1998,87 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             Assert.Equal(still, alternate.GetImageInfo(ImageType.Backdrop, 0)?.Path);
         }
 
+        [Theory]
+        [InlineData(SourceMode.Movies)]
+        [InlineData(SourceMode.Series)]
+        public async Task ReconcileAsync_MarksEveryVideoItemAsHls(SourceMode mode)
+        {
+            // Jellyfin only adds aac_adtstoasc to a copied AAC track when the source container is
+            // ts, aac or hls (EncodingHelper.GetAudioBitStreamArguments), and reads it from
+            // item.Container. Without it the mp4 muxer rejects the audio and the client falls back to
+            // a full transcode. Jellyfin's own probe used to set it; the stream describer does not.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000067";
+            var video = TieredVideo(vodId);
+
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+            var created = new List<BaseItem>();
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created.Add(call.ArgAt<BaseItem>(0)));
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            var anchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [],
+                new SourceRecord { Url = "https://example.com/source" },
+                mode, "Test", [video],
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            // The primary and one alternate per tier.
+            var videos = created.OfType<Video>().ToList();
+            Assert.Equal(3, videos.Count);
+            Assert.All(videos, v => Assert.Equal("hls", v.Container));
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_Updates_AnItemPublishedWithoutAContainer()
+        {
+            // Items published before the container was set carry none; the next pass has to write it
+            // rather than count them unchanged.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000068";
+            var anchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+            var source = new SourceRecord { Url = "https://example.com/source" };
+            var video = new VideoRecord
+            {
+                Id = vodId,
+                SourceUrl = source.Url,
+                VideoUrl = "https://example.com/watch/68",
+                Title = "Steady",
+                DurationSeconds = 120
+            };
+
+            BaseItem? created = null;
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created = call.ArgAt<BaseItem>(0));
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                new[] { video },
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            Assert.NotNull(created);
+            created.Container = null;
+            _library.ClearReceivedCalls();
+            _library.GetItemList(Arg.Any<InternalItemsQuery>())
+                .Returns(new List<BaseItem> { created });
+
+            var second = await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                new[] { video },
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            Assert.Equal(1, second.Updated);
+            Assert.Equal("hls", created.Container);
+        }
+
         [Fact]
         public async Task ReconcileAsync_AsksForAlternateVersions_WhenReadingWhatIsAlreadyPublished()
         {

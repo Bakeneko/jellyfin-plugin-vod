@@ -34,7 +34,9 @@ namespace Jellyfin.Plugin.VOD.Controllers
         private readonly IVodDatabase _db;
         private readonly YtDlpService _ytDlp;
         private readonly PlaylistCache _cache;
+        private readonly SubtitleTokens _subtitles;
         private readonly MediaStreamWriter _streamWriter;
+        private readonly StreamDescriber _describer;
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly ILibraryManager _libraryManager;
         private readonly LibraryPublisher _publisher;
@@ -44,7 +46,9 @@ namespace Jellyfin.Plugin.VOD.Controllers
         /// <param name="db">The VOD database used to look up videos by UUID.</param>
         /// <param name="ytDlp">The yt-dlp service used to resolve stream URLs.</param>
         /// <param name="cache">The playlist cache.</param>
+        /// <param name="subtitles">Mints and resolves the subtitle proxy tokens.</param>
         /// <param name="streamWriter">Stores media streams so Jellyfin does not have to re-probe.</param>
+        /// <param name="describer">Describes the version group's streams before they are played.</param>
         /// <param name="httpClientFactory">The HTTP client factory.</param>
         /// <param name="libraryManager">Used to list the libraries the plugin may publish into.</param>
         /// <param name="publisher">Used to check that the configured library still resolves.</param>
@@ -53,7 +57,9 @@ namespace Jellyfin.Plugin.VOD.Controllers
             IVodDatabase db,
             YtDlpService ytDlp,
             PlaylistCache cache,
+            SubtitleTokens subtitles,
             MediaStreamWriter streamWriter,
+            StreamDescriber describer,
             IHttpClientFactory httpClientFactory,
             ILibraryManager libraryManager,
             LibraryPublisher publisher,
@@ -62,7 +68,9 @@ namespace Jellyfin.Plugin.VOD.Controllers
             _db = db;
             _ytDlp = ytDlp;
             _cache = cache;
+            _subtitles = subtitles;
             _streamWriter = streamWriter;
+            _describer = describer;
             _httpClientFactory = httpClientFactory;
             _libraryManager = libraryManager;
             _publisher = publisher;
@@ -93,7 +101,7 @@ namespace Jellyfin.Plugin.VOD.Controllers
         [HttpGet("stream/{id}.m3u8")]
         public async Task<ActionResult> GetStream(
             [FromRoute] string id,
-            [FromQuery] string format = "bv*[protocol^=m3u8]",
+            [FromQuery] string format = StreamCacheKey.DefaultFormat,
             [FromQuery] int? height = null,
             [FromQuery] string? codec = null,
             [FromQuery] string? audioLangs = null,
@@ -127,9 +135,8 @@ namespace Jellyfin.Plugin.VOD.Controllers
                 return NotFound(new { error = "This broadcast has not started yet.", id });
             }
 
-            var cacheKey = string.Create(
-                System.Globalization.CultureInfo.InvariantCulture,
-                $"{id}|{format}|{height}|{codec}|{effectiveAudioLangs}|{effectiveSubLangs}");
+            var cacheKey = StreamCacheKey.For(
+                id, format, height, codec, effectiveAudioLangs, effectiveSubLangs);
 
             if (_cache.TryGet(cacheKey, out var cached))
             {
@@ -151,12 +158,12 @@ namespace Jellyfin.Plugin.VOD.Controllers
                 return Redirect(resolution.Url);
             }
 
-            var filtered = await FilterUpstreamAsync(
+            var master = await FilterUpstreamAsync(
                     resolution.Url, height, codec, effectiveAudioLangs, effectiveSubLangs,
                     cancellationToken)
                 .ConfigureAwait(false);
 
-            if (filtered is null)
+            if (master is null)
             {
                 return height is null
                     ? Redirect(resolution.Url)
@@ -168,23 +175,35 @@ namespace Jellyfin.Plugin.VOD.Controllers
                     });
             }
 
-            // Cache miss only: this bounds stream writes to roughly one per playlist TTL.
-            // Storing the tracks is a fidelity gain, not a prerequisite for playback, so a failure
-            // here must not cost the caller its playlist nor keep it out of the cache.
-            try
+            // Everything downstream is keyed or filtered for the default master, so a request that
+            // chose another one may be served but must leave no trace. A custom-format caller
+            // re-resolves on every request, which is that caller's own cost and not the default
+            // playback path.
+            if (DescribesTheServedMaster(format))
             {
-                var streams = MediaStreamBuilder.Build(filtered);
-                _streamWriter.TryWrite(id, height, codec, streams, cancellationToken);
-            }
+                _cache.Set(cacheKey, master.Filtered);
+
+                // Cache miss only: this bounds the work to roughly one per playlist TTL. Labels are
+                // applied inline because they are immediate and cheap; the description itself is a
+                // probe per member, so it runs in the background and never delays this response.
+                try
+                {
+                    var streams = MediaStreamBuilder.Build(master.Filtered);
+                    _streamWriter.TryWrite(
+                        id, height, codec, streams,
+                        StreamBitRates.VariantBandwidth(master.Filtered), cancellationToken);
+                }
 #pragma warning disable CA1031 // nothing about persisting track labels is worth failing playback for
-            catch (Exception ex)
+                catch (Exception ex)
 #pragma warning restore CA1031
-            {
-                LogStreamPersistFailed(ex, id);
+                {
+                    LogStreamPersistFailed(ex, id);
+                }
             }
 
-            _cache.Set(cacheKey, filtered);
-            return Content(filtered, "application/vnd.apple.mpegurl");
+            DescribeInBackground(config, id, master, format);
+
+            return Content(master.Filtered, "application/vnd.apple.mpegurl");
         }
 
         /// <summary>Returns a subtitle playlist whose segment ffmpeg will accept.</summary>
@@ -193,7 +212,7 @@ namespace Jellyfin.Plugin.VOD.Controllers
             [FromRoute] string token,
             CancellationToken cancellationToken = default)
         {
-            if (!_cache.TryGet(SubtitleKey(token), out var upstreamUrl))
+            if (!_subtitles.TryResolve(token, out var upstreamUrl))
             {
                 return NotFound(new { error = "Unknown or expired subtitle token", token });
             }
@@ -225,7 +244,7 @@ namespace Jellyfin.Plugin.VOD.Controllers
             [FromRoute] string token,
             CancellationToken cancellationToken = default)
         {
-            if (!_cache.TryGet(SubtitleKey(token), out var upstreamUrl))
+            if (!_subtitles.TryResolve(token, out var upstreamUrl))
             {
                 return NotFound(new { error = "Unknown or expired subtitle token", token });
             }
@@ -451,7 +470,33 @@ namespace Jellyfin.Plugin.VOD.Controllers
         internal static bool IsStreamable(VideoRecord video)
             => video.LiveStatus != LiveStatus.Upcoming;
 
-        private async Task<string?> FilterUpstreamAsync(
+        /// <summary>
+        /// Whether the master fetched by this request is the one <see cref="StreamDescriber"/>
+        /// would probe for the same video.
+        /// </summary>
+        /// <param name="format">The yt-dlp format selector used by this request.</param>
+        /// <returns><see langword="true"/> only when <paramref name="format"/> is the default.</returns>
+        /// <remarks>
+        /// <see cref="StreamDescriber"/> primes its cache entries under
+        /// <see cref="StreamCacheKey.DefaultFormat"/> and the plugin-configured languages — exactly
+        /// the keys normal playback reads. A request that passes a custom format resolves a
+        /// different master; handing that master to the describer would prime those default-format
+        /// entries with the wrong content and then probe it into a permanent, incorrect description
+        /// (Jellyfin never re-probes a source that already has a video stream). The background
+        /// description is therefore only safe when the request used the default format.
+        /// </remarks>
+        internal static bool DescribesTheServedMaster(string? format)
+            => string.Equals(format, StreamCacheKey.DefaultFormat, StringComparison.Ordinal);
+
+        /// <summary>A fetched master and the playlist filtered out of it.</summary>
+        /// <param name="Filtered">What this request serves.</param>
+        /// <param name="Upstream">The complete upstream master, which the describer reuses for the
+        /// sibling tiers — downloading it once is what keeps the group's description free of
+        /// further network calls.</param>
+        /// <param name="BaseUri">The URI the master was fetched from.</param>
+        private sealed record FetchedMaster(string Filtered, string Upstream, Uri BaseUri);
+
+        private async Task<FetchedMaster?> FilterUpstreamAsync(
             string masterUrl, int? height, string? codec, string audioLangs, string subLangs, CancellationToken cancellationToken)
         {
             var baseUri = new Uri(masterUrl);
@@ -461,29 +506,67 @@ namespace Jellyfin.Plugin.VOD.Controllers
                 return null;
             }
 
-            return HlsPlaylistFilter.FilterMaster(
+            var filtered = HlsPlaylistFilter.FilterMaster(
                 upstream,
                 baseUri,
                 height,
                 codec,
                 audioLangs.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries),
                 subLangs.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries),
-                ServeSubtitle);
+                _subtitles.Rewrite);
+
+            return filtered is null ? null : new FetchedMaster(filtered, upstream, baseUri);
         }
 
-        private string? ServeSubtitle(string upstreamUri)
+        /// <summary>
+        /// Describes this video's group without delaying the response.
+        /// </summary>
+        /// <param name="config">The plugin configuration, or null when the plugin is unloaded.</param>
+        /// <param name="id">The video UUID.</param>
+        /// <param name="master">The fetched master whose upstream content the describer reuses.</param>
+        /// <param name="format">The yt-dlp format selector used by this request.</param>
+        /// <remarks>
+        /// Deliberately not awaited, and deliberately not given the request's cancellation token:
+        /// the request ends as soon as the playlist is written, which would cancel the work. The
+        /// describer never throws, and its own guards keep two callers from probing the same member
+        /// twice.
+        /// </remarks>
+        private void DescribeInBackground(PluginConfiguration? config, string id, FetchedMaster master, string format)
         {
-            if (!upstreamUri.Contains("timedtext", StringComparison.OrdinalIgnoreCase))
+            if (config is null)
             {
-                return upstreamUri;
+                return;
             }
 
-            var token = Guid.NewGuid().ToString("N");
-            _cache.Set(SubtitleKey(token), upstreamUri, TimeSpan.FromHours(1));
+            // Only launch when the request used the default format: StreamDescriber primes its
+            // cache entries under DefaultFormat and the plugin-configured languages, which are
+            // exactly the keys normal playback reads. A custom-format master would prime those same
+            // keys with different content and then probe it into a permanent wrong description.
+            if (!DescribesTheServedMaster(format))
+            {
+                return;
+            }
 
-            // Relative to /VOD/stream/{id}: never bake in a host — the cached master may be served
-            // to a different caller (container ffmpeg vs. Jellyfin's own probe).
-            return $"../subtitles/{token}.m3u8";
+            _ = Task.Run(
+                async () =>
+                {
+                    try
+                    {
+                        // The outcome is intentionally discarded: the background path is a best-effort
+                        // failsafe, and the task loop and its back-off registry own the retry logic.
+                        _ = await _describer
+                            .DescribeGroupAsync(
+                                config, id, master.Upstream, master.BaseUri, CancellationToken.None)
+                            .ConfigureAwait(false);
+                    }
+#pragma warning disable CA1031 // a background description must never take the server down
+                    catch (Exception ex)
+#pragma warning restore CA1031
+                    {
+                        LogBackgroundDescribeFailed(ex, id);
+                    }
+                },
+                CancellationToken.None);
         }
 
         private async Task<string?> FetchStringAsync(string url, CancellationToken cancellationToken)
@@ -496,8 +579,6 @@ namespace Jellyfin.Plugin.VOD.Controllers
                 : null;
         }
 
-        private static string SubtitleKey(string token) => $"sub:{token}";
-
         [LoggerMessage(EventId = 10, Level = LogLevel.Warning,
             Message = "{VideoUrl} resolved with {Format} to a bare media URL (no HLS manifest): expect video-only")]
         private partial void LogNoManifest(string videoUrl, string format);
@@ -505,5 +586,9 @@ namespace Jellyfin.Plugin.VOD.Controllers
         [LoggerMessage(EventId = 11, Level = LogLevel.Warning,
             Message = "Could not persist the media streams of {VideoId}; playback is unaffected")]
         private partial void LogStreamPersistFailed(Exception exception, string videoId);
+
+        [LoggerMessage(EventId = 12, Level = LogLevel.Warning,
+            Message = "Describing the version group of {VideoId} in the background failed; playback is unaffected")]
+        private partial void LogBackgroundDescribeFailed(Exception exception, string videoId);
     }
 }

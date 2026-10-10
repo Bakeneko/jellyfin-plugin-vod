@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Jellyfin.Plugin.VOD.Controllers;
 using Jellyfin.Plugin.VOD.Data.Models;
+using Jellyfin.Plugin.VOD.Services;
 using Jellyfin.Plugin.VOD.Services.Sync;
 using MediaBrowser.Model.Entities;
 using Xunit;
@@ -237,6 +238,22 @@ namespace Jellyfin.Plugin.VOD.Tests.Controllers
                 LiveStatus = LiveStatus.Upcoming
             };
             Assert.False(VodController.IsStreamable(video));
+        }
+
+        [Theory]
+        [InlineData(StreamCacheKey.DefaultFormat, true)]
+        [InlineData("worst", false)]
+        [InlineData(null, false)]
+        [InlineData("", false)]
+        public void DescribesTheServedMaster_OnlyWhenFormatIsDefault(string? format, bool expected)
+        {
+            // GET /VOD/stream/{id}.m3u8 is unauthenticated: ffmpeg and players call it without a
+            // token. StreamDescriber primes its cache entries under the default format and the
+            // plugin-configured languages, which are exactly the keys normal playback reads. A
+            // request with a custom format (e.g. "worst") would prime those same keys with a
+            // different master and then probe it into a permanent, wrong description. The guard
+            // therefore only allows the background description when the format matches the default.
+            Assert.Equal(expected, VodController.DescribesTheServedMaster(format));
         }
     }
 }

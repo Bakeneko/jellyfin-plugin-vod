@@ -98,7 +98,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
                 new() { Type = MediaStreamType.Video, Index = 2 }
             };
 
-            Assert.True(_writer.TryWrite(Uuid, null, null, fromMaster, CancellationToken.None));
+            Assert.True(_writer.TryWrite(Uuid, null, null, fromMaster, null, CancellationToken.None));
 
             var saved = Saved();
             Assert.NotNull(saved);
@@ -115,17 +115,60 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
         }
 
         [Fact]
-        public void TryWrite_WritesTheWholeListWhenNothingHasBeenProbedYet()
+        public void TryWrite_GivesADescribedVideoWithoutABitrateTheVariantBandwidth()
         {
-            // Our list is poorer than a probe's, but it is better than no streams at all, and this is
-            // the state a first playback starts from.
+            // Items Jellyfin probed itself carry no video bitrate for H.264 in MPEG-TS either, and the
+            // describer never revisits a described item: the playback route is where they get one.
+            var item = Item(Guid.NewGuid(), $"http://localhost:8096/VOD/stream/{Uuid}.m3u8");
+            LibraryHolds(item);
+            AlreadyProbed(
+                Probed(MediaStreamType.Audio, 0, "fr"),
+                Probed(MediaStreamType.Video, 1));
+
+            var fromMaster = new List<MediaStream>
+            {
+                new() { Type = MediaStreamType.Audio, Index = 0 },
+                new() { Type = MediaStreamType.Video, Index = 1 }
+            };
+
+            Assert.True(_writer.TryWrite(Uuid, null, null, fromMaster, 3000000, CancellationToken.None));
+
+            var saved = Saved();
+            Assert.NotNull(saved);
+            Assert.Equal(3000000, saved[1].BitRate);
+            Assert.Equal("High", saved[1].Profile);
+        }
+
+        [Fact]
+        public void TryWrite_AMuxedVariantWithNoStreamList_StillGetsItsBandwidth()
+        {
+            // Twitch: the master declares no rendition, so the route derives no stream list — but the
+            // variant still declares its bandwidth, which is all an unmeasured H.264 video needs.
+            var item = Item(Guid.NewGuid(), $"http://localhost:8096/VOD/stream/{Uuid}.m3u8");
+            LibraryHolds(item);
+            AlreadyProbed(
+                Probed(MediaStreamType.Audio, 0),
+                Probed(MediaStreamType.Video, 1));
+
+            Assert.True(_writer.TryWrite(Uuid, null, null, [], 8444342, CancellationToken.None));
+
+            var saved = Saved();
+            Assert.NotNull(saved);
+            Assert.Equal(8444342, saved[1].BitRate);
+        }
+
+        [Fact]
+        public void TryWrite_AnItemWithNoDescription_IsLeftToTheDescriber()
+        {
             var item = Item(Guid.NewGuid(), $"http://localhost:8096/VOD/stream/{Uuid}.m3u8");
             LibraryHolds(item);
             AlreadyProbed();
 
-            Assert.True(_writer.TryWrite(Uuid, null, null, Streams, CancellationToken.None));
-
-            Assert.Same(Streams, Saved());
+            // A playlist cannot carry profile, level, colour or channel count, and a thin list is
+            // final: Jellyfin never re-probes a source that has a video stream. StreamDescriber
+            // writes the real description instead, so the writer only ever labels.
+            Assert.False(_writer.TryWrite(Uuid, null, null, Streams, null, CancellationToken.None));
+            Assert.Null(Saved());
         }
 
         [Fact]
@@ -147,7 +190,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
                 new() { Type = MediaStreamType.Video, Index = 1 }
             };
 
-            Assert.False(_writer.TryWrite(Uuid, null, null, fromMaster, CancellationToken.None));
+            Assert.False(_writer.TryWrite(Uuid, null, null, fromMaster, null, CancellationToken.None));
 
             _repository.DidNotReceive().SaveMediaStreams(
                 Arg.Any<Guid>(), Arg.Any<IReadOnlyList<MediaStream>>(), Arg.Any<CancellationToken>());
@@ -164,9 +207,20 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
             var asMovie = Item(Guid.NewGuid(), path);
             var asEpisode = Item(Guid.NewGuid(), path);
             LibraryHolds(asMovie, asEpisode);
-            AlreadyProbed();
+            // Each item needs its own list instance so TrackLabels.Apply modifies separate objects;
+            // sharing one list would make the second item see a title that was already applied, and
+            // Apply would return 0 — the second save would then be skipped.
+            _repository.GetMediaStreams(Arg.Is<MediaStreamQuery>(q => q.ItemId == asMovie.Id))
+                .Returns(new List<MediaStream> { Probed(MediaStreamType.Video, 0) });
+            _repository.GetMediaStreams(Arg.Is<MediaStreamQuery>(q => q.ItemId == asEpisode.Id))
+                .Returns(new List<MediaStream> { Probed(MediaStreamType.Video, 0) });
 
-            Assert.True(_writer.TryWrite(Uuid, 1080, "h264", Streams, CancellationToken.None));
+            var fromMaster = new List<MediaStream>
+            {
+                new() { Type = MediaStreamType.Video, Index = 0, Title = "HD" }
+            };
+
+            Assert.True(_writer.TryWrite(Uuid, 1080, "h264", fromMaster, null, CancellationToken.None));
 
             _repository.Received(1).SaveMediaStreams(
                 asMovie.Id, Arg.Any<IReadOnlyList<MediaStream>>(), Arg.Any<CancellationToken>());
@@ -191,7 +245,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
                 new() { Type = MediaStreamType.Video, Index = 1 }
             };
 
-            Assert.False(_writer.TryWrite(Uuid, null, null, fromMaster, CancellationToken.None));
+            Assert.False(_writer.TryWrite(Uuid, null, null, fromMaster, null, CancellationToken.None));
 
             _repository.DidNotReceive().SaveMediaStreams(
                 Arg.Any<Guid>(), Arg.Any<IReadOnlyList<MediaStream>>(), Arg.Any<CancellationToken>());
@@ -204,10 +258,17 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
             var alternate = Item(
                 Guid.NewGuid(), $"http://localhost:8096/VOD/stream/{Uuid}.m3u8?height=1080&codec=h264");
             LibraryHolds(primary, alternate);
+            AlreadyProbed(Probed(MediaStreamType.Video, 0));
 
-            Assert.True(_writer.TryWrite(Uuid, null, null, Streams, CancellationToken.None));
+            var fromMaster = new List<MediaStream>
+            {
+                new() { Type = MediaStreamType.Video, Index = 0, Title = "HD" }
+            };
 
-            _repository.Received(1).SaveMediaStreams(primary.Id, Streams, Arg.Any<CancellationToken>());
+            Assert.True(_writer.TryWrite(Uuid, null, null, fromMaster, null, CancellationToken.None));
+
+            _repository.Received(1).SaveMediaStreams(
+                primary.Id, Arg.Any<IReadOnlyList<MediaStream>>(), Arg.Any<CancellationToken>());
             _repository.DidNotReceive().SaveMediaStreams(
                 alternate.Id, Arg.Any<IReadOnlyList<MediaStream>>(), Arg.Any<CancellationToken>());
         }
@@ -223,10 +284,17 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
             var uhd = Item(
                 Guid.NewGuid(), $"http://localhost:8096/VOD/stream/{Uuid}.m3u8?height=2160&codec=vp9");
             LibraryHolds(primary, hd, uhd);
+            AlreadyProbed(Probed(MediaStreamType.Video, 0));
 
-            Assert.True(_writer.TryWrite(Uuid, 2160, "vp9", Streams, CancellationToken.None));
+            var fromMaster = new List<MediaStream>
+            {
+                new() { Type = MediaStreamType.Video, Index = 0, Title = "UHD" }
+            };
 
-            _repository.Received(1).SaveMediaStreams(uhd.Id, Streams, Arg.Any<CancellationToken>());
+            Assert.True(_writer.TryWrite(Uuid, 2160, "vp9", fromMaster, null, CancellationToken.None));
+
+            _repository.Received(1).SaveMediaStreams(
+                uhd.Id, Arg.Any<IReadOnlyList<MediaStream>>(), Arg.Any<CancellationToken>());
             _repository.DidNotReceive().SaveMediaStreams(
                 hd.Id, Arg.Any<IReadOnlyList<MediaStream>>(), Arg.Any<CancellationToken>());
             _repository.DidNotReceive().SaveMediaStreams(
@@ -241,10 +309,17 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
                 Guid.NewGuid(),
                 $"https://old-host.example.com:9000/VOD/stream/{Uuid}.m3u8?height=1080&codec=h264");
             LibraryHolds(alternate);
+            AlreadyProbed(Probed(MediaStreamType.Video, 0));
 
-            Assert.True(_writer.TryWrite(Uuid, 1080, "h264", Streams, CancellationToken.None));
+            var fromMaster = new List<MediaStream>
+            {
+                new() { Type = MediaStreamType.Video, Index = 0, Title = "HD" }
+            };
 
-            _repository.Received(1).SaveMediaStreams(alternate.Id, Streams, Arg.Any<CancellationToken>());
+            Assert.True(_writer.TryWrite(Uuid, 1080, "h264", fromMaster, null, CancellationToken.None));
+
+            _repository.Received(1).SaveMediaStreams(
+                alternate.Id, Arg.Any<IReadOnlyList<MediaStream>>(), Arg.Any<CancellationToken>());
         }
 
         [Fact]
@@ -253,7 +328,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
             var primary = Item(Guid.NewGuid(), $"http://localhost:8096/VOD/stream/{Uuid}.m3u8");
             LibraryHolds(primary);
 
-            Assert.False(_writer.TryWrite(Uuid, 2160, "vp9", Streams, CancellationToken.None));
+            Assert.False(_writer.TryWrite(Uuid, 2160, "vp9", Streams, null, CancellationToken.None));
 
             _repository.DidNotReceive().SaveMediaStreams(
                 Arg.Any<Guid>(), Arg.Any<IReadOnlyList<MediaStream>>(), Arg.Any<CancellationToken>());
@@ -264,7 +339,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
         {
             LibraryHolds();
 
-            Assert.False(_writer.TryWrite(Uuid, null, null, Streams, CancellationToken.None));
+            Assert.False(_writer.TryWrite(Uuid, null, null, Streams, null, CancellationToken.None));
 
             _repository.DidNotReceive().SaveMediaStreams(
                 Arg.Any<Guid>(), Arg.Any<IReadOnlyList<MediaStream>>(), Arg.Any<CancellationToken>());
@@ -273,7 +348,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
         [Fact]
         public void TryWrite_ReturnsFalse_WhenThereAreNoStreamsToWrite()
         {
-            Assert.False(_writer.TryWrite(Uuid, null, null, [], CancellationToken.None));
+            Assert.False(_writer.TryWrite(Uuid, null, null, [], null, CancellationToken.None));
         }
 
         [Fact]
@@ -284,7 +359,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
             var primary = Item(Guid.NewGuid(), $"http://localhost:8096/VOD/stream/{Uuid}.m3u8");
             LibraryHolds(primary);
 
-            _writer.TryWrite(Uuid, null, null, Streams, CancellationToken.None);
+            _writer.TryWrite(Uuid, null, null, Streams, null, CancellationToken.None);
 
             _library.Received(1).GetItemList(Arg.Is<InternalItemsQuery>(q => q.Limit == null));
         }
@@ -300,7 +375,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
             var primary = Item(Guid.NewGuid(), $"http://localhost:8096/VOD/stream/{Uuid}.m3u8");
             LibraryHolds(primary);
 
-            _writer.TryWrite(Uuid, null, null, Streams, CancellationToken.None);
+            _writer.TryWrite(Uuid, null, null, Streams, null, CancellationToken.None);
 
             _library.Received(1).GetItemList(
                 Arg.Is<InternalItemsQuery>(q => q.IncludeAlternateVersions));
@@ -318,7 +393,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
                 Guid.NewGuid(), $"http://localhost:8096/VOD/stream/{Uuid}.m3u8?height=1080&codec=h264");
             LibraryHolds(primary, hd);
 
-            Assert.False(_writer.TryWrite(Uuid, 2160, "vp9", Streams, CancellationToken.None));
+            Assert.False(_writer.TryWrite(Uuid, 2160, "vp9", Streams, null, CancellationToken.None));
 
             _repository.DidNotReceive().SaveMediaStreams(
                 Arg.Any<Guid>(), Arg.Any<IReadOnlyList<MediaStream>>(), Arg.Any<CancellationToken>());

@@ -89,6 +89,23 @@ namespace Jellyfin.Plugin.VOD.Configuration
         [SuppressMessage("Performance", "CA1819:Properties should not return arrays", Justification = "string[] is required for Jellyfin XML serialization of BasePluginConfiguration.")]
         public string[] PreferredSubtitleLanguages { get; set; } = [];
 
+        /// <summary>
+        /// Gets or sets how many videos the stream description task describes per pass.
+        /// Zero or less disables the task; the description at playback stays active either way.
+        /// </summary>
+        /// <remarks>
+        /// Each video costs one yt-dlp resolution and at most one heavy probe (up to ~25 MB read).
+        /// Ten videos every fifteen minutes is about 960 a day, which clears a large library in a
+        /// day or two without the burst that earns an anti-bot answer.
+        /// </remarks>
+        public int StreamDescriptionBatchSize { get; set; } = 10;
+
+        /// <summary>
+        /// Gets or sets how many hours a video whose description failed is left alone before
+        /// another pass tries it again.
+        /// </summary>
+        public int StreamDescriptionRetryHours { get; set; } = 24;
+
         // ── Sync ─────────────────────────────────────────────────────────────────
 
         /// <summary>
