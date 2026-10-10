@@ -133,6 +133,35 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             Assert.Single(_service.Candidates(now.AddHours(24), retryHours: 24));
         }
 
+        /// <summary>Verifies the exact edge of the retry window: held one tick before it, released on it.</summary>
+        [Fact]
+        public void Candidates_TheRetryWindow_EndsExactlyAfterRetryHours()
+        {
+            DatabaseHolds(Video("failing", qualities: TwoTiers));
+            var failedAt = new DateTimeOffset(2026, 10, 9, 12, 0, 0, TimeSpan.Zero);
+
+            _service.RememberFailure("failing", failedAt);
+
+            Assert.Empty(_service.Candidates(failedAt.AddHours(24).AddTicks(-1), retryHours: 24));
+            Assert.Single(_service.Candidates(failedAt.AddHours(24), retryHours: 24));
+        }
+
+        /// <summary>Verifies that a video with no publication date comes after every dated one.</summary>
+        [Fact]
+        public void Candidates_AVideoWithoutAPublicationDate_ComesLast()
+        {
+            var undated = Video("undated", qualities: TwoTiers);
+            undated.PublishedAt = null;
+            DatabaseHolds(
+                undated,
+                Video("old", publishedAt: new DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero), qualities: TwoTiers),
+                Video("new", publishedAt: new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero), qualities: TwoTiers));
+
+            var candidates = _service.Candidates(DateTimeOffset.UtcNow, retryHours: 24);
+
+            Assert.Equal(["new", "old", "undated"], candidates.Select(c => c.Id));
+        }
+
         /// <summary>Verifies that a batch size of zero disables the pass.</summary>
         [Fact]
         public async Task DescribeNextBatchAsync_WithBatchSizeZero_DescribesNothing()

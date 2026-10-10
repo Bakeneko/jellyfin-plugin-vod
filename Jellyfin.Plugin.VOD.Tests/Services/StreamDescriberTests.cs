@@ -304,7 +304,9 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
             await _describer.DescribeGroupAsync(
                 _config, Uuid, AvcOnlyMaster, new Uri("https://cdn.test/master.m3u8"), CancellationToken.None);
 
-            // Both members are empty, so both are probed: nothing may be copied from a blank.
+            // The substitute keeps answering "no streams" for the primary even after its probe, as
+            // when that probe saved nothing: the reference then cannot copy from a blank and is
+            // probed itself. (Live, the primary's save lands first and the reference is copied.)
             await _encoder.Received(2).GetMediaInfo(
                 Arg.Any<MediaInfoRequest>(), Arg.Any<CancellationToken>());
             Assert.NotNull(SavedFor(reference));

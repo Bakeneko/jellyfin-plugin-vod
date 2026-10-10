@@ -119,8 +119,8 @@ namespace Jellyfin.Plugin.VOD.Controllers
             }
 
             var config = Plugin.Instance?.Configuration;
-            var effectiveAudioLangs = audioLangs ?? JoinLanguages(config?.PreferredAudioLanguages);
-            var effectiveSubLangs = subLangs ?? JoinLanguages(config?.PreferredSubtitleLanguages);
+            var effectiveAudioLangs = audioLangs ?? StreamCacheKey.JoinLanguages(config?.PreferredAudioLanguages);
+            var effectiveSubLangs = subLangs ?? StreamCacheKey.JoinLanguages(config?.PreferredSubtitleLanguages);
 
             var video = _db.GetVideoByUuid(id);
             if (video is null)
@@ -436,21 +436,6 @@ namespace Jellyfin.Plugin.VOD.Controllers
             => records
                 .Select(r => new SourceStatus(r.Url, r.Name, r.LastSyncedAt, r.LastError, r.VideoCount))
                 .ToList();
-
-        /// <summary>
-        /// Joins configured language prefixes into the comma-separated form the filter expects.
-        /// </summary>
-        /// <param name="languages">The configured prefixes, possibly null or containing blanks.</param>
-        /// <returns>A comma-separated list with no empty entries.</returns>
-        /// <remarks>
-        /// Blank entries are dropped rather than joined: the administrator's field is free text, and
-        /// a trailing comma would otherwise reach HlsPlaylistFilter as an empty prefix, which
-        /// matches every rendition.
-        /// </remarks>
-        internal static string JoinLanguages(string[]? languages)
-            => languages is null
-                ? string.Empty
-                : string.Join(',', languages.Where(l => !string.IsNullOrWhiteSpace(l)));
 
         /// <summary>
         /// Whether the quality selection is complete. height and codec identify one variant

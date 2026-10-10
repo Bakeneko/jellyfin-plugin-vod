@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Linq;
 
 namespace Jellyfin.Plugin.VOD.Services
 {
@@ -27,5 +28,20 @@ namespace Jellyfin.Plugin.VOD.Services
             => string.Create(
                 CultureInfo.InvariantCulture,
                 $"{id}|{format}|{height}|{codec}|{audioLangs}|{subLangs}");
+
+        /// <summary>
+        /// Joins configured language prefixes into the comma-separated form the filter expects.
+        /// </summary>
+        /// <param name="languages">The configured prefixes, possibly null or containing blanks.</param>
+        /// <returns>A comma-separated list with no empty entries.</returns>
+        /// <remarks>
+        /// Lives beside the key because both of its callers feed it into one. Blank entries are
+        /// dropped rather than joined: the administrator's field is free text, and a trailing comma
+        /// would otherwise reach HlsPlaylistFilter as an empty prefix, which matches every rendition.
+        /// </remarks>
+        public static string JoinLanguages(string[]? languages)
+            => languages is null
+                ? string.Empty
+                : string.Join(',', languages.Where(l => !string.IsNullOrWhiteSpace(l)));
     }
 }

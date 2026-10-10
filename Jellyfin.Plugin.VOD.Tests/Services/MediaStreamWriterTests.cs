@@ -223,9 +223,11 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
             Assert.True(_writer.TryWrite(Uuid, 1080, "h264", fromMaster, null, CancellationToken.None));
 
             _repository.Received(1).SaveMediaStreams(
-                asMovie.Id, Arg.Any<IReadOnlyList<MediaStream>>(), Arg.Any<CancellationToken>());
+                asMovie.Id, Arg.Is<IReadOnlyList<MediaStream>>(s => s.Count == 1 && s[0].Title == "HD"),
+                Arg.Any<CancellationToken>());
             _repository.Received(1).SaveMediaStreams(
-                asEpisode.Id, Arg.Any<IReadOnlyList<MediaStream>>(), Arg.Any<CancellationToken>());
+                asEpisode.Id, Arg.Is<IReadOnlyList<MediaStream>>(s => s.Count == 1 && s[0].Title == "HD"),
+                Arg.Any<CancellationToken>());
         }
 
         [Fact]
@@ -268,7 +270,8 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
             Assert.True(_writer.TryWrite(Uuid, null, null, fromMaster, null, CancellationToken.None));
 
             _repository.Received(1).SaveMediaStreams(
-                primary.Id, Arg.Any<IReadOnlyList<MediaStream>>(), Arg.Any<CancellationToken>());
+                primary.Id, Arg.Is<IReadOnlyList<MediaStream>>(s => s.Count == 1 && s[0].Title == "HD"),
+                Arg.Any<CancellationToken>());
             _repository.DidNotReceive().SaveMediaStreams(
                 alternate.Id, Arg.Any<IReadOnlyList<MediaStream>>(), Arg.Any<CancellationToken>());
         }
@@ -294,7 +297,8 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
             Assert.True(_writer.TryWrite(Uuid, 2160, "vp9", fromMaster, null, CancellationToken.None));
 
             _repository.Received(1).SaveMediaStreams(
-                uhd.Id, Arg.Any<IReadOnlyList<MediaStream>>(), Arg.Any<CancellationToken>());
+                uhd.Id, Arg.Is<IReadOnlyList<MediaStream>>(s => s.Count == 1 && s[0].Title == "UHD"),
+                Arg.Any<CancellationToken>());
             _repository.DidNotReceive().SaveMediaStreams(
                 hd.Id, Arg.Any<IReadOnlyList<MediaStream>>(), Arg.Any<CancellationToken>());
             _repository.DidNotReceive().SaveMediaStreams(
@@ -319,7 +323,8 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
             Assert.True(_writer.TryWrite(Uuid, 1080, "h264", fromMaster, null, CancellationToken.None));
 
             _repository.Received(1).SaveMediaStreams(
-                alternate.Id, Arg.Any<IReadOnlyList<MediaStream>>(), Arg.Any<CancellationToken>());
+                alternate.Id, Arg.Is<IReadOnlyList<MediaStream>>(s => s.Count == 1 && s[0].Title == "HD"),
+                Arg.Any<CancellationToken>());
         }
 
         [Fact]

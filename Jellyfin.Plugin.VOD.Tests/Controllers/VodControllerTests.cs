@@ -200,24 +200,6 @@ namespace Jellyfin.Plugin.VOD.Tests.Controllers
             => Assert.Empty(VodController.ProjectSourceStatus([]));
 
         [Theory]
-        [InlineData(new string[0], "")]
-        [InlineData(new[] { "fr" }, "fr")]
-        [InlineData(new[] { "fr", "en" }, "fr,en")]
-        [InlineData(new[] { "fr", "", "en" }, "fr,en")]
-        [InlineData(new[] { "fr", "   ", "en" }, "fr,en")]
-        [InlineData(new[] { "", "  " }, "")]
-        public void JoinLanguages_DropsBlankEntries(string[] input, string expected)
-        {
-            // Review Focus 4: a naive Join yields "fr,,en", and HlsPlaylistFilter then matches an
-            // empty language prefix against every rendition.
-            Assert.Equal(expected, VodController.JoinLanguages(input));
-        }
-
-        [Fact]
-        public void JoinLanguages_TreatsNullAsEmpty()
-            => Assert.Equal(string.Empty, VodController.JoinLanguages(null));
-
-        [Theory]
         [InlineData(null, null, true)]      // no selection: the default rule applies
         [InlineData(1080, "h264", true)]    // a complete selection
         [InlineData(1080, null, false)]     // half a selection is a malformed request

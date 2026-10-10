@@ -72,6 +72,12 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// group costs one probe, the reference tier being copied from the primary. A video with no
         /// tier is a lone primary, which Jellyfin probes itself. Whether a member still lacks a
         /// description is asked later, per video, because it takes a library query.
+        /// <para>
+        /// A video without a publication date sorts after every dated one: newest first serves the
+        /// videos most likely to be played next, and an undated one gives no reason to jump the
+        /// queue. A failed video is held back while less than <paramref name="retryHours"/> have
+        /// passed, and released on the exact boundary.
+        /// </para>
         /// </remarks>
         internal IReadOnlyList<VideoRecord> Candidates(DateTimeOffset now, int retryHours)
         {

@@ -411,14 +411,13 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
     /// <summary>
     /// ProcessEntries returns the count of records created (not updated) in a pass.
     /// </summary>
-    public sealed class SyncServiceProcessEntriesTests : IDisposable
+    public sealed class SyncServiceProcessEntriesTests
     {
         private const string SourceUrl = "https://example.test/pe";
         private readonly IVodDatabase _db = Substitute.For<IVodDatabase>();
         private readonly IVodLocalizer _localizer = Substitute.For<IVodLocalizer>();
         private readonly ILibraryManager _library = Substitute.For<ILibraryManager>();
         private readonly ITaskManager _tasks = Substitute.For<ITaskManager>();
-        private readonly string _root = Directory.CreateTempSubdirectory("vod-pe-tests").FullName;
         private readonly SyncService _service;
 
         public SyncServiceProcessEntriesTests()
@@ -435,8 +434,6 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                     NullLogger<YtDlpService>.Instance),
                 publisher, _localizer, NullLogger<SyncService>.Instance, _tasks);
         }
-
-        public void Dispose() => Directory.Delete(_root, recursive: true);
 
         /// <summary>Builds a playlist entry and its corresponding full metadata with the given id.</summary>
         private static (PlaylistEntry Entry, VideoMetadata Meta) EntryWithMeta(string id) => (
@@ -486,13 +483,12 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
     /// QueueDescriptionIfCreated queues the stream description task exactly when the pass created
     /// at least one video, and stays silent when it created nothing.
     /// </summary>
-    public sealed class SyncServiceQueueDescriptionIfCreatedTests : IDisposable
+    public sealed class SyncServiceQueueDescriptionIfCreatedTests
     {
         private readonly IVodDatabase _db = Substitute.For<IVodDatabase>();
         private readonly IVodLocalizer _localizer = Substitute.For<IVodLocalizer>();
         private readonly ILibraryManager _library = Substitute.For<ILibraryManager>();
         private readonly ITaskManager _tasks = Substitute.For<ITaskManager>();
-        private readonly string _root = Directory.CreateTempSubdirectory("vod-qd-tests").FullName;
         private readonly SyncService _service;
 
         public SyncServiceQueueDescriptionIfCreatedTests()
@@ -509,8 +505,6 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                     NullLogger<YtDlpService>.Instance),
                 publisher, _localizer, NullLogger<SyncService>.Instance, _tasks);
         }
-
-        public void Dispose() => Directory.Delete(_root, recursive: true);
 
         [Fact]
         public void QueueDescriptionIfCreated_QueuesTask_WhenCreatedIsPositive()

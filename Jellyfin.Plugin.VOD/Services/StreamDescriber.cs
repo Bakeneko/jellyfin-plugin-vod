@@ -6,7 +6,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Data.Enums;
 using Jellyfin.Plugin.VOD.Configuration;
-using Jellyfin.Plugin.VOD.Controllers;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
@@ -143,8 +142,8 @@ namespace Jellyfin.Plugin.VOD.Services
             ArgumentException.ThrowIfNullOrEmpty(upstreamMaster);
             ArgumentNullException.ThrowIfNull(masterBaseUri);
 
-            var audioLangs = VodController.JoinLanguages(config.PreferredAudioLanguages);
-            var subLangs = VodController.JoinLanguages(config.PreferredSubtitleLanguages);
+            var audioLangs = StreamCacheKey.JoinLanguages(config.PreferredAudioLanguages);
+            var subLangs = StreamCacheKey.JoinLanguages(config.PreferredSubtitleLanguages);
 
             var attempted = 0;
             var described = 0;
