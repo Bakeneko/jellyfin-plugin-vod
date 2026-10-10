@@ -416,6 +416,11 @@
                         var cell = tr.querySelector('.src-status');
                         var row = byUrl[tr.querySelector('.src-url').value.trim().toLowerCase()];
 
+                        // The name the source was last published under, so each URL can be told
+                        // apart at a glance. Only visible while no override is typed.
+                        tr.querySelector('.src-name').placeholder =
+                            row && row.Name ? row.Name : '(from platform)';
+
                         if (!row) {
                             cell.textContent = 'never synced';
                             cell.style.color = '';
