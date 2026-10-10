@@ -10,14 +10,9 @@ description: >
   Get a virtual library of VOD channel/playlist with videos synched, cached and streamed on demand via yt-dlp.
 
 category: "General"
-# Every managed assembly `dotnet publish` emits, and nothing else. jprm packages only what is
-# listed here, so a dependency missing from this list ships a plugin that cannot open its database.
-# The server's own assemblies and the native SQLite libraries are kept out of the publish output by
-# the project file instead; see the comments on Jellyfin.Controller and SQLitePCLRaw.lib.e_sqlite3.
+# Every managed assembly `dotnet publish` emits, and nothing else: jprm packages only what is listed
+# here. SQLite, SkiaSharp and the Jellyfin assemblies all come from the server; see the comments on
+# their references in the project file.
 artifacts:
   - "Jellyfin.Plugin.VOD.dll"
-  - "Microsoft.Data.Sqlite.dll"
-  - "SQLitePCLRaw.batteries_v2.dll"
-  - "SQLitePCLRaw.core.dll"
-  - "SQLitePCLRaw.provider.e_sqlite3.dll"
 changelog: |-

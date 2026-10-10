@@ -16,14 +16,15 @@
          MediaBrowser.Controller would sit beside the server's, and an ILibraryManager the plugin
          asks for would no longer be the type the server's DI hands out. -->
     <PackageReference Include="Jellyfin.Controller" Version="12.1.0" ExcludeAssets="runtime" />
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
-    <!-- Ships the managed SQLite assemblies but not the native library. Native code is always
-         resolved from the server, because PluginLoadContext overrides Load but not
-         LoadUnmanagedDll. Worse than useless, too: PluginManager's *.dll scan is recursive, so
-         runtimes/win-*/native/e_sqlite3.dll would be loaded as a managed assembly, fail, and mark
-         the plugin Malfunctioned on every platform. Pinned at the version Microsoft.Data.Sqlite
-         pulls transitively. -->
-    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.12" ExcludeAssets="native" />
+    <!-- Compile-time only: the server ships Microsoft.Data.Sqlite and SQLitePCLRaw, initialises the
+         provider, and loads the native library. An assembly absent from the plugin folder resolves
+         to the server's copy, so these must match the server's versions exactly — a newer one
+         fails to load. Jellyfin 12.1 ships Microsoft.Data.Sqlite.Core 10.0.11 and SQLitePCLRaw
+         2.1.12. Referencing the Core packages rather than the Microsoft.Data.Sqlite metapackage
+         matters: ExcludeAssets does not reach transitive packages, and the metapackage's bundle
+         would copy SQLitePCLRaw into the plugin again. -->
+    <PackageReference Include="Microsoft.Data.Sqlite.Core" Version="10.0.11" ExcludeAssets="runtime" />
+    <PackageReference Include="SQLitePCLRaw.core" Version="2.1.12" ExcludeAssets="runtime" />
     <!-- Compile-time only: the server already loads SkiaSharp and its native library from
          /jellyfin, so shipping our own copy would duplicate it and risk two versions in one
          process. "runtime" keeps the managed assembly out of the published plugin; "native" is
