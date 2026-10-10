@@ -2,7 +2,7 @@
     {
         "guid": "16bb0693-4248-478b-a1e5-a4508326245c",
         "name": "VOD",
-        "description": "Get a virtual library of VOD channel/playlist with videos synched, cached and streamed on demand via yt-dlp.\n",
+        "description": "Follow YouTube, Twitch and other online channels from Jellyfin: their videos appear in a library and are streamed on demand through yt-dlp, with nothing downloaded to disk.\n",
         "overview": "Virtual VOD channel/playlist library via yt-dlp",
         "owner": "bakeneko",
         "category": "General",

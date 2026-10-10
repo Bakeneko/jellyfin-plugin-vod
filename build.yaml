@@ -2,17 +2,20 @@
 name: "VOD"
 guid: "16bb0693-4248-478b-a1e5-a4508326245c"
 version: 1
-targetAbi: "12.1.0"
+targetAbi: "12.1.0.0"
 framework: "net10.0"
 owner: "bakeneko"
 overview: "Virtual VOD channel/playlist library via yt-dlp"
 description: >
-  Get a virtual library of VOD channel/playlist with videos synched, cached and streamed on demand via yt-dlp.
+  Follow YouTube, Twitch and other online channels from Jellyfin: their videos appear in a library and are streamed on demand through yt-dlp, with nothing downloaded to disk.
 
 category: "General"
-# Every managed assembly `dotnet publish` emits, and nothing else: jprm packages only what is listed
-# here. SQLite, SkiaSharp and the Jellyfin assemblies all come from the server; see the comments on
-# their references in the project file.
 artifacts:
   - "Jellyfin.Plugin.VOD.dll"
 changelog: |-
+  - First release.
+  - Follow YouTube, Twitch and Arte channels, tabs, playlists and single videos as series or movies.
+  - Stream on demand through yt-dlp, with nothing stored on disk.
+  - Quality versions, described ahead of playback so Jellyfin copies instead of transcoding.
+  - Multiple audio and subtitle tracks, named and filtered by preferred language.
+  - Live broadcasts detected within minutes, turned into replays when they end.
