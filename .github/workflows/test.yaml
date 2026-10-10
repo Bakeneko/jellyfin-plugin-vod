@@ -15,4 +15,6 @@ on:
 
 jobs:
   call:
+    permissions:
+      contents: read
     uses: jellyfin/jellyfin-meta-plugins/.github/workflows/test.yaml@master

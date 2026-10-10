@@ -13,6 +13,10 @@ on:
 
 jobs:
   call:
+    permissions:
+      # Draft the release, push the version-bump branch and open its pull request.
+      contents: write
+      pull-requests: write
     uses: jellyfin/jellyfin-meta-plugins/.github/workflows/changelog.yaml@master
     with:
       repository-name: bakeneko/jellyfin-plugin-vod

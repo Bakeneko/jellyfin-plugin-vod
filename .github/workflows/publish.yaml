@@ -1,25 +1,29 @@
 name: '🚀 Publish Plugin'
 
+# Runs on a published release only: the assets are uploaded to that release, so there is nothing to
+# publish to without one.
 on:
   release:
     types:
       - released
-  workflow_dispatch:
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      # Upload the release assets and push the updated manifest.json to main.
+      contents: write
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@87b7050bc53ea08284295505d98d2aa94301e852 # v4.2.0
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: 10.0.x
-          
+
       - name: Setup jprm
         run: |
           pip install --user jprm
@@ -53,12 +57,12 @@ jobs:
         run: |
           jprm repo add --plugin-url $(echo "${{ steps.release.outputs.browser_download_url }}" | sed -n 3p) ./manifest.json ./upload/*.zip
 
+      # A plain push: if main moved while this ran, failing loudly beats overwriting what landed.
       - name: Commit manifest
         run: |
-          git config user.name GitHub Actions
+          git config user.name "GitHub Actions"
           git config user.email actions@github.com
-          git pull
+          git pull --ff-only
           git add ./manifest.json
-          git commit -m "Update manifest.json"
-          git push --force origin main
-      
+          git commit -m "chore(release): update manifest.json"
+          git push origin main
