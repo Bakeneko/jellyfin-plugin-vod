@@ -1,22 +1,108 @@
 <h1 align="center">Jellyfin VOD Plugin</h1>
 
-## About
+<p align="center">
+Follow YouTube, Twitch and other online channels from Jellyfin: their videos appear in a library
+and are streamed on demand through <a href="https://github.com/yt-dlp/yt-dlp">yt-dlp</a>, with
+nothing downloaded to disk.
+</p>
 
-Get a virtual library of VOD channel/playlist with videos synched, cached and streamed on demand via yt-dlp.
+> **Early release.** The plugin is used daily on one server but has not been tested widely yet.
+> Expect rough edges, and please report what you find.
 
+## What it does
 
-## Build & Installation Process
+- **Sources**: add a channel, a channel tab (`/videos`, `/streams`), a playlist or a single video.
+  Tested with YouTube, Twitch and Arte; other sites yt-dlp supports may work.
+- **Virtual library**: each source is published into a Jellyfin library you choose, either as a
+  series (one episode per video, seasons by year) or as movies. Titles, descriptions, dates and
+  artwork come from the source.
+- **On-demand streaming**: playback resolves the video's HLS stream at that moment. No file is
+  stored, so the library costs no disk space.
+- **Quality versions**: a video offered in several qualities gets a "Version" menu — the best H.264
+  (usually 1080p) and the best available (4K, 1440p, VP9/AV1/HEVC) when it differs. Stream
+  descriptions are probed ahead of playback so Jellyfin can copy rather than transcode.
+- **Audio and subtitle tracks**: multiple audio tracks and subtitles are kept, with their names
+  (e.g. "français (confort audio)"), filtered by your preferred languages.
+- **Lives**: a broadcast in progress is detected within minutes and playable as a live item; it
+  turns into a regular video once the replay is available.
+- **Scheduled sync**: each source is refreshed on its own interval; old videos can be capped by
+  count or by age.
 
-1. Clone this repository
+## Requirements
 
-2. Ensure you have .NET Core SDK setup and installed
+- **Jellyfin 12.1** or later.
+- **yt-dlp**, reachable from the Jellyfin server process. The official Jellyfin image does not
+  include it: the simplest route is the
+  [standalone Linux binary](https://github.com/yt-dlp/yt-dlp/releases/latest) placed in a mounted
+  volume, e.g. `/config/yt-dlp`, then set **yt-dlp path** accordingly. Keep it up to date: sites
+  change often, and an outdated yt-dlp is the most common cause of failures.
+- **A JavaScript runtime for YouTube.** yt-dlp needs one to solve YouTube's challenges.
+  [Deno](https://github.com/denoland/deno/releases/latest) works well as a standalone binary,
+  e.g. `/config/deno`, with **JS runtime** set to `deno:/config/deno`.
+- **Optional — cookies.** A Netscape-format cookie file lets yt-dlp read age-restricted or
+  members-only videos and helps against bot checks. A cookie file is as good as the account's
+  password: **use a throwaway account**, never a personal one.
 
-3. Build the plugin with following command:
+## Installation
+
+1. In Jellyfin, open **Dashboard → Plugins → Repositories** and add:
+   ```
+   https://raw.githubusercontent.com/Bakeneko/jellyfin-plugin-vod/main/manifest.json
+   ```
+2. Install **VOD** from the catalogue and restart Jellyfin.
+
+## Setup
+
+1. **Create the target library.** Add a Jellyfin library pointing to an **empty** folder: a
+   Shows library for series, a Movies library for movies, or a single Mixed library for both. Its
+   name must match the plugin's **Series library** / **Movies library** settings (`VOD` by
+   default). The plugin writes nothing there but a `.keep` marker; its items are virtual.
+2. **Configure the plugin** (Dashboard → Plugins → VOD):
+   - **yt-dlp path** and **JS runtime**, as above;
+   - **Local base URL**: the address the Jellyfin server uses to reach itself, **from inside its
+     own container** — usually `http://localhost:8096`, even when you browse Jellyfin on another
+     port. Streams fail if this is wrong;
+   - preferred audio and subtitle languages, and the library names.
+3. **Add sources**, choosing for each one the mode (Series or Movies) and, optionally, how many
+   videos to keep and for how long.
+4. Run **VOD Sync** from **Dashboard → Scheduled Tasks**, or wait for its next run.
+
+Scheduled tasks added by the plugin, all under the **VOD** category:
+
+| Task | Default | Role |
+|---|---|---|
+| VOD Sync | hourly | refreshes each source once its own interval has elapsed (12 h by default) |
+| VOD Live Probe | every 5 minutes | finds broadcasts in progress |
+| VOD Stream Description | every 15 minutes | probes quality versions ahead of playback, in small batches |
+
+## Known limitations
+
+- **Transcoding cost.** Codecs your client cannot play (VP9/AV1 on some TVs, for instance) are
+  transcoded by Jellyfin like any other media: hardware acceleration is strongly recommended for
+  4K versions.
+- **First playback of a just-published video** may still be transcoded while its streams are
+  being described; the next one is copied.
+- **A single-video source that becomes private** stays in the library; the source shows an error.
+- **Live latency.** Lives are served from the live edge with the usual HLS delay.
+- **The stream endpoint is not authenticated**, because ffmpeg calls it without a token. It only
+  answers for known video ids, but anyone who can reach your server and knows one can make it run
+  yt-dlp.
+- Sites may throttle or block heavy use; the plugin paces its calls, but a large number of sources
+  synced often will be noticed.
+
+## Building from source
+
+Requires the .NET 10 SDK.
 
 ```bash
-dotnet publish --configuration Release --output bin
+dotnet test
+dotnet publish Jellyfin.Plugin.VOD --configuration Release --output publish
 ```
 
-4. Place the resulting `Jellyfin.Plugin.VOD.dll` file in a folder called `plugins/` inside your Jellyfin installation / data directory.
+Copy `publish/Jellyfin.Plugin.VOD.dll` into a `VOD` folder under your Jellyfin `plugins/` directory
+and restart Jellyfin. Only that DLL is needed: SQLite and the Jellyfin assemblies come from the
+server.
 
-Repository: https://raw.githubusercontent.com/bakeneko/jellyfin-plugin-vod/main/manifest.json
+## License
+
+[GPL-3.0](LICENSE)
