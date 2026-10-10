@@ -32,13 +32,27 @@ nothing downloaded to disk.
 
 - **Jellyfin 12.1** or later.
 - **yt-dlp**, reachable from the Jellyfin server process. The official Jellyfin image does not
-  include it: the simplest route is the
-  [standalone Linux binary](https://github.com/yt-dlp/yt-dlp/releases/latest) placed in a mounted
-  volume, e.g. `/config/yt-dlp`, then set **yt-dlp path** accordingly. Keep it up to date: sites
-  change often, and an outdated yt-dlp is the most common cause of failures.
+  include it, nor Python: use the **standalone executable** from the
+  [yt-dlp releases](https://github.com/yt-dlp/yt-dlp/releases/latest) — `yt-dlp_linux` on x86-64,
+  `yt-dlp_linux_aarch64` on ARM64 — **not** the asset named plain `yt-dlp`, which is a Python
+  script and fails with `env: 'python3': No such file or directory`. For example:
+  ```bash
+  curl -L -o /path/to/jellyfin/config/yt-dlp \
+    https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux
+  chmod +x /path/to/jellyfin/config/yt-dlp
+  ```
+  then set **yt-dlp path** to where the container sees it, e.g. `/config/yt-dlp`. Keep it up to
+  date (`/config/yt-dlp -U`): sites change often, and an outdated yt-dlp is the most common cause
+  of failures.
 - **A JavaScript runtime for YouTube.** yt-dlp needs one to solve YouTube's challenges.
-  [Deno](https://github.com/denoland/deno/releases/latest) works well as a standalone binary,
-  e.g. `/config/deno`, with **JS runtime** set to `deno:/config/deno`.
+  [Deno](https://github.com/denoland/deno/releases/latest) ships as a single executable inside
+  `deno-x86_64-unknown-linux-gnu.zip` (or `deno-aarch64-unknown-linux-gnu.zip` on ARM64):
+  ```bash
+  curl -L -o /tmp/deno.zip \
+    https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip
+  unzip -o /tmp/deno.zip -d /path/to/jellyfin/config/
+  ```
+  then set **JS runtime** to `deno:/config/deno`.
 - **Optional — cookies.** A Netscape-format cookie file lets yt-dlp read age-restricted or
   members-only videos and helps against bot checks. A cookie file is as good as the account's
   password: **use a throwaway account**, never a personal one.
