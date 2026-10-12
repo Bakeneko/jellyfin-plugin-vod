@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -362,6 +363,97 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             Assert.NotNull(stored);
             Assert.Equal(2026, stored!.SeasonNumber);
             Assert.Equal(1004001, stored.EpisodeNumber);
+        }
+
+        [Fact]
+        public async Task ProbeSourceCoreAsync_UpsertsARepeatedLiveEntryOnce()
+        {
+            // A flat listing can return the same video twice — observed in production on a YouTube
+            // playlist. YoutubeAsync fetches detail per entry, so the pass then carries the same
+            // metadata twice. Reading the existing rows once, before the loop, the second copy
+            // found nothing in that snapshot and minted a second Guid for the same native id: two
+            // rows before the UNIQUE index of schema v7, and a UNIQUE violation that aborts the
+            // whole probe pass after it — so the broadcast is not published until the next pass.
+            var db = Substitute.For<IVodDatabase>();
+            const string sourceUrl = "https://www.youtube.com/playlist?list=PLdup";
+            db.GetVideosBySource(sourceUrl).Returns([]);
+            db.GetAllVideoIds().Returns([]);
+
+            var stored = new List<VideoRecord>();
+            db.When(d => d.UpsertVideo(Arg.Any<VideoRecord>()))
+              .Do(c => stored.Add(c.Arg<VideoRecord>()));
+
+            var meta = new VideoMetadata
+            {
+                Id = "vdc4kRhxEzY",
+                ExtractorKey = "Youtube",
+                Title = "A broadcast",
+                FullTitle = "A broadcast",
+                UploadDate = "20261012",
+                LiveStatus = LiveStatus.Live
+            };
+
+            await MakeService(db).ProbeSourceCoreAsync(
+                new PluginConfiguration { SeriesLibraryName = string.Empty },
+                new SourceDefinition { Url = sourceUrl, Mode = SourceMode.Series },
+                SourceType.YoutubePlaylist,
+                new SourceRecord { Url = sourceUrl, Name = "A playlist" },
+                new ProbeOutcome(true, [meta, meta]),
+                CancellationToken.None);
+
+            Assert.Single(stored);
+        }
+
+        [Fact]
+        public async Task ProbeSourceCoreAsync_DoesNotSpendADayRank_OnABroadcastItAlreadyNumbered()
+        {
+            // A pass re-finds a broadcast it numbered earlier and finds a second, new one. The
+            // tally is seeded from the stored rows, so advancing it again for the already-numbered
+            // one pushes the new broadcast a rank further than the sync would have given it — and
+            // nothing renumbers it afterwards, because the date-based branch never overwrites a
+            // number a row already carries.
+            var db = Substitute.For<IVodDatabase>();
+            const string sourceUrl = "https://www.youtube.com/@live/videos";
+            db.GetVideosBySource(sourceUrl).Returns(
+            [
+                new VideoRecord
+                {
+                    Id = Guid.NewGuid().ToString(),
+                    SourceUrl = sourceUrl,
+                    VideoUrl = sourceUrl,
+                    NativeId = "first",
+                    LiveStatus = LiveStatus.Live,
+                    PublishedAt = new DateTimeOffset(2026, 10, 12, 0, 0, 0, TimeSpan.Zero),
+                    SeasonNumber = 2026,
+                    EpisodeNumber = 1012001
+                }
+            ]);
+            db.GetAllVideoIds().Returns([]);
+
+            var saved = new List<VideoRecord>();
+            db.When(d => d.UpsertVideo(Arg.Any<VideoRecord>()))
+              .Do(c => saved.Add(c.Arg<VideoRecord>()));
+
+            VideoMetadata Live(string id, string title) => new VideoMetadata
+            {
+                Id = id,
+                ExtractorKey = "Youtube",
+                Title = title,
+                FullTitle = title,
+                UploadDate = "20261012",
+                LiveStatus = LiveStatus.Live
+            };
+
+            await MakeService(db).ProbeSourceCoreAsync(
+                new PluginConfiguration { SeriesLibraryName = string.Empty },
+                new SourceDefinition { Url = sourceUrl, Mode = SourceMode.Series },
+                SourceType.YoutubeChannel,
+                new SourceRecord { Url = sourceUrl, Name = "A channel" },
+                new ProbeOutcome(true, [Live("first", "Still airing"), Live("second", "A new one")]),
+                CancellationToken.None);
+
+            Assert.Equal(1012001, saved[0].EpisodeNumber);
+            Assert.Equal(1012002, saved[1].EpisodeNumber);
         }
 
         [Fact]

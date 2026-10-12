@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.VOD.Configuration;
@@ -476,6 +477,164 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 CancellationToken.None);
 
             Assert.Equal(2, created);
+        }
+
+        [Fact]
+        public void ProcessEntries_CountsARepeatedEntryOnce_AndUpsertsItOnce()
+        {
+            // A flat listing that returns the same video twice. Before the fix this created two
+            // rows, each with its own Guid, and every later sync of the source threw on the
+            // native-id map build.
+            var (entry, meta) = EntryWithMeta("dup");
+
+            var entries = new List<PlaylistEntry> { entry, entry };
+            var metadataMap = new Dictionary<string, VideoMetadata>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["dup"] = meta,
+            };
+            var source = new SourceDefinition { Url = SourceUrl };
+
+            var created = _service.ProcessEntries(
+                source, entries, metadataMap, existingVideos: [],
+                seriesName: string.Empty,
+                syncStart: DateTimeOffset.UtcNow,
+                CancellationToken.None);
+
+            Assert.Equal(1, created);
+            _db.Received(1).UpsertVideo(Arg.Any<VideoRecord>());
+        }
+
+        [Fact]
+        public void ProcessEntries_DoesNotLetARepeatedEntryConsumeTwoRanksOfItsDay()
+        {
+            // Two distinct videos published the same day, the first one repeated by the listing.
+            // The day's ranks must be 1 and 2 — not 1 and 3, which is what a repeated entry
+            // produced while it was ranked twice.
+            var first = new PlaylistEntry { Id = "aaa", VideoUrl = "https://example.test/v/aaa" };
+            var second = new PlaylistEntry { Id = "bbb", VideoUrl = "https://example.test/v/bbb" };
+            var metadataMap = new Dictionary<string, VideoMetadata>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["aaa"] = new VideoMetadata { Id = "aaa", Title = "First",  UploadDate = "20260705" },
+                ["bbb"] = new VideoMetadata { Id = "bbb", Title = "Second", UploadDate = "20260705" },
+            };
+
+            var saved = new List<VideoRecord>();
+            _db.When(d => d.UpsertVideo(Arg.Any<VideoRecord>()))
+               .Do(call => saved.Add(call.Arg<VideoRecord>()));
+
+            _service.ProcessEntries(
+                new SourceDefinition { Url = SourceUrl },
+                [first, first, second],
+                metadataMap,
+                existingVideos: [],
+                seriesName: string.Empty,
+                syncStart: DateTimeOffset.UtcNow,
+                CancellationToken.None);
+
+            // (month * 100 + day) * 1000 + rankOfDay, with month = 7 and day = 5 → 705_001 and 705_002.
+            Assert.Equal(new int?[] { 705_001, 705_002 }, saved.Select(v => v.EpisodeNumber));
+        }
+
+        [Fact]
+        public void ProcessEntries_DoesNotThrow_WhenTheDatabaseAlreadyHoldsTwoRowsForOneNativeId()
+        {
+            // The state of a database written by a pre-fix build. Migration v7 cleans it up at
+            // startup, but ProcessEntries must not be the thing that crashes if it ever sees it:
+            // throwing here takes down the whole source, which is the failure being removed.
+            var (entry, meta) = EntryWithMeta("dup");
+            var metadataMap = new Dictionary<string, VideoMetadata>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["dup"] = meta,
+            };
+            var existingVideos = new List<VideoRecord> { StoredVideo("dup"), StoredVideo("dup") };
+
+            var created = _service.ProcessEntries(
+                new SourceDefinition { Url = SourceUrl },
+                [entry],
+                metadataMap,
+                existingVideos,
+                seriesName: string.Empty,
+                syncStart: DateTimeOffset.UtcNow,
+                CancellationToken.None);
+
+            Assert.Equal(0, created);
+        }
+
+        [Fact]
+        public void ProcessEntries_MatchesTheStoredRowOnTheIdItWrote_NotTheListingId()
+        {
+            // The row's native_id is written from meta.Id, but the lookup used entry.Id. Those are
+            // equal on every platform today — the Arte id derived from the listing URL is the id a
+            // full fetch reports, deliberately so — and if that ever stopped holding, the entry
+            // would be taken for new: a second row for the same video, which the UNIQUE index of
+            // schema v7 now refuses, failing that source's every sync from then on.
+            var stored = StoredVideo("real");
+            stored.PublishedAt = new DateTimeOffset(2026, 10, 12, 0, 0, 0, TimeSpan.Zero);
+            stored.SeasonNumber = 2026;
+            stored.EpisodeNumber = 1012001;
+
+            var diverging = new PlaylistEntry { Id = "derived", VideoUrl = "https://example.test/v/real" };
+            var fresh = new PlaylistEntry { Id = "new", VideoUrl = "https://example.test/v/new" };
+            var metadataMap = new Dictionary<string, VideoMetadata>(StringComparer.OrdinalIgnoreCase)
+            {
+                // The listing calls it "derived"; the full fetch calls it "real".
+                ["derived"] = new VideoMetadata { Id = "real", Title = "Known", UploadDate = "20261012" },
+                ["new"] = new VideoMetadata { Id = "new", Title = "New", UploadDate = "20261012" },
+            };
+
+            var saved = new List<VideoRecord>();
+            _db.When(d => d.UpsertVideo(Arg.Any<VideoRecord>()))
+               .Do(call => saved.Add(call.Arg<VideoRecord>()));
+
+            var created = _service.ProcessEntries(
+                new SourceDefinition { Url = SourceUrl },
+                [diverging, fresh],
+                metadataMap,
+                new List<VideoRecord> { stored },
+                seriesName: string.Empty,
+                syncStart: DateTimeOffset.UtcNow,
+                CancellationToken.None);
+
+            // Only the genuinely new video counts as created, the known row keeps its number, and
+            // the day's rank is not spent twice on the same video.
+            Assert.Equal(1, created);
+            Assert.Equal(1012001, saved[0].EpisodeNumber);
+            Assert.Equal(1012002, saved[1].EpisodeNumber);
+        }
+
+        [Fact]
+        public void ProcessEntries_WritesOneRow_WhenTwoListingEntriesResolveToTheSameStoredId()
+        {
+            // The pass deduplicates on the listing id, but the row is keyed on the metadata's id.
+            // Admit that those can differ — which is the whole premise of matching on meta.Id —
+            // and two distinct entries can resolve to one stored id: both would look new, both
+            // would mint a Guid for the same native_id, and the second insert would hit the UNIQUE
+            // index of schema v7 and fail that source's every sync from then on. Exactly the
+            // bricked source this work exists to abolish.
+            var firstEntry = new PlaylistEntry { Id = "listing-a", VideoUrl = "https://example.test/v/a" };
+            var secondEntry = new PlaylistEntry { Id = "listing-b", VideoUrl = "https://example.test/v/b" };
+            var metadataMap = new Dictionary<string, VideoMetadata>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["listing-a"] = new VideoMetadata { Id = "same", Title = "One", UploadDate = "20261012" },
+                ["listing-b"] = new VideoMetadata { Id = "same", Title = "One again", UploadDate = "20261012" },
+            };
+
+            var saved = new List<VideoRecord>();
+            _db.When(d => d.UpsertVideo(Arg.Any<VideoRecord>()))
+               .Do(call => saved.Add(call.Arg<VideoRecord>()));
+
+            var created = _service.ProcessEntries(
+                new SourceDefinition { Url = SourceUrl },
+                [firstEntry, secondEntry],
+                metadataMap,
+                existingVideos: [],
+                seriesName: string.Empty,
+                syncStart: DateTimeOffset.UtcNow,
+                CancellationToken.None);
+
+            Assert.Equal(1, created);
+            Assert.Single(saved);
+            Assert.Equal("same", saved[0].NativeId);
         }
     }
 

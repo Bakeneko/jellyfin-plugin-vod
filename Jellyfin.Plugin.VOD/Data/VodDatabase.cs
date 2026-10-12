@@ -45,7 +45,7 @@ namespace Jellyfin.Plugin.VOD.Data
         /// Schema version this build expects, tracked in SQLite's <c>user_version</c>.
         /// Bump it and add the matching case to <see cref="Migrate"/> whenever the schema changes.
         /// </summary>
-        private const int SchemaVersion = 6;
+        private const int SchemaVersion = 7;
 
         /// <inheritdoc />
         public void EnsureCreated()
@@ -56,10 +56,23 @@ namespace Jellyfin.Plugin.VOD.Data
                 if (from < SchemaVersion)
                 {
                     using var txn = Connection.BeginTransaction();
-                    for (var v = from + 1; v <= SchemaVersion; v++)
-                        Migrate(v, txn);
+                    try
+                    {
+                        for (var v = from + 1; v <= SchemaVersion; v++)
+                            Migrate(v, txn);
 
-                    txn.Commit();
+                        txn.Commit();
+                    }
+                    catch (SqliteException)
+                    {
+                        // Disposing the transaction rolls it back on its own; this is here to say
+                        // so. A step logs what it did as it does it — how many rows it deleted,
+                        // for instance — and those lines are only the truth about the statements
+                        // that ran. Whether any of it stuck is this line, or the one below it.
+                        LogMigrationRolledBack(from);
+                        throw;
+                    }
+
                     LogSchemaMigrated(from, SchemaVersion);
                 }
             }
@@ -74,6 +87,8 @@ namespace Jellyfin.Plugin.VOD.Data
         /// Each script stamps its own <c>user_version</c> as its last statement, so the recorded
         /// version cannot drift from the schema it describes.
         /// </summary>
+        /// <param name="version">The version this step brings the schema to.</param>
+        /// <param name="txn">The transaction every step of a migration shares.</param>
         private void Migrate(int version, SqliteTransaction txn)
         {
             using var cmd = Connection.CreateCommand();
@@ -197,6 +212,54 @@ namespace Jellyfin.Plugin.VOD.Data
                         ALTER TABLE videos DROP COLUMN is_live;
 
                         PRAGMA user_version = 6;
+                        """;
+                    break;
+
+                case 7:
+                    // ProcessEntries built its native-id map before its loop and never updated it,
+                    // so a listing that returned the same video twice created two rows, one Guid
+                    // each — observed in production with identical first_seen_at values. Every
+                    // later sync of that source then threw on the map build, permanently.
+                    // The rows are deleted oldest-wins (rowid breaks a tie, which the observed
+                    // case needs), then the v1 index is rebuilt as UNIQUE under the same name, so
+                    // the defect can no longer be silent. NULL native ids are left alone: SQLite
+                    // treats NULLs as distinct in a UNIQUE index, and they are not duplicates of
+                    // one another.
+                    // The DELETE runs on its own command rather than in the script below, for its
+                    // affected-row count: this is the first migration of a released build that
+                    // destroys rows, and a user upgrading has no other way to learn what it took.
+                    using (var dedupe = Connection.CreateCommand())
+                    {
+                        dedupe.Transaction = txn;
+                        dedupe.CommandText = """
+                            DELETE FROM videos
+                            WHERE native_id IS NOT NULL
+                              AND rowid NOT IN (
+                                  SELECT rowid FROM (
+                                      SELECT rowid,
+                                             ROW_NUMBER() OVER (
+                                                 PARTITION BY source_url, native_id
+                                                 ORDER BY COALESCE(first_seen_at, '9999') ASC, rowid ASC
+                                             ) AS rank
+                                      FROM videos
+                                      WHERE native_id IS NOT NULL
+                                  )
+                                  WHERE rank = 1
+                              );
+                            """;
+
+                        var dropped = dedupe.ExecuteNonQuery();
+                        if (dropped > 0)
+                        {
+                            LogDroppedDuplicateVideos(dropped);
+                        }
+                    }
+
+                    cmd.CommandText = """
+                        DROP INDEX IF EXISTS idx_videos_native_id;
+                        CREATE UNIQUE INDEX idx_videos_native_id ON videos(source_url, native_id);
+
+                        PRAGMA user_version = 7;
                         """;
                     break;
 
@@ -702,5 +765,15 @@ namespace Jellyfin.Plugin.VOD.Data
         [LoggerMessage(EventId = 101, Level = LogLevel.Information,
             Message = "VOD database migrated from schema v{FromVersion} to v{ToVersion}")]
         private partial void LogSchemaMigrated(int fromVersion, int toVersion);
+
+        [LoggerMessage(EventId = 102, Level = LogLevel.Warning,
+            Message = "Migration v7 deleted {Dropped} duplicate video row(s): a listing had "
+                + "returned the same video twice and each repeat had been stored separately")]
+        private partial void LogDroppedDuplicateVideos(int dropped);
+
+        [LoggerMessage(EventId = 103, Level = LogLevel.Error,
+            Message = "VOD database migration from schema v{FromVersion} rolled back: the schema "
+                + "and its rows are unchanged, and the next start will try again")]
+        private partial void LogMigrationRolledBack(int fromVersion);
     }
 }

@@ -5,6 +5,7 @@ using Jellyfin.Plugin.VOD.Data;
 using Jellyfin.Plugin.VOD.Data.Models;
 using Jellyfin.Plugin.VOD.Services.Sync;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -499,15 +500,330 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
             Assert.Equal(LiveStatus.NotLive, corrupted.LiveStatus);
         }
 
+        /// <summary>
+        /// Migration v7 on a v6 database that holds what a pre-fix sync wrote: two rows for one
+        /// native id. The oldest row survives, the index becomes UNIQUE, and a third row for the
+        /// same pair is then refused instead of silently stored.
+        /// </summary>
         [Fact]
-        public void EnsureCreated_LeavesTheSchemaAtVersion6()
+        public void EnsureCreated_MigrationV7_KeepsOneRowPerNativeIdAndRefusesNewDuplicates()
+        {
+            var path = Path.GetTempFileName();
+            try
+            {
+                using (var seed = new SqliteConnection($"Data Source={path}"))
+                {
+                    seed.Open();
+                    using var cmd = seed.CreateCommand();
+                    cmd.CommandText = """
+                        CREATE TABLE sources (
+                            url         TEXT PRIMARY KEY,
+                            name        TEXT,
+                            video_count INTEGER NOT NULL DEFAULT 0
+                        );
+                        CREATE TABLE videos (
+                            id               TEXT PRIMARY KEY,
+                            source_url       TEXT NOT NULL REFERENCES sources(url),
+                            video_url        TEXT NOT NULL,
+                            synced_at        TEXT NOT NULL,
+                            native_id        TEXT,
+                            first_seen_at    TEXT,
+                            live_status      TEXT NOT NULL DEFAULT 'NotLive'
+                        );
+                        CREATE INDEX idx_videos_native_id ON videos(source_url, native_id);
+
+                        INSERT INTO sources (url) VALUES ('https://example.test/a');
+                        INSERT INTO sources (url) VALUES ('https://example.test/b');
+
+                        -- Two rows for one (source, native id), same first_seen_at: the lower
+                        -- rowid wins. Three rows for another, with distinct dates: the oldest wins.
+                        INSERT INTO videos (id, source_url, video_url, synced_at, native_id, first_seen_at)
+                        VALUES ('keep-tie', 'https://example.test/a', 'https://example.test/v/dup',
+                                '2026-10-12T00:00:00+00:00', 'dup', '2026-10-11T15:58:02.8248783+00:00'),
+                               ('drop-tie', 'https://example.test/a', 'https://example.test/v/dup',
+                                '2026-10-12T00:00:00+00:00', 'dup', '2026-10-11T15:58:02.8248783+00:00'),
+                               ('drop-new', 'https://example.test/a', 'https://example.test/v/tri',
+                                '2026-10-12T00:00:00+00:00', 'tri', '2026-10-09T00:00:00+00:00'),
+                               ('keep-old', 'https://example.test/a', 'https://example.test/v/tri',
+                                '2026-10-12T00:00:00+00:00', 'tri', '2026-10-01T00:00:00+00:00'),
+                               ('drop-null', 'https://example.test/a', 'https://example.test/v/tri',
+                                '2026-10-12T00:00:00+00:00', 'tri', NULL),
+                               -- The same video in a second source: a different pair, both survive.
+                               ('other-source', 'https://example.test/b', 'https://example.test/v/dup',
+                                '2026-10-12T00:00:00+00:00', 'dup', '2026-10-11T00:00:00+00:00'),
+                               -- Rows without a native id are not duplicates of each other.
+                               ('null-id-1', 'https://example.test/a', 'https://example.test/v/n1',
+                                '2026-10-12T00:00:00+00:00', NULL, '2026-10-01T00:00:00+00:00'),
+                               ('null-id-2', 'https://example.test/a', 'https://example.test/v/n2',
+                                '2026-10-12T00:00:00+00:00', NULL, '2026-10-02T00:00:00+00:00');
+
+                        PRAGMA user_version = 6;
+                        """;
+                    cmd.ExecuteNonQuery();
+                }
+
+                using var upgraded = new VodDatabase(path, NullLogger<VodDatabase>.Instance);
+                upgraded.EnsureCreated();
+
+                using var conn = new SqliteConnection($"Data Source={path}");
+                conn.Open();
+
+                using var version = conn.CreateCommand();
+                version.CommandText = "PRAGMA user_version";
+                Assert.Equal(7L, (long)version.ExecuteScalar()!);
+
+                using var survivors = conn.CreateCommand();
+                survivors.CommandText = "SELECT id FROM videos ORDER BY id";
+                var ids = new List<string>();
+                using (var reader = survivors.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        ids.Add(reader.GetString(0));
+                    }
+                }
+
+                Assert.Equal(
+                    ["keep-old", "keep-tie", "null-id-1", "null-id-2", "other-source"],
+                    ids);
+
+                // The tie between keep-tie and drop-tie is broken by `rowid ASC`, and the
+                // survivor above proves the ORDER BY's first key: drop-tie sorts before
+                // keep-tie alphabetically, so the survivor is not merely the first by id.
+                // The rowid key itself is NOT pinned here and cannot be: SQLite resolves a
+                // ROW_NUMBER() tie in scan order, which agrees with rowid, so the assertion
+                // would hold with the clause removed. It stays in the migration as an explicit
+                // determinism guarantee, verified by construction rather than by this test.
+
+                using var unique = conn.CreateCommand();
+                unique.CommandText =
+                    "SELECT \"unique\" FROM pragma_index_list('videos') WHERE name = 'idx_videos_native_id'";
+                Assert.Equal(1L, (long)unique.ExecuteScalar()!);
+
+                using var insert = conn.CreateCommand();
+                insert.CommandText = """
+                    INSERT INTO videos (id, source_url, video_url, synced_at, native_id)
+                    VALUES ('late-duplicate', 'https://example.test/a', 'https://example.test/v/dup',
+                            '2026-10-13T00:00:00+00:00', 'dup');
+                    """;
+                var ex = Record.Exception(() => insert.ExecuteNonQuery());
+
+                Assert.IsType<SqliteException>(ex);
+                Assert.Contains("UNIQUE constraint failed", ex.Message, StringComparison.Ordinal);
+            }
+            finally
+            {
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+        }
+
+        /// <summary>
+        /// A destructive migration on a published plugin has to say what it destroyed: without a
+        /// count in the log, a user upgrading cannot tell afterwards whether rows were dropped,
+        /// nor how many.
+        /// </summary>
+        [Fact]
+        public void EnsureCreated_MigrationV7_LogsHowManyDuplicateRowsItDropped()
+        {
+            var path = Path.GetTempFileName();
+            var logger = new RecordingLogger<VodDatabase>();
+            try
+            {
+                using (var seed = new SqliteConnection($"Data Source={path}"))
+                {
+                    seed.Open();
+                    using var cmd = seed.CreateCommand();
+                    cmd.CommandText = """
+                        CREATE TABLE sources (
+                            url         TEXT PRIMARY KEY,
+                            name        TEXT,
+                            video_count INTEGER NOT NULL DEFAULT 0
+                        );
+                        CREATE TABLE videos (
+                            id            TEXT PRIMARY KEY,
+                            source_url    TEXT NOT NULL REFERENCES sources(url),
+                            video_url     TEXT NOT NULL,
+                            synced_at     TEXT NOT NULL,
+                            native_id     TEXT,
+                            first_seen_at TEXT,
+                            live_status   TEXT NOT NULL DEFAULT 'NotLive'
+                        );
+                        INSERT INTO sources (url) VALUES ('https://example.test/a');
+                        INSERT INTO videos (id, source_url, video_url, synced_at, native_id, first_seen_at)
+                        VALUES ('keep', 'https://example.test/a', 'https://example.test/v/dup',
+                                '2026-10-12T00:00:00+00:00', 'dup', '2026-10-01T00:00:00+00:00'),
+                               ('drop', 'https://example.test/a', 'https://example.test/v/dup',
+                                '2026-10-12T00:00:00+00:00', 'dup', '2026-10-02T00:00:00+00:00');
+                        PRAGMA user_version = 6;
+                        """;
+                    cmd.ExecuteNonQuery();
+                }
+
+                using var upgraded = new VodDatabase(path, logger);
+                upgraded.EnsureCreated();
+
+                Assert.Contains(
+                    logger.Messages,
+                    m => m.Contains("deleted 1 duplicate", StringComparison.Ordinal));
+            }
+            finally
+            {
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+        }
+
+        /// <summary>
+        /// A migration step that fails after the deletion: the rows and the version stamp come
+        /// back, and the log says so. The deletion line is not retracted — it reports what the
+        /// statement did — so the rollback line is what tells a reader it did not stick.
+        /// </summary>
+        [Fact]
+        public void EnsureCreated_LogsTheRollback_WhenAMigrationStepFailsAfterDeletingRows()
+        {
+            var path = Path.GetTempFileName();
+            var logger = new RecordingLogger<VodDatabase>();
+            try
+            {
+                using (var seed = new SqliteConnection($"Data Source={path}"))
+                {
+                    seed.Open();
+                    using var cmd = seed.CreateCommand();
+                    cmd.CommandText = """
+                        CREATE TABLE sources (
+                            url         TEXT PRIMARY KEY,
+                            name        TEXT,
+                            video_count INTEGER NOT NULL DEFAULT 0
+                        );
+                        CREATE TABLE videos (
+                            id            TEXT PRIMARY KEY,
+                            source_url    TEXT NOT NULL REFERENCES sources(url),
+                            video_url     TEXT NOT NULL,
+                            synced_at     TEXT NOT NULL,
+                            native_id     TEXT,
+                            first_seen_at TEXT,
+                            live_status   TEXT NOT NULL DEFAULT 'NotLive'
+                        );
+
+                        -- A table holding the name migration v7 gives its index. DROP INDEX IF
+                        -- EXISTS tolerates it, CREATE UNIQUE INDEX then fails — so the step fails
+                        -- after its DELETE has already run.
+                        CREATE TABLE idx_videos_native_id (x);
+
+                        INSERT INTO sources (url) VALUES ('https://example.test/a');
+                        INSERT INTO videos (id, source_url, video_url, synced_at, native_id, first_seen_at)
+                        VALUES ('keep', 'https://example.test/a', 'https://example.test/v/dup',
+                                '2026-10-12T00:00:00+00:00', 'dup', '2026-10-01T00:00:00+00:00'),
+                               ('drop', 'https://example.test/a', 'https://example.test/v/dup',
+                                '2026-10-12T00:00:00+00:00', 'dup', '2026-10-02T00:00:00+00:00');
+                        PRAGMA user_version = 6;
+                        """;
+                    cmd.ExecuteNonQuery();
+                }
+
+                using var upgraded = new VodDatabase(path, logger);
+
+                Assert.Throws<SqliteException>(upgraded.EnsureCreated);
+
+                Assert.Contains(
+                    logger.Messages,
+                    m => m.Contains("rolled back", StringComparison.Ordinal));
+                Assert.DoesNotContain(
+                    logger.Messages,
+                    m => m.Contains("migrated from schema", StringComparison.Ordinal));
+
+                using var conn = new SqliteConnection($"Data Source={path}");
+                conn.Open();
+
+                using var version = conn.CreateCommand();
+                version.CommandText = "PRAGMA user_version";
+                Assert.Equal(6L, (long)version.ExecuteScalar()!);
+
+                using var rows = conn.CreateCommand();
+                rows.CommandText = "SELECT COUNT(*) FROM videos";
+                Assert.Equal(2L, (long)rows.ExecuteScalar()!);
+            }
+            finally
+            {
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+        }
+
+        /// <summary>
+        /// A migration that deletes rows is expected to report how many, and the only way to read
+        /// that back in a test is to capture what the logger was handed.
+        /// </summary>
+        private sealed class RecordingLogger<T> : ILogger<T>
+        {
+            public List<string> Messages { get; } = [];
+
+            public IDisposable BeginScope<TState>(TState state)
+                where TState : notnull => NullScope.Instance;
+
+            public bool IsEnabled(LogLevel logLevel) => true;
+
+            public void Log<TState>(
+                LogLevel logLevel,
+                EventId eventId,
+                TState state,
+                Exception? exception,
+                Func<TState, Exception?, string> formatter)
+            {
+                ArgumentNullException.ThrowIfNull(formatter);
+                Messages.Add(formatter(state, exception));
+            }
+
+            private sealed class NullScope : IDisposable
+            {
+                internal static readonly NullScope Instance = new();
+
+                public void Dispose()
+                {
+                }
+            }
+        }
+
+        [Fact]
+        public void EnsureCreated_LeavesTheSchemaAtVersion7()
         {
             using var conn = new SqliteConnection($"Data Source={_dbPath}");
             conn.Open();
             using var cmd = conn.CreateCommand();
             cmd.CommandText = "PRAGMA user_version";
 
-            Assert.Equal(6L, (long)cmd.ExecuteScalar()!);
+            Assert.Equal(7L, (long)cmd.ExecuteScalar()!);
+        }
+
+        /// <summary>
+        /// The UNIQUE index on <c>(source_url, native_id)</c> on a database created from scratch.
+        /// The migrated path is covered by
+        /// <see cref="EnsureCreated_MigrationV7_KeepsOneRowPerNativeIdAndRefusesNewDuplicates"/>,
+        /// and the two paths are the ones that drift: a change made to a migration script but
+        /// forgotten in the CREATE statements only shows up on one of them.
+        /// </summary>
+        [Fact]
+        public void EnsureCreated_GivesAFreshDatabaseTheUniqueNativeIdIndex()
+        {
+            using var conn = new SqliteConnection($"Data Source={_dbPath}");
+            conn.Open();
+
+            using var unique = conn.CreateCommand();
+            unique.CommandText =
+                "SELECT \"unique\" FROM pragma_index_list('videos') WHERE name = 'idx_videos_native_id'";
+            Assert.Equal(1L, (long)unique.ExecuteScalar()!);
+
+            using var columns = conn.CreateCommand();
+            columns.CommandText =
+                "SELECT GROUP_CONCAT(name) FROM pragma_index_info('idx_videos_native_id')";
+            Assert.Equal("source_url,native_id", columns.ExecuteScalar());
         }
 
         [Fact]
@@ -554,6 +870,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                             tags           TEXT,
                             categories     TEXT,
                             channels       TEXT,
+                            native_id      TEXT,
                             is_live        INTEGER NOT NULL DEFAULT 0
                         );
                         INSERT INTO videos (id, source_url, video_url, synced_at)
@@ -572,7 +889,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
 
                 using var version = conn.CreateCommand();
                 version.CommandText = "PRAGMA user_version";
-                Assert.Equal(6L, (long)version.ExecuteScalar()!);
+                Assert.Equal(7L, (long)version.ExecuteScalar()!);
 
                 using var backfilled = conn.CreateCommand();
                 backfilled.CommandText = "SELECT first_seen_at FROM videos WHERE id = 'legacy'";
@@ -687,6 +1004,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                             subtitle_langs TEXT,
                             tags           TEXT,
                             categories     TEXT,
+                            native_id      TEXT,
                             is_live        INTEGER NOT NULL DEFAULT 0
                         );
                         PRAGMA user_version = 1;
@@ -702,7 +1020,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
 
                 using var version = conn.CreateCommand();
                 version.CommandText = "PRAGMA user_version";
-                Assert.Equal(6L, (long)version.ExecuteScalar()!);
+                Assert.Equal(7L, (long)version.ExecuteScalar()!);
 
                 using var columns = conn.CreateCommand();
                 columns.CommandText = "SELECT name FROM pragma_table_info('videos') WHERE name = 'extras'";
@@ -867,6 +1185,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                             categories       TEXT,
                             channels         TEXT,
                             first_seen_at    TEXT,
+                            native_id        TEXT,
                             is_live          INTEGER NOT NULL DEFAULT 0
                         );
                         INSERT INTO sources (url, name) VALUES ('__debug__', 'Debug (internal)');
@@ -887,7 +1206,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                 conn.Open();
                 using var version = conn.CreateCommand();
                 version.CommandText = "PRAGMA user_version";
-                Assert.Equal(6L, (long)version.ExecuteScalar()!);
+                Assert.Equal(7L, (long)version.ExecuteScalar()!);
             }
             finally
             {
@@ -902,7 +1221,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
         /// C3: a v5 database that has the <c>is_live</c> column must gain <c>live_status</c> and
         /// lose <c>is_live</c> after migration v6. This covers the upgrade path every existing
         /// installation takes; a fresh database created from scratch is covered by
-        /// <see cref="EnsureCreated_LeavesTheSchemaAtVersion6"/>.
+        /// <see cref="EnsureCreated_LeavesTheSchemaAtVersion7"/>.
         /// </summary>
         [Fact]
         public void EnsureCreated_MigrationV6_ReplacesIsLiveColumnWithLiveStatus()
@@ -956,7 +1275,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
 
                 using var version = conn.CreateCommand();
                 version.CommandText = "PRAGMA user_version";
-                Assert.Equal(6L, (long)version.ExecuteScalar()!);
+                Assert.Equal(7L, (long)version.ExecuteScalar()!);
 
                 // live_status must be present (default 'NotLive' applied to the pre-existing row).
                 using var liveStatus = conn.CreateCommand();
@@ -1090,6 +1409,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                             categories     TEXT,
                             channels       TEXT,
                             first_seen_at  TEXT,
+                            native_id      TEXT,
                             is_live        INTEGER NOT NULL DEFAULT 0
                         );
                         PRAGMA user_version = 3;

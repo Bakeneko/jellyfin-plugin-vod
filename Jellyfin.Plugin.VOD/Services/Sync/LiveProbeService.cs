@@ -253,6 +253,15 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             // probe may be the first pass ever to write it, for a source whose every sync failed.
             _db.UpsertSource(sourceRecord);
 
+            // One record per video, whatever the listing repeated. A flat listing can return the
+            // same id twice — observed in production — and YoutubeAsync fetches detail per entry,
+            // so the pass carries that video's metadata twice. Since the existing rows are read
+            // once, before the loop, the second copy found nothing in that snapshot: it minted a
+            // second Guid for the same native id and took a second rank of its day. Under the
+            // UNIQUE index of schema v7 it now fails the whole pass instead, so the broadcast
+            // would wait for the next one. Same defect, same fix as the sync's DeduplicateEntries.
+            var found = DeduplicateFound(outcome.Found);
+
             // Build or update a record for every video the pass found broadcasting.
             var syncedAt = DateTimeOffset.UtcNow;
             var existingVideos = _db.GetVideosBySource(source.Url);
@@ -261,7 +270,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             // handed out, so two broadcasts found in the same pass cannot both take the same rank.
             var numberedPerDay = SyncService.NumberedPerDay(existingVideos);
 
-            foreach (var meta in outcome.Found)
+            foreach (var meta in found)
             {
                 var existing = meta.Id is { Length: > 0 }
                     ? FindExistingByNativeId(existingVideos, meta.Id)
@@ -285,11 +294,16 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 // The sync's own rule, not a second one. An unnumbered episode is filed under
                 // Specials and renumbered by the next sync, which loses the watch state: an
                 // episode's user-data key is built from its season and episode numbers.
-                SyncService.AssignNumbers(
-                    record,
-                    meta,
-                    effectiveTitle,
-                    SyncService.NextDateBasedNumber(numberedPerDay, publishedAt));
+                // The date-based number is only asked for when this row has none: computing it
+                // advances the day's tally as a side effect, so spending a rank on a broadcast
+                // this source already numbered pushes the next new one past the number the sync
+                // would have given it — and no later pass corrects that, because the date-based
+                // branch of AssignNumbers never overwrites a number a row already carries.
+                var dateBased = record.SeasonNumber.HasValue
+                    ? null
+                    : SyncService.NextDateBasedNumber(numberedPerDay, publishedAt);
+
+                SyncService.AssignNumbers(record, meta, effectiveTitle, dateBased);
 
                 _db.UpsertVideo(record);
             }
@@ -314,7 +328,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 // (measured 2026-10-08), and refreshing the old row by asking the channel root kept
                 // it "live" for as long as the channel aired anything.
                 var current = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var m in outcome.Found)
+                foreach (var m in found)
                     current.Add(m.Id);
 
                 // Checked once, before the first delete: the reconcile below is what removes the
@@ -334,7 +348,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             else
             {
                 var foundIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var m in outcome.Found)
+                foreach (var m in found)
                     foundIds.Add(m.Id);
 
                 foreach (var video in _db.GetVideosBySource(source.Url))
@@ -426,6 +440,27 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// </remarks>
         internal static bool IsTwitchStrategy(SourceType type)
             => type is SourceType.TwitchChannelLive or SourceType.TwitchVideos;
+
+        /// <summary>
+        /// The metadata a pass found, with at most one entry per native id — the first occurrence.
+        /// </summary>
+        /// <param name="found">What the probe strategy reported as broadcasting.</param>
+        /// <returns>The same metadata, with later repeats of an id removed.</returns>
+        private static List<VideoMetadata> DeduplicateFound(
+            IReadOnlyList<VideoMetadata> found)
+        {
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var unique = new List<VideoMetadata>(found.Count);
+            foreach (var meta in found)
+            {
+                if (seen.Add(meta.Id))
+                {
+                    unique.Add(meta);
+                }
+            }
+
+            return unique;
+        }
 
         private static VideoRecord? FindExistingByNativeId(
             IReadOnlyList<VideoRecord> existingVideos, string nativeId)

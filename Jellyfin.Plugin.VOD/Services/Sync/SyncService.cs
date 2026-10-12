@@ -437,6 +437,106 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         }
 
         /// <summary>
+        /// The entries of a listing with at most one entry per native id, keeping the first
+        /// occurrence so the listing's order survives.
+        /// </summary>
+        /// <param name="entries">The flat-playlist entries returned by yt-dlp.</param>
+        /// <param name="metadataMap">Full metadata keyed by the id the listing reported.</param>
+        /// <returns>The entries, with later repeats of a stored id removed.</returns>
+        /// <remarks>
+        /// A listing can repeat a video: a YouTube playlist has been observed returning the same
+        /// id twice in one flat listing. Each repeat used to create its own row — same native id,
+        /// a fresh <c>Guid</c> each time — and the next sync of that source then threw on the
+        /// native-id map, permanently.
+        /// <para>
+        /// The key is the id that will be <b>stored</b> — the metadata's, falling back to the
+        /// listing's when no metadata was fetched — and not the listing's own. The two are equal
+        /// on every platform supported today, but <see cref="ExistingFor"/> exists precisely
+        /// because that is an invariant rather than a guarantee, and keying here on the listing id
+        /// would let two entries resolving to one stored id both look new: two <c>Guid</c>s for
+        /// one native id, the second insert refused by the UNIQUE index of schema v7, and the
+        /// source failing every sync from then on.
+        /// </para>
+        /// <para>
+        /// The comparison is case-insensitive, which is stricter than the database's (binary)
+        /// UNIQUE index: anything this method lets through is something the index also accepts.
+        /// </para>
+        /// </remarks>
+        internal static IReadOnlyList<PlaylistEntry> DeduplicateEntries(
+            IReadOnlyList<PlaylistEntry> entries,
+            Dictionary<string, VideoMetadata> metadataMap)
+        {
+            ArgumentNullException.ThrowIfNull(entries);
+            ArgumentNullException.ThrowIfNull(metadataMap);
+
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var unique = new List<PlaylistEntry>(entries.Count);
+            foreach (var entry in entries)
+            {
+                var storedId = metadataMap.TryGetValue(entry.Id, out var meta) ? meta.Id : entry.Id;
+                if (seen.Add(storedId))
+                {
+                    unique.Add(entry);
+                }
+            }
+
+            return unique;
+        }
+
+        /// <summary>
+        /// Every stored video of a source keyed by native id, keeping the first row of each id.
+        /// </summary>
+        /// <param name="existingVideos">Every video the database already holds for the source.</param>
+        /// <returns>The map used to tell an update from a creation.</returns>
+        /// <remarks>
+        /// Deliberately not <c>ToDictionary</c>: a database written before the UNIQUE index of
+        /// migration v7 can hold two rows for one native id, and <c>ToDictionary</c> threw
+        /// <see cref="ArgumentException"/> on them, which failed the source's sync for good. The
+        /// duplicates themselves are removed by that migration and prevented by the index; this
+        /// method only makes sure they can never again cost a whole source.
+        /// </remarks>
+        internal static Dictionary<string, VideoRecord> BuildNativeIdMap(
+            IReadOnlyList<VideoRecord> existingVideos)
+        {
+            ArgumentNullException.ThrowIfNull(existingVideos);
+
+            var map = new Dictionary<string, VideoRecord>(StringComparer.OrdinalIgnoreCase);
+            foreach (var video in existingVideos)
+            {
+                if (video.NativeId is { } nativeId)
+                {
+                    map.TryAdd(nativeId, video);
+                }
+            }
+
+            return map;
+        }
+
+        /// <summary>
+        /// The stored row an entry stands for, matched on the id that was written to it.
+        /// </summary>
+        /// <param name="existingByNativeId">The map from <see cref="BuildNativeIdMap"/>.</param>
+        /// <param name="entryId">The id the listing reported for this entry.</param>
+        /// <param name="metaId">The id the full metadata reports, which is what gets stored.</param>
+        /// <returns>The stored row, or null when this entry is new to the source.</returns>
+        /// <remarks>
+        /// <c>native_id</c> is written from the metadata's id, so that is the id to match on first.
+        /// The two are equal on every platform supported today — the Arte id derived from a listing
+        /// URL is deliberately the id a full fetch reports, so rows re-match — and the listing id
+        /// stays as a fallback for the rows written before that was true. Matching on the listing
+        /// id alone would take a video for new the day they diverged, and the UNIQUE index added by
+        /// schema v7 would then refuse the second row and fail that source's every sync.
+        /// </remarks>
+        internal static VideoRecord? ExistingFor(
+            Dictionary<string, VideoRecord> existingByNativeId, string entryId, string metaId)
+        {
+            ArgumentNullException.ThrowIfNull(existingByNativeId);
+
+            return existingByNativeId.GetValueOrDefault(metaId)
+                ?? existingByNativeId.GetValueOrDefault(entryId);
+        }
+
+        /// <summary>
         /// Upserts database records for every entry in the playlist, and returns the count of
         /// records that were created (as opposed to updated) this pass.
         /// </summary>
@@ -457,18 +557,20 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             DateTimeOffset syncStart,
             CancellationToken ct)
         {
+            // One entry per video, before anything counts, ranks or upserts them.
+            var uniqueEntries = DeduplicateEntries(entries, metadataMap);
+
             // Build a map of existing videos by NativeId for update detection
-            var existingByNativeId = existingVideos
-                .Where(v => v.NativeId is not null)
-                .ToDictionary(v => v.NativeId!, StringComparer.OrdinalIgnoreCase);
+            var existingByNativeId = BuildNativeIdMap(existingVideos);
 
             // Compute episode numbers for NEW entries grouped by date
             // Key: nativeId → (season, episode)
-            var assignments = AssignEpisodeNumbers(entries, metadataMap, existingByNativeId, existingVideos);
+            var assignments = AssignEpisodeNumbers(
+                uniqueEntries, metadataMap, existingByNativeId, existingVideos);
 
             var created = 0;
 
-            foreach (var entry in entries)
+            foreach (var entry in uniqueEntries)
             {
                 ct.ThrowIfCancellationRequested();
 
@@ -476,7 +578,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                     continue;
 
                 var publishedAt = ParseDate(meta);
-                var existing = existingByNativeId.GetValueOrDefault(entry.Id);
+                var existing = ExistingFor(existingByNativeId, entry.Id, meta.Id);
 
                 if (existing is null)
                 {
@@ -634,12 +736,11 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             var newByDate = new Dictionary<DateOnly, List<(PlaylistEntry entry, DateTimeOffset date)>>();
             foreach (var entry in entries)
             {
-                if (existingByNativeId.TryGetValue(entry.Id, out var existing)
-                    && existing.SeasonNumber.HasValue)
-                    continue; // Already has a number — skip
-
                 if (!metadataMap.TryGetValue(entry.Id, out var meta))
                     continue;
+
+                if (ExistingFor(existingByNativeId, entry.Id, meta.Id) is { SeasonNumber: not null })
+                    continue; // Already has a number — skip, and do not spend a rank of its day
 
                 var date = ParseDate(meta);
                 if (!date.HasValue)
