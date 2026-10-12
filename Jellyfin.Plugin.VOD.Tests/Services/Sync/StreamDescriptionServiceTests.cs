@@ -54,6 +54,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
 
             var ytDlp = new YtDlpService(
                 new CookieJar(NullLogger<CookieJar>.Instance),
+                ThrottleClock.Throttle(),
                 NullLogger<YtDlpService>.Instance);
 
             _service = new StreamDescriptionService(

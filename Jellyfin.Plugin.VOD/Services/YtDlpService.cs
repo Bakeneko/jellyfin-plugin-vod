@@ -23,12 +23,17 @@ namespace Jellyfin.Plugin.VOD.Services
         private static readonly TimeSpan PlaylistTimeout = TimeSpan.FromMinutes(10);
 
         private readonly CookieJar _cookies;
+        private readonly YtDlpThrottle _throttle;
         private readonly ILogger<YtDlpService> _logger;
 
         /// <summary>Initializes a new instance of the <see cref="YtDlpService"/> class.</summary>
-        public YtDlpService(CookieJar cookies, ILogger<YtDlpService> logger)
+        /// <param name="cookies">The cookie jar, one working copy per lane.</param>
+        /// <param name="throttle">Paces background calls, per platform.</param>
+        /// <param name="logger">Logger instance.</param>
+        public YtDlpService(CookieJar cookies, YtDlpThrottle throttle, ILogger<YtDlpService> logger)
         {
             _cookies = cookies;
+            _throttle = throttle;
             _logger = logger;
         }
 
@@ -47,7 +52,7 @@ namespace Jellyfin.Plugin.VOD.Services
             ArgumentException.ThrowIfNullOrWhiteSpace(format);
 
             var startInfo = BuildBaseStartInfo();
-            using var cookies = await _cookies.AcquireAsync(cancellationToken).ConfigureAwait(false);
+            using var cookies = await _cookies.AcquireAsync(PlatformLane.Playback, cancellationToken).ConfigureAwait(false);
             ApplyCookies(startInfo, cookies);
             ApplyJsRuntime(startInfo);
 
@@ -98,14 +103,28 @@ namespace Jellyfin.Plugin.VOD.Services
         /// Note: behaviour varies by extractor — yt-dlp may still enumerate all entries and filter client-side.
         /// </param>
         /// <param name="cancellationToken">Cancellation token.</param>
+        /// <param name="lane">
+        /// The throttle lane to spend, when it is not the URL's own platform — an administrator's
+        /// own action uses <see cref="PlatformLane.Interactive"/> so it cannot queue behind a
+        /// platform's backoff.
+        /// </param>
         public async Task<PlaylistInfo?> GetPlaylistEntriesAsync(
             string url,
             int? maxEntries,
             DateTimeOffset? dateAfter,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            string? lane = null)
         {
+            lane ??= PlatformLane.For(url);
+
+            // The lease is taken before the cookie file, so the pacing wait happens outside the
+            // lane's cookie lock rather than holding it for three seconds.
+            using var lease = await _throttle
+                .EnterAsync(lane, YtDlpCallKind.Listing, cancellationToken)
+                .ConfigureAwait(false);
+
             var startInfo = BuildBaseStartInfo();
-            using var cookies = await _cookies.AcquireAsync(cancellationToken).ConfigureAwait(false);
+            using var cookies = await _cookies.AcquireAsync(lane, cancellationToken).ConfigureAwait(false);
             ApplyCookies(startInfo, cookies);
             ApplyJsRuntime(startInfo);
 
@@ -126,7 +145,7 @@ namespace Jellyfin.Plugin.VOD.Services
             startInfo.ArgumentList.Add("--no-warnings");
             startInfo.ArgumentList.Add(url);
 
-            var stdout = await RunProcessAsync(startInfo, PlaylistTimeout, cancellationToken)
+            var stdout = await RunProcessAsync(startInfo, PlaylistTimeout, cancellationToken, lane, lease)
                 .ConfigureAwait(false);
             if (stdout is null)
                 return null;
@@ -134,6 +153,14 @@ namespace Jellyfin.Plugin.VOD.Services
             var info = PlaylistInfo.ParseJson(stdout);
             if (info is null)
                 LogParseFailed(url, "flat-playlist");
+
+            // One process, several requests: a listing is charged for the pages it really
+            // fetched, not for one call.
+            if (info is not null)
+            {
+                lease.Charge(YtDlpThrottle.ExtraListingCalls(info.Entries.Count));
+            }
+
             return info;
         }
 
@@ -166,8 +193,13 @@ namespace Jellyfin.Plugin.VOD.Services
             string url,
             CancellationToken cancellationToken)
         {
+            var lane = PlatformLane.For(url);
+            using var lease = await _throttle
+                .EnterAsync(lane, YtDlpCallKind.Resolution, cancellationToken)
+                .ConfigureAwait(false);
+
             var startInfo = BuildBaseStartInfo();
-            using var cookies = await _cookies.AcquireAsync(cancellationToken).ConfigureAwait(false);
+            using var cookies = await _cookies.AcquireAsync(lane, cancellationToken).ConfigureAwait(false);
             ApplyCookies(startInfo, cookies);
             ApplyJsRuntime(startInfo);
 
@@ -179,7 +211,7 @@ namespace Jellyfin.Plugin.VOD.Services
             startInfo.ArgumentList.Add("--ignore-no-formats-error");
             startInfo.ArgumentList.Add(url);
 
-            var run = await RunProcessRawAsync(startInfo, Timeout, cancellationToken)
+            var run = await RunProcessRawAsync(startInfo, Timeout, cancellationToken, lane, lease)
                 .ConfigureAwait(false);
 
             if (run.ExitCode != 0)
@@ -244,8 +276,13 @@ namespace Jellyfin.Plugin.VOD.Services
             string url,
             CancellationToken cancellationToken)
         {
+            var lane = PlatformLane.For(url);
+            using var lease = await _throttle
+                .EnterAsync(lane, YtDlpCallKind.Resolution, cancellationToken)
+                .ConfigureAwait(false);
+
             var startInfo = BuildBaseStartInfo();
-            using var cookies = await _cookies.AcquireAsync(cancellationToken).ConfigureAwait(false);
+            using var cookies = await _cookies.AcquireAsync(lane, cancellationToken).ConfigureAwait(false);
             ApplyCookies(startInfo, cookies);
             ApplyJsRuntime(startInfo);
 
@@ -256,7 +293,7 @@ namespace Jellyfin.Plugin.VOD.Services
             startInfo.ArgumentList.Add("--ignore-no-formats-error");
             startInfo.ArgumentList.Add(url);
 
-            var stdout = await RunProcessAsync(startInfo, PlaylistTimeout, cancellationToken)
+            var stdout = await RunProcessAsync(startInfo, PlaylistTimeout, cancellationToken, lane, lease)
                 .ConfigureAwait(false);
             if (stdout is null)
                 return null;
@@ -300,7 +337,10 @@ namespace Jellyfin.Plugin.VOD.Services
         {
             ArgumentException.ThrowIfNullOrWhiteSpace(url);
 
-            var playlist = await GetPlaylistEntriesAsync(url, 1, null, cancellationToken)
+            // Someone is waiting on the configuration page: this must not queue behind a
+            // platform's backoff (see PlatformLane.Interactive).
+            var playlist = await GetPlaylistEntriesAsync(
+                    url, 1, null, cancellationToken, PlatformLane.Interactive)
                 .ConfigureAwait(false);
 
             if (playlist is null)
@@ -349,9 +389,11 @@ namespace Jellyfin.Plugin.VOD.Services
         private async Task<string?> RunProcessAsync(
             ProcessStartInfo startInfo,
             TimeSpan timeout,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            string? lane = null,
+            YtDlpLease? lease = null)
         {
-            var run = await RunProcessRawAsync(startInfo, timeout, cancellationToken)
+            var run = await RunProcessRawAsync(startInfo, timeout, cancellationToken, lane, lease)
                 .ConfigureAwait(false);
 
             if (run.ExitCode != 0)
@@ -367,10 +409,18 @@ namespace Jellyfin.Plugin.VOD.Services
         /// Runs a yt-dlp process and hands back its exit code and both streams, so a caller that
         /// can read meaning into a specific failure gets the chance to.
         /// </summary>
+        /// <remarks>
+        /// The throttle's verdict is settled here rather than at each call site: a timeout is
+        /// <b>thrown</b> from this method, not returned, and <see cref="RunProcessAsync"/> does not
+        /// hand stderr back to its callers — so two of the four background entry points could not
+        /// judge their own outcome. One place knows "exit code, stderr, timeout" and reports it.
+        /// </remarks>
         private async Task<ProcessRun> RunProcessRawAsync(
             ProcessStartInfo startInfo,
             TimeSpan timeout,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            string? lane = null,
+            YtDlpLease? lease = null)
         {
             using var process = new Process { StartInfo = startInfo };
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -387,6 +437,10 @@ namespace Jellyfin.Plugin.VOD.Services
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {
                 TryKill(process);
+
+                // F9: a rate-limited session stops answering rather than saying so, so a timeout
+                // is a refusal on every platform and backs its lane off.
+                lease?.RateLimited();
                 throw new TimeoutException($"yt-dlp timed out after {timeout.TotalSeconds:0}s");
             }
             catch (OperationCanceledException)
@@ -397,6 +451,18 @@ namespace Jellyfin.Plugin.VOD.Services
 
             var stdout = await stdoutTask.ConfigureAwait(false);
             var stderr = await stderrTask.ConfigureAwait(false);
+
+            if (lease is not null)
+            {
+                if (lane is not null && PlatformLimits.IsPlatformRefusal(lane, stderr, timedOut: false))
+                {
+                    lease.RateLimited();
+                }
+                else
+                {
+                    lease.Succeeded();
+                }
+            }
 
             return new ProcessRun(process.ExitCode, stdout, stderr);
         }

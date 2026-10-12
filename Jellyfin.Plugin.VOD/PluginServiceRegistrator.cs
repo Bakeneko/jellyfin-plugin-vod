@@ -1,4 +1,6 @@
+using System;
 using System.IO;
+using System.Threading.Tasks;
 using Jellyfin.Plugin.VOD.Data;
 using Jellyfin.Plugin.VOD.Imaging;
 using Jellyfin.Plugin.VOD.Localization;
@@ -33,6 +35,11 @@ namespace Jellyfin.Plugin.VOD
 
             // Streaming services
             serviceCollection.AddSingleton<CookieJar>();
+            serviceCollection.AddSingleton(provider => new YtDlpThrottle(
+                TimeProvider.System,
+                () => Plugin.Instance?.Configuration.YtDlpCallsPerMinute ?? 20,
+                (delay, cancellationToken) => Task.Delay(delay, cancellationToken),
+                provider.GetRequiredService<ILogger<YtDlpThrottle>>()));
             serviceCollection.AddSingleton<YtDlpService>();
             serviceCollection.AddSingleton<PlaylistCache>();
             serviceCollection.AddSingleton<SubtitleTokens>();

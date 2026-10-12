@@ -637,6 +637,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             return new LiveProbeService(
                 new YtDlpService(
                     new CookieJar(NullLogger<CookieJar>.Instance),
+                    ThrottleClock.Throttle(),
                     NullLogger<YtDlpService>.Instance),
                 db,
                 publisher,

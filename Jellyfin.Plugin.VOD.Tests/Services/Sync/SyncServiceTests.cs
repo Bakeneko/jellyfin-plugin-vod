@@ -56,6 +56,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 _db,
                 new YtDlpService(
                     new CookieJar(NullLogger<CookieJar>.Instance),
+                    ThrottleClock.Throttle(),
                     NullLogger<YtDlpService>.Instance),
                 publisher, _localizer, NullLogger<SyncService>.Instance, _tasks);
         }
@@ -432,6 +433,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 _db,
                 new YtDlpService(
                     new CookieJar(NullLogger<CookieJar>.Instance),
+                    ThrottleClock.Throttle(),
                     NullLogger<YtDlpService>.Instance),
                 publisher, _localizer, NullLogger<SyncService>.Instance, _tasks);
         }
@@ -661,6 +663,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 _db,
                 new YtDlpService(
                     new CookieJar(NullLogger<CookieJar>.Instance),
+                    ThrottleClock.Throttle(),
                     NullLogger<YtDlpService>.Instance),
                 publisher, _localizer, NullLogger<SyncService>.Instance, _tasks);
         }

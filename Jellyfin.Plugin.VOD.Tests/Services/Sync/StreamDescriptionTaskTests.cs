@@ -30,7 +30,10 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             var service = new StreamDescriptionService(
                 Substitute.For<IVodDatabase>(),
                 describer,
-                new YtDlpService(new CookieJar(NullLogger<CookieJar>.Instance), NullLogger<YtDlpService>.Instance),
+                new YtDlpService(
+                    new CookieJar(NullLogger<CookieJar>.Instance),
+                    ThrottleClock.Throttle(),
+                    NullLogger<YtDlpService>.Instance),
                 Substitute.For<IHttpClientFactory>(),
                 NullLogger<StreamDescriptionService>.Instance);
 

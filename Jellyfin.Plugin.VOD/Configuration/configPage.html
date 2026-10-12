@@ -138,6 +138,19 @@
                     </div>
 
                     <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="ytDlpCallsPerMinute">yt-dlp calls per minute, per platform</label>
+                        <input id="ytDlpCallsPerMinute" name="YtDlpCallsPerMinute" type="number" min="1"
+                               is="emby-input" class="emby-input"
+                               placeholder="20" />
+                        <div class="fieldDescription">
+                            How fast background work may call yt-dlp for one platform — sync, stream
+                            descriptions and the live probe share this budget, and two platforms advance
+                            independently. A started video is never held back by it.
+                            Raising it risks the platform rate-limiting the whole session for up to an hour.
+                        </div>
+                    </div>
+
+                    <div class="inputContainer">
                         <label class="inputLabel inputLabelUnfocused" for="streamDescriptionBatchSize">Stream descriptions per pass</label>
                         <input id="streamDescriptionBatchSize" name="StreamDescriptionBatchSize" type="number" min="0"
                                is="emby-input" class="emby-input"
@@ -544,6 +557,7 @@
                             document.querySelector('#localBaseUrl').value      = config.LocalBaseUrl || 'http://localhost:8096';
                             document.querySelector('#cacheMinutes').value      = config.CacheMinutes || 5;
                             document.querySelector('#liveProbeIntervalMinutes').value = config.LiveProbeIntervalMinutes != null ? config.LiveProbeIntervalMinutes : 5;
+                            document.querySelector('#ytDlpCallsPerMinute').value = config.YtDlpCallsPerMinute != null ? config.YtDlpCallsPerMinute : 20;
                             document.querySelector('#streamDescriptionBatchSize').value = config.StreamDescriptionBatchSize != null ? config.StreamDescriptionBatchSize : 10;
                             document.querySelector('#streamDescriptionRetryHours').value = config.StreamDescriptionRetryHours != null ? config.StreamDescriptionRetryHours : 24;
                             document.querySelector('#preferredAudioLanguages').value =
@@ -581,6 +595,8 @@
                             config.LocalBaseUrl    = document.querySelector('#localBaseUrl').value;
                             config.CacheMinutes    = parseInt(document.querySelector('#cacheMinutes').value, 10) || 5;
                             config.LiveProbeIntervalMinutes = parseInt(document.querySelector('#liveProbeIntervalMinutes').value, 10) || 0;
+                            var ytDlpCallsPerMinute = parseInt(document.querySelector('#ytDlpCallsPerMinute').value, 10);
+                            config.YtDlpCallsPerMinute = isNaN(ytDlpCallsPerMinute) || ytDlpCallsPerMinute < 1 ? 20 : ytDlpCallsPerMinute;
                             var descriptionBatchSize = parseInt(document.querySelector('#streamDescriptionBatchSize').value, 10);
                             config.StreamDescriptionBatchSize = isNaN(descriptionBatchSize) ? 10 : descriptionBatchSize;
                             var descriptionRetryHours = parseInt(document.querySelector('#streamDescriptionRetryHours').value, 10);

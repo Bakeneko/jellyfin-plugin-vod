@@ -90,6 +90,19 @@ namespace Jellyfin.Plugin.VOD.Configuration
         public string[] PreferredSubtitleLanguages { get; set; } = [];
 
         /// <summary>
+        /// Gets or sets how many yt-dlp calls a minute background work may make to <b>one</b>
+        /// platform. Sync, stream descriptions and the live probe share this budget, per platform.
+        /// </summary>
+        /// <remarks>
+        /// The limit is imposed on the session, not on the caller, so every background path has to
+        /// share one allowance. 120 a minute earned a rate-limit window in production (measured
+        /// 2026-10-12); 20 keeps a factor of six of margin and still allows ~28 800 calls a day
+        /// per platform. Resolving a video a user just started is deliberately exempt: making a
+        /// started video wait behind a backlog would break playback.
+        /// </remarks>
+        public int YtDlpCallsPerMinute { get; set; } = 20;
+
+        /// <summary>
         /// Gets or sets how many videos the stream description task describes per pass.
         /// Zero or less disables the task; the description at playback stays active either way.
         /// </summary>

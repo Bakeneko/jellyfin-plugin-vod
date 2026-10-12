@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -10,15 +11,24 @@ namespace Jellyfin.Plugin.VOD.Services
     /// Hands yt-dlp a cookie file it may safely rewrite, without ever touching the user's seed.
     /// </summary>
     /// <remarks>
-    /// yt-dlp rewrites <c>--cookies</c> in place. The seed is therefore copied once into the plugin data
+    /// yt-dlp rewrites <c>--cookies</c> in place. The seed is therefore copied into the plugin data
     /// folder; re-seeding triggers when the seed's mtime changes. Concurrent yt-dlp processes would race
-    /// on the working copy, so access is serialised via a semaphore.
+    /// on one working copy, so there is a copy — and a semaphore — <b>per lane</b>: a single shared copy
+    /// behind a single lock is what would otherwise make the throttle's per-platform lanes fictional,
+    /// since an Arte call would queue behind a YouTube one for as long as its process ran.
     /// </remarks>
     public sealed partial class CookieJar : IDisposable
     {
-        private readonly SemaphoreSlim _lock = new(1, 1);
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> _locks =
+            new(StringComparer.OrdinalIgnoreCase);
         private readonly ILogger<CookieJar> _logger;
-        private bool _seedFailureLogged;
+        /// <summary>
+        /// Per lane, not global: with one flag, a lane whose copy succeeds clears the flag a lane
+        /// whose copy keeps failing had set, so the same error logs again on every single call —
+        /// up to the full call rate, with a stack trace each time.
+        /// </summary>
+        private readonly ConcurrentDictionary<string, bool> _seedFailureLogged =
+            new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>Initializes a new instance of the <see cref="CookieJar"/> class.</summary>
         public CookieJar(ILogger<CookieJar> logger) => _logger = logger;
@@ -32,63 +42,91 @@ namespace Jellyfin.Plugin.VOD.Services
             }
         }
 
-        private static string WorkingPath
-            => Path.Combine(Plugin.Instance!.DataFolderPath, "cookies.txt");
+        /// <summary>The file name the working copy of a lane's cookies takes.</summary>
+        /// <param name="lane">The lane key, from <see cref="PlatformLane.For"/>.</param>
+        /// <returns>A file name safe on every platform the server runs on.</returns>
+        /// <remarks>
+        /// One copy per lane rather than one for everything: yt-dlp rewrites the file in place, so
+        /// a shared copy has to be serialised, and that serialisation is what would make the
+        /// throttle's per-platform lanes fictional. A lane only talks to its own platform, so the
+        /// cookies it keeps refreshed are the only ones it needs.
+        /// </remarks>
+        internal static string WorkingFileNameFor(string lane)
+        {
+            var safe = lane;
+            foreach (var invalid in Path.GetInvalidFileNameChars())
+            {
+                safe = safe.Replace(invalid, '_');
+            }
 
-        private static string SeedStampPath
-            => Path.Combine(Plugin.Instance!.DataFolderPath, "cookies.seed");
+            return $"cookies-{safe}.txt";
+        }
+
+        private static string WorkingPathFor(string lane)
+            => Path.Combine(Plugin.Instance!.DataFolderPath, WorkingFileNameFor(lane));
+
+        private static string SeedStampPathFor(string lane)
+            => Path.Combine(Plugin.Instance!.DataFolderPath, WorkingFileNameFor(lane) + ".seed");
 
         /// <summary>
-        /// Takes the cookie file for the duration of one yt-dlp invocation.
+        /// Takes the cookie file of one lane for the duration of one yt-dlp invocation.
         /// Returns a lease whose <see cref="CookieLease.Path"/> is null when no cookies are configured.
         /// </summary>
-        public async Task<CookieLease> AcquireAsync(CancellationToken cancellationToken)
+        /// <param name="lane">The lane key, from <see cref="PlatformLane.For"/>.</param>
+        /// <param name="cancellationToken">A token to abandon the wait.</param>
+        /// <returns>The lease; disposing it releases that lane's file.</returns>
+        public async Task<CookieLease> AcquireAsync(string lane, CancellationToken cancellationToken)
         {
+            ArgumentException.ThrowIfNullOrWhiteSpace(lane);
+
             var seed = ConfiguredSeedPath;
             if (seed is null || Plugin.Instance is null)
             {
                 return new CookieLease(null, null);
             }
 
-            await _lock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            var gate = _locks.GetOrAdd(lane, _ => new SemaphoreSlim(1, 1));
+            await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
 
             try
             {
-                return new CookieLease(EnsureWorkingCopy(seed), _lock);
+                return new CookieLease(EnsureWorkingCopy(seed, lane), gate);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                LogSeedFailedOnce(seed, ex);
-                _lock.Release();
+                LogSeedFailedOnce(seed, ex, lane);
+                gate.Release();
                 return new CookieLease(null, null);
             }
         }
 
-        private string? EnsureWorkingCopy(string seed)
+        private string? EnsureWorkingCopy(string seed, string lane)
         {
             if (!File.Exists(seed))
             {
-                LogSeedMissingOnce(seed);
+                LogSeedMissingOnce(seed, lane);
                 return null;
             }
 
             var stamp = File.GetLastWriteTimeUtc(seed).Ticks
                 .ToString(System.Globalization.CultureInfo.InvariantCulture);
-            var seeded = File.Exists(SeedStampPath)
-                ? File.ReadAllText(SeedStampPath).Trim()
+            var workingPath = WorkingPathFor(lane);
+            var stampPath = SeedStampPathFor(lane);
+            var seeded = File.Exists(stampPath)
+                ? File.ReadAllText(stampPath).Trim()
                 : null;
 
-            if (!File.Exists(WorkingPath) || !string.Equals(stamp, seeded, StringComparison.Ordinal))
+            if (!File.Exists(workingPath) || !string.Equals(stamp, seeded, StringComparison.Ordinal))
             {
                 Plugin.Instance!.EnsureDataFolder();
-                File.Copy(seed, WorkingPath, overwrite: true);
-                File.WriteAllText(SeedStampPath, stamp);
-                RestrictPermissions(WorkingPath);
+                File.Copy(seed, workingPath, overwrite: true);
+                File.WriteAllText(stampPath, stamp);
+                RestrictPermissions(workingPath);
                 LogSeeded(seed);
             }
 
-            _seedFailureLogged = false;
-            return WorkingPath;
+            _seedFailureLogged[lane] = false;
+            return workingPath;
         }
 
         private static void RestrictPermissions(string path)
@@ -99,26 +137,34 @@ namespace Jellyfin.Plugin.VOD.Services
             }
         }
 
-        private void LogSeedFailedOnce(string seed, Exception ex)
+        private void LogSeedFailedOnce(string seed, Exception ex, string lane)
         {
-            if (!_seedFailureLogged)
+            if (!_seedFailureLogged.TryGetValue(lane, out var logged) && logged)
             {
-                _seedFailureLogged = true;
+                _seedFailureLogged[lane] = true;
                 LogSeedFailed(seed, ex);
             }
         }
 
-        private void LogSeedMissingOnce(string seed)
+        private void LogSeedMissingOnce(string seed, string lane)
         {
-            if (!_seedFailureLogged)
+            if (!_seedFailureLogged.TryGetValue(lane, out var logged) && logged)
             {
-                _seedFailureLogged = true;
+                _seedFailureLogged[lane] = true;
                 LogSeedMissing(seed);
             }
         }
 
         /// <inheritdoc />
-        public void Dispose() => _lock.Dispose();
+        public void Dispose()
+        {
+            foreach (var gate in _locks.Values)
+            {
+                gate.Dispose();
+            }
+
+            _locks.Clear();
+        }
 
         [LoggerMessage(EventId = 20, Level = LogLevel.Information,
             Message = "Seeded working cookie file from {SeedPath}")]
