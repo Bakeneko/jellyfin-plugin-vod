@@ -57,5 +57,13 @@ namespace Jellyfin.Plugin.VOD.Data.Models
         /// an error — the sweep then falls back to the configured libraries.
         /// </remarks>
         public Guid? PublishedAnchorId { get; set; }
+
+        /// <summary>Gets or sets when this source's last resolution wave finished.</summary>
+        /// <remarks>
+        /// Diagnostic only — the status shown on the configuration page, and the logs. The order
+        /// sources are served in is derived from how many videos each has due, so the scheduler
+        /// keeps no persistent state of its own.
+        /// </remarks>
+        public DateTimeOffset? LastResolvedAt { get; set; }
     }
 }

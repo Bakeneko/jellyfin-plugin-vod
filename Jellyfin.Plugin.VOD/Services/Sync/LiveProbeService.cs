@@ -291,6 +291,14 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
                 SyncService.FillVideoRecord(record, meta, source.Url, effectiveTitle, syncedAt, publishedAt);
 
+                // This pass resolved the broadcast itself, so its row is resolved. Left pending it
+                // would be published here — the probe reconciles its own list — and then retired by
+                // the next sync, which offers the library only resolved rows.
+                record.ResolutionState = ResolutionState.Resolved;
+                record.ResolutionError = null;
+                record.ResolutionAttempts = 0;
+                record.ResolutionAttemptedAt = syncedAt;
+
                 // The sync's own rule, not a second one. An unnumbered episode is filed under
                 // Specials and renumbered by the next sync, which loses the watch state: an
                 // episode's user-data key is built from its season and episode numbers.
@@ -372,6 +380,16 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
                     var refreshedTitle = PlatformRules.TitleFor(refreshed) ?? refreshed.Id;
                     SyncService.FillVideoRecord(video, refreshed, source.Url, refreshedTitle, syncedAt, SyncService.ParseDate(refreshed));
+
+                    // This branch resolved the video too — the ex-broadcast whose stream has
+                    // ended. Left in whatever state it was read with, a migrated payload-less row
+                    // would stay pending while now carrying a payload, so the sync's skip set
+                    // would never fetch it again either.
+                    video.ResolutionState = ResolutionState.Resolved;
+                    video.ResolutionError = null;
+                    video.ResolutionAttempts = 0;
+                    video.ResolutionAttemptedAt = syncedAt;
+
                     _db.UpsertVideo(video);
                 }
             }
@@ -384,14 +402,16 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             }
 
             var target = _publisher.ResolveTarget(libraryName);
+            // The same notion of publishable as the sync's: a probe that published a pending or
+            // unavailable row would put back, every five minutes, exactly what the sync retires.
             await _publisher.ReconcileAsync(
                     target,
                     _publisher.SweepAnchorsFor(config, source, sourceRecord),
                     sourceRecord,
                     source.Mode,
                     sourceRecord.Name!,
-                    _db.GetVideosBySource(source.Url),
-                    _db.GetAllVideoIds().ToHashSet(StringComparer.OrdinalIgnoreCase),
+                    _db.GetPublishableVideosBySource(source.Url),
+                    _db.GetPublishableVideoIds().ToHashSet(StringComparer.OrdinalIgnoreCase),
                     config.LocalBaseUrl,
                     config.UseReleaseDateAsDateAdded,
                     ct)

@@ -73,5 +73,35 @@ namespace Jellyfin.Plugin.VOD.Data.Models
 
         /// <summary>Whether this video is broadcasting now, scheduled, or neither.</summary>
         public LiveStatus LiveStatus { get; set; }
+
+        /// <summary>Gets or sets where this video is in the resolution business.</summary>
+        /// <remarks>Only <see cref="Data.Models.ResolutionState.Resolved"/> is publishable.</remarks>
+        public ResolutionState ResolutionState { get; set; } = ResolutionState.Pending;
+
+        /// <summary>Gets or sets when resolution was last attempted; null when never.</summary>
+        /// <remarks>
+        /// Carries both retry windows: the growing per-video backoff after a failure, and the
+        /// seven-day re-check of a video a platform called gone.
+        /// </remarks>
+        public DateTimeOffset? ResolutionAttemptedAt { get; set; }
+
+        /// <summary>Gets or sets how many times in a row resolution has failed for this video.</summary>
+        /// <remarks>
+        /// Consecutive, and reset by a success. It drives the growing backoff, and it is
+        /// deliberately NOT incremented by a failure the platform caused — one rate-limit window
+        /// must not push every video of a source a step further out.
+        /// </remarks>
+        public int ResolutionAttempts { get; set; }
+
+        /// <summary>Gets or sets the last resolution error, truncated to 500 characters.</summary>
+        /// <remarks>Diagnostic only: it is what the configuration page shows about a stuck video.</remarks>
+        public string? ResolutionError { get; set; }
+
+        /// <summary>Gets or sets this video's rank in the last listing — 0 is the newest.</summary>
+        /// <remarks>
+        /// The only priority order available: a video that has never been resolved has no
+        /// publication date yet, so the listing's own order is all there is to go on.
+        /// </remarks>
+        public int? ListingPosition { get; set; }
     }
 }

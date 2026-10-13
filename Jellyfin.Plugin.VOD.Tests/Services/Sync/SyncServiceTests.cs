@@ -638,6 +638,109 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             Assert.Single(saved);
             Assert.Equal("same", saved[0].NativeId);
         }
+
+        [Fact]
+        public void ApplyListingVerdict_MarksAnUntitledYoutubeEntryUnavailable_WithoutACall()
+        {
+            // The production case: 33 of 43 entries of a playlist are dead, and YouTube says so by
+            // returning a template of nulls. Before this, each of them cost one yt-dlp call on
+            // every single sync, all of them failed, and no row was ever written.
+            var entries = new List<PlaylistEntry>
+            {
+                new() { Id = "alive", VideoUrl = "https://example.test/v/alive", Title = "A video", IeKey = "Youtube" },
+                new() { Id = "dead", VideoUrl = "https://example.test/v/dead", Title = null, IeKey = "Youtube" },
+            };
+
+            var verdict = SyncService.ApplyListingVerdict(entries, [], DateTimeOffset.UtcNow);
+
+            Assert.Equal(["dead"], verdict.Unavailable);
+            var written = Assert.Single(verdict.Updated);
+            Assert.Equal("dead", written.NativeId);
+            Assert.Equal(ResolutionState.Unavailable, written.ResolutionState);
+            Assert.Equal("absent from the listing", written.ResolutionError);
+        }
+
+        [Fact]
+        public void ApplyListingVerdict_LeavesAnUntitledArteEntryAlone()
+        {
+            // Arte titles nothing: 0 of 79 measured. Reading silence as death here empties a
+            // whole collection from the library.
+            var entries = new List<PlaylistEntry>
+            {
+                new() { Id = "a1", VideoUrl = "https://example.test/v/a1", Title = null, IeKey = "ArteTV" },
+                new() { Id = "a2", VideoUrl = "https://example.test/v/a2", Title = null, IeKey = "ArteTV" },
+            };
+
+            var verdict = SyncService.ApplyListingVerdict(entries, [], DateTimeOffset.UtcNow);
+
+            Assert.Empty(verdict.Unavailable);
+            Assert.Empty(verdict.Updated);
+        }
+
+        [Fact]
+        public void ApplyListingVerdict_BringsBackAVideoWhoseTitleReappeared()
+        {
+            // A video made private and then public again: the re-check is free and immediate, and
+            // does not wait for the seven-day window that only concerns verdicts a call produced.
+            var stored = StoredVideo("back");
+            stored.ResolutionState = ResolutionState.Unavailable;
+            stored.ResolutionError = "absent from the listing";
+
+            var entries = new List<PlaylistEntry>
+            {
+                new() { Id = "back", VideoUrl = "https://example.test/v/back", Title = "Public again", IeKey = "Youtube" },
+            };
+
+            var verdict = SyncService.ApplyListingVerdict(entries, [stored], DateTimeOffset.UtcNow);
+
+            Assert.Empty(verdict.Unavailable);
+            var written = Assert.Single(verdict.Updated);
+            Assert.Equal(ResolutionState.Pending, written.ResolutionState);
+            Assert.Null(written.ResolutionError);
+
+            // Reported so the caller can lift it out of its skip set: the row still carries the
+            // payload of its earlier life, so a skip would leave it pending for ever.
+            Assert.Equal(["back"], verdict.Reopened);
+        }
+
+        [Fact]
+        public void ApplyListingVerdict_RetiresAVideoThatLostItsTitle()
+        {
+            // The original goal of this line of work: a published video that goes private leaves
+            // the library, because publication only offers what is resolved.
+            var stored = StoredVideo("gone");
+            stored.ResolutionState = ResolutionState.Resolved;
+
+            var entries = new List<PlaylistEntry>
+            {
+                new() { Id = "gone", VideoUrl = "https://example.test/v/gone", Title = null, IeKey = "Youtube" },
+            };
+
+            var verdict = SyncService.ApplyListingVerdict(entries, [stored], DateTimeOffset.UtcNow);
+
+            var written = Assert.Single(verdict.Updated);
+            Assert.Equal(ResolutionState.Unavailable, written.ResolutionState);
+        }
+
+        [Fact]
+        public void ApplyListingVerdict_NeverTouchesALiveEntry()
+        {
+            // A broadcast's listing entry has no stable title either, and MustRefetch already
+            // forces it to be fetched again every pass.
+            var stored = StoredVideo("airing");
+            stored.LiveStatus = LiveStatus.Live;
+            stored.ResolutionState = ResolutionState.Resolved;
+
+            var entries = new List<PlaylistEntry>
+            {
+                new() { Id = "airing", VideoUrl = "https://example.test/v/airing", Title = null, IeKey = "Youtube", LiveStatus = LiveStatus.Live },
+            };
+
+            var verdict = SyncService.ApplyListingVerdict(entries, [stored], DateTimeOffset.UtcNow);
+
+            Assert.Empty(verdict.Unavailable);
+            Assert.Empty(verdict.Updated);
+        }
     }
 
     /// <summary>

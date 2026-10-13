@@ -248,4 +248,50 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             Assert.Equal(expected, PlatformRules.SupportsLiveProbe(url));
         }
     }
+
+    public sealed class PlatformRulesListingVerdictTests
+    {
+        [Theory]
+        [InlineData("Youtube")]
+        [InlineData("youtube")]
+        [InlineData("YoutubeTab")]
+        public void ListingTellsUnavailable_IsTrueForYoutube(string ieKey)
+        {
+            // Measured: a dead entry is a template of nulls, and the 10 titled entries of a
+            // 43-entry playlist were exactly the 10 YouTube said were watchable.
+            Assert.True(PlatformRules.ListingTellsUnavailable(ieKey));
+        }
+
+        [Theory]
+        [InlineData("ArteTV")]
+        [InlineData("ArteTVPlaylist")]
+        public void ListingTellsUnavailable_IsFalseForArte(string ieKey)
+        {
+            // Measured: 0 titles out of 79. Reading silence as death here would empty an entire
+            // Arte collection from the library on the first sync.
+            Assert.False(PlatformRules.ListingTellsUnavailable(ieKey));
+        }
+
+        [Theory]
+        [InlineData("Twitch")]
+        [InlineData("TwitchVideos")]
+        public void ListingTellsUnavailable_IsFalseForTwitch(string ieKey)
+        {
+            // Measured: 15 titled out of 15. A deleted VOD leaves the listing entirely, which is
+            // the orphan sweep's business.
+            Assert.False(PlatformRules.ListingTellsUnavailable(ieKey));
+        }
+
+        [Theory]
+        [InlineData("Vimeo")]
+        [InlineData("generic")]
+        [InlineData("")]
+        [InlineData(null)]
+        public void ListingTellsUnavailable_IsFalseForAnUnmeasuredPlatform(string? ieKey)
+        {
+            // A platform that has not been measured gets the prudent answer, never a neighbour's.
+            Assert.False(PlatformRules.ListingTellsUnavailable(ieKey));
+        }
+    }
+
 }

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using Jellyfin.Plugin.VOD.Data;
 using Jellyfin.Plugin.VOD.Data.Models;
 using Jellyfin.Plugin.VOD.Services.Sync;
@@ -527,8 +528,10 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                             video_url        TEXT NOT NULL,
                             synced_at        TEXT NOT NULL,
                             native_id        TEXT,
+                            extras           TEXT,
                             first_seen_at    TEXT,
-                            live_status      TEXT NOT NULL DEFAULT 'NotLive'
+                            live_status      TEXT NOT NULL DEFAULT 'NotLive',
+                            extractor_key TEXT
                         );
                         CREATE INDEX idx_videos_native_id ON videos(source_url, native_id);
 
@@ -570,7 +573,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
 
                 using var version = conn.CreateCommand();
                 version.CommandText = "PRAGMA user_version";
-                Assert.Equal(7L, (long)version.ExecuteScalar()!);
+                Assert.Equal(8L, (long)version.ExecuteScalar()!);
 
                 using var survivors = conn.CreateCommand();
                 survivors.CommandText = "SELECT id FROM videos ORDER BY id";
@@ -648,8 +651,10 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                             video_url     TEXT NOT NULL,
                             synced_at     TEXT NOT NULL,
                             native_id     TEXT,
+                            extras        TEXT,
                             first_seen_at TEXT,
-                            live_status   TEXT NOT NULL DEFAULT 'NotLive'
+                            live_status   TEXT NOT NULL DEFAULT 'NotLive',
+                            extractor_key TEXT
                         );
                         INSERT INTO sources (url) VALUES ('https://example.test/a');
                         INSERT INTO videos (id, source_url, video_url, synced_at, native_id, first_seen_at)
@@ -706,8 +711,10 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                             video_url     TEXT NOT NULL,
                             synced_at     TEXT NOT NULL,
                             native_id     TEXT,
+                            extras        TEXT,
                             first_seen_at TEXT,
-                            live_status   TEXT NOT NULL DEFAULT 'NotLive'
+                            live_status   TEXT NOT NULL DEFAULT 'NotLive',
+                            extractor_key TEXT
                         );
 
                         -- A table holding the name migration v7 gives its index. DROP INDEX IF
@@ -791,24 +798,274 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
             }
         }
 
+        /// <summary>
+        /// Migration v8 on a v7 database: a row that already carries metadata has been paid for and
+        /// is resolved; a row with none has never been resolved and is pending, for the resolver to
+        /// take. Nothing is re-downloaded and nothing is lost.
+        /// </summary>
         [Fact]
-        public void EnsureCreated_LeavesTheSchemaAtVersion7()
+        public void EnsureCreated_MigrationV8_MarksRowsThatAlreadyHaveMetadataAsResolved()
+        {
+            var path = Path.GetTempFileName();
+            try
+            {
+                using (var seed = new SqliteConnection($"Data Source={path}"))
+                {
+                    seed.Open();
+                    using var cmd = seed.CreateCommand();
+                    cmd.CommandText = """
+                        CREATE TABLE sources (
+                            url         TEXT PRIMARY KEY,
+                            name        TEXT,
+                            video_count INTEGER NOT NULL DEFAULT 0
+                        );
+                        CREATE TABLE videos (
+                            id            TEXT PRIMARY KEY,
+                            source_url    TEXT NOT NULL REFERENCES sources(url),
+                            video_url     TEXT NOT NULL,
+                            synced_at     TEXT NOT NULL,
+                            native_id     TEXT,
+                            extractor_key TEXT,
+                            extras        TEXT,
+                            first_seen_at TEXT,
+                            live_status   TEXT NOT NULL DEFAULT 'NotLive'
+                        );
+                        CREATE UNIQUE INDEX idx_videos_native_id ON videos(source_url, native_id);
+
+                        INSERT INTO sources (url) VALUES ('https://example.test/a');
+                        INSERT INTO videos (id, source_url, video_url, synced_at, native_id, extras)
+                        VALUES ('has-metadata', 'https://example.test/a', 'https://example.test/v/1',
+                                '2026-10-12T00:00:00+00:00', 'one', '{"Version":1}'),
+                               ('empty-extras', 'https://example.test/a', 'https://example.test/v/2',
+                                '2026-10-12T00:00:00+00:00', 'two', ''),
+                               ('no-extras', 'https://example.test/a', 'https://example.test/v/3',
+                                '2026-10-12T00:00:00+00:00', 'three', NULL);
+                        PRAGMA user_version = 7;
+                        """;
+                    cmd.ExecuteNonQuery();
+                }
+
+                using var upgraded = new VodDatabase(path, NullLogger<VodDatabase>.Instance);
+                upgraded.EnsureCreated();
+
+                using var conn = new SqliteConnection($"Data Source={path}");
+                conn.Open();
+                using var states = conn.CreateCommand();
+                states.CommandText = "SELECT id, resolution_state FROM videos ORDER BY id";
+                var byId = new Dictionary<string, string>(StringComparer.Ordinal);
+                using (var reader = states.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        byId[reader.GetString(0)] = reader.GetString(1);
+                    }
+                }
+
+                Assert.Equal("Resolved", byId["has-metadata"]);
+                Assert.Equal("Pending", byId["empty-extras"]);
+                Assert.Equal("Pending", byId["no-extras"]);
+            }
+            finally
+            {
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+        }
+
+        [Fact]
+        public void UpsertVideo_RoundTripsTheResolutionColumns()
+        {
+            var attempted = new DateTimeOffset(2026, 10, 12, 8, 30, 0, TimeSpan.Zero);
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/rt" });
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = "uuid-resolution",
+                SourceUrl = "https://example.test/rt",
+                VideoUrl = "https://example.test/v/rt",
+                NativeId = "rt",
+                SyncedAt = attempted,
+                ResolutionState = ResolutionState.Failed,
+                ResolutionAttemptedAt = attempted,
+                ResolutionAttempts = 3,
+                ResolutionError = "ERROR: [youtube] rt: Something unrecognised",
+                ListingPosition = 7,
+            });
+
+            var read = _db.GetVideoByUuid("uuid-resolution");
+
+            Assert.NotNull(read);
+            Assert.Equal(ResolutionState.Failed, read!.ResolutionState);
+            Assert.Equal(attempted, read.ResolutionAttemptedAt);
+            Assert.Equal(3, read.ResolutionAttempts);
+            Assert.Equal("ERROR: [youtube] rt: Something unrecognised", read.ResolutionError);
+            Assert.Equal(7, read.ListingPosition);
+        }
+
+        [Fact]
+        public void UpsertSource_RoundTripsLastResolvedAt()
+        {
+            var resolved = new DateTimeOffset(2026, 10, 12, 9, 0, 0, TimeSpan.Zero);
+            _db.UpsertSource(new SourceRecord
+            {
+                Url = "https://example.test/lr",
+                LastResolvedAt = resolved,
+            });
+
+            Assert.Equal(resolved, _db.GetSource("https://example.test/lr")!.LastResolvedAt);
+        }
+
+        [Fact]
+        public void UpsertVideo_UpdatesTheResolutionColumns_OnASecondPass()
+        {
+            // The branch every later pass takes. A forgotten or swapped `excluded.…` in the
+            // ON CONFLICT clause would leave the first pass's values in place, and the whole
+            // state machine would look like it worked while never changing anything.
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/up" });
+            var row = new VideoRecord
+            {
+                Id = "uuid-update",
+                SourceUrl = "https://example.test/up",
+                VideoUrl = "https://example.test/v/up",
+                NativeId = "up",
+                SyncedAt = DateTimeOffset.UnixEpoch,
+                ResolutionState = ResolutionState.Pending,
+            };
+            _db.UpsertVideo(row);
+
+            var failedAt = new DateTimeOffset(2026, 10, 13, 6, 0, 0, TimeSpan.Zero);
+            row.ResolutionState = ResolutionState.Failed;
+            row.ResolutionAttemptedAt = failedAt;
+            row.ResolutionAttempts = 2;
+            row.ResolutionError = "unrecognised";
+            row.ListingPosition = 4;
+            _db.UpsertVideo(row);
+
+            var read = _db.GetVideoByUuid("uuid-update")!;
+            Assert.Equal(ResolutionState.Failed, read.ResolutionState);
+            Assert.Equal(failedAt, read.ResolutionAttemptedAt);
+            Assert.Equal(2, read.ResolutionAttempts);
+            Assert.Equal("unrecognised", read.ResolutionError);
+            Assert.Equal(4, read.ListingPosition);
+        }
+
+        [Fact]
+        public void SetListingPositions_RanksEveryRowItIsGiven_WhateverItsState()
+        {
+            // The rank belongs to the listing, so an unavailable or pending row gets it too —
+            // those are exactly the rows a resolver orders by it, having no date to go on.
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/rank" });
+            foreach (var (id, nativeId, state) in new[]
+            {
+                ("rank-a", "a", ResolutionState.Resolved),
+                ("rank-b", "b", ResolutionState.Unavailable),
+                ("rank-c", "c", ResolutionState.Pending),
+            })
+            {
+                _db.UpsertVideo(new VideoRecord
+                {
+                    Id = id,
+                    SourceUrl = "https://example.test/rank",
+                    VideoUrl = "https://example.test/v/" + nativeId,
+                    NativeId = nativeId,
+                    SyncedAt = DateTimeOffset.UnixEpoch,
+                    ResolutionState = state,
+                });
+            }
+
+            _db.SetListingPositions(
+                "https://example.test/rank",
+                new Dictionary<string, int> { ["a"] = 0, ["b"] = 1, ["c"] = 2 });
+
+            Assert.Equal(0, _db.GetVideoByUuid("rank-a")!.ListingPosition);
+            Assert.Equal(1, _db.GetVideoByUuid("rank-b")!.ListingPosition);
+            Assert.Equal(2, _db.GetVideoByUuid("rank-c")!.ListingPosition);
+
+            // A second listing re-ranks: the one that was newest has slipped to second.
+            _db.SetListingPositions(
+                "https://example.test/rank",
+                new Dictionary<string, int> { ["c"] = 0, ["a"] = 1, ["b"] = 2 });
+
+            Assert.Equal(1, _db.GetVideoByUuid("rank-a")!.ListingPosition);
+            Assert.Equal(0, _db.GetVideoByUuid("rank-c")!.ListingPosition);
+        }
+
+        [Fact]
+        public void PublishableQueries_OfferOnlyResolvedRows()
+        {
+            // One notion of "publishable", for both the rows handed to the publisher and the ids
+            // that protect an item from the orphan sweep. With an unfiltered id list, excluding a
+            // row from the expected set leaves its library item in place for ever: the sweep skips
+            // any item whose video the database still knows.
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/pub" });
+
+            foreach (var (id, nativeId, state) in new[]
+            {
+                ("pub-resolved", "r1", ResolutionState.Resolved),
+                ("pub-pending", "p1", ResolutionState.Pending),
+                ("pub-unavailable", "u1", ResolutionState.Unavailable),
+                ("pub-failed", "f1", ResolutionState.Failed),
+            })
+            {
+                _db.UpsertVideo(new VideoRecord
+                {
+                    Id = id,
+                    SourceUrl = "https://example.test/pub",
+                    VideoUrl = "https://example.test/v/" + nativeId,
+                    NativeId = nativeId,
+                    SyncedAt = DateTimeOffset.UnixEpoch,
+                    ResolutionState = state,
+                });
+            }
+
+            Assert.Equal(
+                ["pub-resolved"],
+                _db.GetPublishableVideosBySource("https://example.test/pub").Select(v => v.Id));
+            Assert.Equal(["pub-resolved"], _db.GetPublishableVideoIds());
+
+            // The unfiltered reads keep their meaning: the resolver needs every row.
+            Assert.Equal(4, _db.GetVideosBySource("https://example.test/pub").Count);
+            Assert.Equal(4, _db.GetAllVideoIds().Count);
+        }
+
+        [Fact]
+        public void EnsureCreated_LeavesTheSchemaAtVersion8()
         {
             using var conn = new SqliteConnection($"Data Source={_dbPath}");
             conn.Open();
             using var cmd = conn.CreateCommand();
             cmd.CommandText = "PRAGMA user_version";
 
-            Assert.Equal(7L, (long)cmd.ExecuteScalar()!);
+            Assert.Equal(8L, (long)cmd.ExecuteScalar()!);
         }
 
-        /// <summary>
-        /// The UNIQUE index on <c>(source_url, native_id)</c> on a database created from scratch.
-        /// The migrated path is covered by
-        /// <see cref="EnsureCreated_MigrationV7_KeepsOneRowPerNativeIdAndRefusesNewDuplicates"/>,
-        /// and the two paths are the ones that drift: a change made to a migration script but
-        /// forgotten in the CREATE statements only shows up on one of them.
-        /// </summary>
+        [Fact]
+        public void EnsureCreated_GivesAFreshDatabaseTheResolutionColumnsAndIndex()
+        {
+            using var conn = new SqliteConnection($"Data Source={_dbPath}");
+            conn.Open();
+
+            using var columns = conn.CreateCommand();
+            columns.CommandText =
+                "SELECT GROUP_CONCAT(name) FROM pragma_table_info('videos') "
+                + "WHERE name IN ('resolution_state','resolution_attempted_at','resolution_attempts',"
+                + "'resolution_error','listing_position')";
+            var found = (string?)columns.ExecuteScalar();
+            Assert.NotNull(found);
+            Assert.Equal(5, found!.Split(',').Length);
+
+            using var sourceColumn = conn.CreateCommand();
+            sourceColumn.CommandText =
+                "SELECT name FROM pragma_table_info('sources') WHERE name = 'last_resolved_at'";
+            Assert.Equal("last_resolved_at", sourceColumn.ExecuteScalar());
+
+            using var index = conn.CreateCommand();
+            index.CommandText =
+                "SELECT GROUP_CONCAT(name) FROM pragma_index_info('idx_videos_resolution')";
+            Assert.Equal("extractor_key,resolution_state", index.ExecuteScalar());
+        }
+
         [Fact]
         public void EnsureCreated_GivesAFreshDatabaseTheUniqueNativeIdIndex()
         {
@@ -871,7 +1128,8 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                             categories     TEXT,
                             channels       TEXT,
                             native_id      TEXT,
-                            is_live        INTEGER NOT NULL DEFAULT 0
+                            is_live        INTEGER NOT NULL DEFAULT 0,
+                            extractor_key TEXT
                         );
                         INSERT INTO videos (id, source_url, video_url, synced_at)
                         VALUES ('legacy', 'https://example.test/s', 'https://example.test/v',
@@ -889,7 +1147,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
 
                 using var version = conn.CreateCommand();
                 version.CommandText = "PRAGMA user_version";
-                Assert.Equal(7L, (long)version.ExecuteScalar()!);
+                Assert.Equal(8L, (long)version.ExecuteScalar()!);
 
                 using var backfilled = conn.CreateCommand();
                 backfilled.CommandText = "SELECT first_seen_at FROM videos WHERE id = 'legacy'";
@@ -1005,7 +1263,8 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                             tags           TEXT,
                             categories     TEXT,
                             native_id      TEXT,
-                            is_live        INTEGER NOT NULL DEFAULT 0
+                            is_live        INTEGER NOT NULL DEFAULT 0,
+                            extractor_key TEXT
                         );
                         PRAGMA user_version = 1;
                         """;
@@ -1020,7 +1279,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
 
                 using var version = conn.CreateCommand();
                 version.CommandText = "PRAGMA user_version";
-                Assert.Equal(7L, (long)version.ExecuteScalar()!);
+                Assert.Equal(8L, (long)version.ExecuteScalar()!);
 
                 using var columns = conn.CreateCommand();
                 columns.CommandText = "SELECT name FROM pragma_table_info('videos') WHERE name = 'extras'";
@@ -1186,7 +1445,8 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                             channels         TEXT,
                             first_seen_at    TEXT,
                             native_id        TEXT,
-                            is_live          INTEGER NOT NULL DEFAULT 0
+                            is_live          INTEGER NOT NULL DEFAULT 0,
+                            extractor_key TEXT
                         );
                         INSERT INTO sources (url, name) VALUES ('__debug__', 'Debug (internal)');
                         INSERT INTO videos  (id, source_url, video_url, synced_at)
@@ -1206,7 +1466,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                 conn.Open();
                 using var version = conn.CreateCommand();
                 version.CommandText = "PRAGMA user_version";
-                Assert.Equal(7L, (long)version.ExecuteScalar()!);
+                Assert.Equal(8L, (long)version.ExecuteScalar()!);
             }
             finally
             {
@@ -1221,7 +1481,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
         /// C3: a v5 database that has the <c>is_live</c> column must gain <c>live_status</c> and
         /// lose <c>is_live</c> after migration v6. This covers the upgrade path every existing
         /// installation takes; a fresh database created from scratch is covered by
-        /// <see cref="EnsureCreated_LeavesTheSchemaAtVersion7"/>.
+        /// <see cref="EnsureCreated_LeavesTheSchemaAtVersion8"/>.
         /// </summary>
         [Fact]
         public void EnsureCreated_MigrationV6_ReplacesIsLiveColumnWithLiveStatus()
@@ -1275,7 +1535,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
 
                 using var version = conn.CreateCommand();
                 version.CommandText = "PRAGMA user_version";
-                Assert.Equal(7L, (long)version.ExecuteScalar()!);
+                Assert.Equal(8L, (long)version.ExecuteScalar()!);
 
                 // live_status must be present (default 'NotLive' applied to the pre-existing row).
                 using var liveStatus = conn.CreateCommand();
@@ -1410,7 +1670,8 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
                             channels       TEXT,
                             first_seen_at  TEXT,
                             native_id      TEXT,
-                            is_live        INTEGER NOT NULL DEFAULT 0
+                            is_live        INTEGER NOT NULL DEFAULT 0,
+                            extractor_key TEXT
                         );
                         PRAGMA user_version = 3;
                         """;

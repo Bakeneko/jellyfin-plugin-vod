@@ -278,6 +278,37 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 .Select(v => v.NativeId!)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
+            // One entry per video before anything reads the listing: a listing can repeat an
+            // entry (measured in production), and two occurrences of an unknown dead entry would
+            // otherwise mint two rows for one native id — which the UNIQUE index of v8's
+            // predecessor refuses, failing the whole pass.
+            var listing = DeduplicateEntries(playlist.Entries, metadataMap);
+
+            // What the listing itself says, for free, before a single call is made. On YouTube
+            // this is most of the work: a dead entry is a template of nulls, and every one of them
+            // used to cost a failing call on every pass.
+            var verdict = ApplyListingVerdict(listing, existingVideos, syncStart);
+            foreach (var row in verdict.Updated)
+            {
+                row.SourceUrl = source.Url;
+                _db.UpsertVideo(row);
+            }
+
+            if (verdict.Unavailable.Count > 0)
+                LogListingDeclaredUnavailable(source.Url, verdict.Unavailable.Count);
+
+            // The rank belongs to the listing, so every row gets it — including the ones this pass
+            // will not fetch, which are exactly the rows a resolver orders by it.
+            var positions = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            for (var i = 0; i < listing.Count; i++)
+                positions[listing[i].Id] = i;
+            _db.SetListingPositions(source.Url, positions);
+
+            // A video the listing just brought back keeps the payload of its earlier life, so the
+            // skip set above would skip it and it would stay pending for ever.
+            foreach (var reopened in verdict.Reopened)
+                skipMetadataIds.Remove(reopened);
+
             var retentionCutoff = source.RetentionDays > 0
                 ? syncStart.AddDays(-source.RetentionDays)
                 : (DateTimeOffset?)null;
@@ -291,7 +322,9 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             _db.TouchVideos(source.Url, seenExistingIds, syncStart);
 
             var newEntries = playlist.Entries
-                .Where(e => !metadataMap.ContainsKey(e.Id) && !skipMetadataIds.Contains(e.Id))
+                .Where(e => !metadataMap.ContainsKey(e.Id)
+                            && !skipMetadataIds.Contains(e.Id)
+                            && !verdict.Unavailable.Contains(e.Id))
                 .ToList();
 
             if (retentionCutoff.HasValue)
@@ -366,10 +399,15 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             // Publication is driven by what the database holds, not by what this pass happened
             // to re-fetch: entries already known are deliberately skipped for metadata, and
             // would otherwise never reach the library.
+            // Only resolved rows are publishable: a pending one has no date, no season and no
+            // episode number, and an unavailable one is exactly what must leave the library.
+            // BOTH arguments have to agree on that: the orphan sweep spares any item whose video
+            // the database still knows, so handing it every id would leave an excluded row's item
+            // in the library for ever and the retirement would never happen.
             await _publisher.ReconcileAsync(
                     target, otherAnchors, sourceRecord, source.Mode, seriesName,
-                    _db.GetVideosBySource(source.Url),
-                    _db.GetAllVideoIds().ToHashSet(StringComparer.OrdinalIgnoreCase),
+                    _db.GetPublishableVideosBySource(source.Url),
+                    _db.GetPublishableVideoIds().ToHashSet(StringComparer.OrdinalIgnoreCase),
                     config.LocalBaseUrl, config.UseReleaseDateAsDateAdded, ct)
                 .ConfigureAwait(false);
 
@@ -611,6 +649,13 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 };
 
                 FillVideoRecord(record, meta, source.Url, effectiveTitle, syncStart, publishedAt);
+
+                // This pass has the metadata in hand, so the row is resolved. (The plan that
+                // follows is what stops the sync from fetching it at all.)
+                record.ResolutionState = ResolutionState.Resolved;
+                record.ResolutionError = null;
+                record.ResolutionAttempts = 0;
+                record.ResolutionAttemptedAt = syncStart;
                 AssignNumbers(
                     record,
                     meta,
@@ -827,6 +872,119 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// </remarks>
         internal static bool MustRefetch(LiveStatus status) => status != LiveStatus.NotLive;
 
+        /// <summary>What a listing said about the entries it carries, before any call is made.</summary>
+        /// <param name="Unavailable">
+        /// The native ids the listing itself declares gone. They must not be fetched.
+        /// </param>
+        /// <param name="Updated">
+        /// The rows whose state changed on the strength of the listing alone — a row to write
+        /// <c>unavailable</c>, or one to bring back to <c>pending</c> because its title reappeared.
+        /// A row built here for an entry the database did not know carries <b>no source url</b>:
+        /// the caller owns that and stamps it before upserting. SQLite refuses the row otherwise,
+        /// so a caller that forgets finds out immediately.
+        /// </param>
+        /// <param name="Reopened">
+        /// The native ids whose title reappeared. They keep the payload of their earlier life, so
+        /// the caller has to lift them out of its skip set or they are never fetched again.
+        /// </param>
+        internal readonly record struct ListingVerdict(
+            IReadOnlySet<string> Unavailable,
+            IReadOnlyList<VideoRecord> Updated,
+            IReadOnlySet<string> Reopened);
+
+        /// <summary>What <c>resolution_error</c> says when the listing itself called a video gone.</summary>
+        internal const string ListingAbsenceError = "absent from the listing";
+
+        /// <summary>
+        /// Reads what a listing says about its own entries, platform by platform, and spends no
+        /// call doing it.
+        /// </summary>
+        /// <param name="entries">The listing's entries.</param>
+        /// <param name="existing">Every row the database holds for this source.</param>
+        /// <param name="now">The pass's timestamp.</param>
+        /// <returns>The ids to skip, and the rows to write.</returns>
+        /// <remarks>
+        /// On YouTube this is the difference between a source that works and one that does not: of
+        /// the 43 entries of the playlist under diagnosis, 33 are dead, and each of them used to
+        /// cost one yt-dlp call on every pass — all failing, writing nothing, and asking again next
+        /// time. That is how a session earns an hour of rate limiting.
+        /// <para>
+        /// A live or upcoming entry is left entirely alone: its title is not stable in a listing
+        /// either, and <see cref="MustRefetch"/> already has it fetched again every pass.
+        /// </para>
+        /// </remarks>
+        internal static ListingVerdict ApplyListingVerdict(
+            IReadOnlyList<PlaylistEntry> entries,
+            IReadOnlyList<VideoRecord> existing,
+            DateTimeOffset now)
+        {
+            ArgumentNullException.ThrowIfNull(entries);
+            ArgumentNullException.ThrowIfNull(existing);
+
+            var byNativeId = BuildNativeIdMap(existing);
+            var unavailable = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var reopened = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var updated = new List<VideoRecord>();
+
+            foreach (var entry in entries)
+            {
+                if (entry.LiveStatus != LiveStatus.NotLive)
+                    continue;
+
+                var stored = byNativeId.GetValueOrDefault(entry.Id);
+                if (stored is not null && MustRefetch(stored.LiveStatus))
+                    continue;
+
+                if (!PlatformRules.ListingTellsUnavailable(entry.IeKey))
+                    continue;
+
+                if (string.IsNullOrWhiteSpace(entry.Title))
+                {
+                    unavailable.Add(entry.Id);
+
+                    // A row only needs writing when this is news: an entry already known gone
+                    // would otherwise be rewritten on every pass for nothing.
+                    if (stored is null || stored.ResolutionState != ResolutionState.Unavailable)
+                    {
+                        var row = stored ?? NewRowFor(entry, now);
+                        row.ResolutionState = ResolutionState.Unavailable;
+                        row.ResolutionError = ListingAbsenceError;
+                        row.ResolutionAttemptedAt = now;
+                        updated.Add(row);
+                    }
+
+                    continue;
+                }
+
+                // Titled again, and we had called it gone on the listing's word: that word is now
+                // the other way, so it goes back in the queue. Free, and immediate — the seven-day
+                // window only governs a verdict a yt-dlp call produced.
+                if (stored is { ResolutionState: ResolutionState.Unavailable }
+                    && string.Equals(stored.ResolutionError, ListingAbsenceError, StringComparison.Ordinal))
+                {
+                    stored.ResolutionState = ResolutionState.Pending;
+                    stored.ResolutionError = null;
+                    stored.ResolutionAttempts = 0;
+                    updated.Add(stored);
+                    reopened.Add(entry.Id);
+                }
+            }
+
+            return new ListingVerdict(unavailable, updated, reopened);
+        }
+
+        private static VideoRecord NewRowFor(PlaylistEntry entry, DateTimeOffset now) => new()
+        {
+            Id = Guid.NewGuid().ToString(),
+            NativeId = entry.Id,
+            ExtractorKey = entry.IeKey,
+            VideoUrl = entry.VideoUrl,
+            Title = entry.Title,
+            SyncedAt = now,
+            FirstSeenAt = now,
+            LiveStatus = entry.LiveStatus,
+        };
+
         /// <summary>The published date to store for a row.</summary>
         /// <remarks>
         /// A scheduled stream's date is its airing time, read from release_timestamp and rewritten on
@@ -926,6 +1084,11 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 return DateTimeOffset.FromUnixTimeSeconds(meta.Timestamp.Value);
             return null;
         }
+
+        [LoggerMessage(EventId = 30, Level = LogLevel.Information,
+            Message = "{SourceUrl}: the listing declares {Count} entr(ies) unavailable; "
+                + "they cost no yt-dlp call")]
+        private partial void LogListingDeclaredUnavailable(string sourceUrl, int count);
 
         [LoggerMessage(EventId = 1, Level = LogLevel.Information, Message = "Starting sync for {SourceUrl}")]
         private partial void LogSyncStarted(string sourceUrl);

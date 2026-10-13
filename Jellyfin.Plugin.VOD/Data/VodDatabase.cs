@@ -45,7 +45,7 @@ namespace Jellyfin.Plugin.VOD.Data
         /// Schema version this build expects, tracked in SQLite's <c>user_version</c>.
         /// Bump it and add the matching case to <see cref="Migrate"/> whenever the schema changes.
         /// </summary>
-        private const int SchemaVersion = 7;
+        private const int SchemaVersion = 8;
 
         /// <inheritdoc />
         public void EnsureCreated()
@@ -263,6 +263,33 @@ namespace Jellyfin.Plugin.VOD.Data
                         """;
                     break;
 
+                case 8:
+                    // The five columns the deferred-resolution design is built on, plus the
+                    // source-level timestamp the configuration page shows.
+                    // The backfill is the honest reading of what a v7 database holds: a row with
+                    // metadata in extras has already been paid for, so it is resolved; one without
+                    // has never been resolved, so it is pending and the resolver will take it. No
+                    // re-download, nothing lost. listing_position stays NULL until the next
+                    // enumeration, which costs nothing — those rows are already resolved.
+                    cmd.CommandText = """
+                        ALTER TABLE videos ADD COLUMN resolution_state        TEXT NOT NULL DEFAULT 'Pending';
+                        ALTER TABLE videos ADD COLUMN resolution_attempted_at TEXT;
+                        ALTER TABLE videos ADD COLUMN resolution_attempts     INTEGER NOT NULL DEFAULT 0;
+                        ALTER TABLE videos ADD COLUMN resolution_error        TEXT;
+                        ALTER TABLE videos ADD COLUMN listing_position        INTEGER;
+
+                        ALTER TABLE sources ADD COLUMN last_resolved_at TEXT;
+
+                        UPDATE videos SET resolution_state = 'Resolved'
+                        WHERE extras IS NOT NULL AND extras <> '';
+
+                        CREATE INDEX IF NOT EXISTS idx_videos_resolution
+                            ON videos(extractor_key, resolution_state);
+
+                        PRAGMA user_version = 8;
+                        """;
+                    break;
+
                 default:
                     throw new InvalidOperationException(
                         $"No migration defined for schema version {version}");
@@ -287,10 +314,12 @@ namespace Jellyfin.Plugin.VOD.Data
                 cmd.CommandText = """
                     INSERT INTO sources
                         (url, name, series_thumbnail_url, series_banner_url, tags, series_synopsis,
-                         last_synced_at, last_error, video_count, published_anchor_id)
+                         last_synced_at, last_error, video_count, published_anchor_id,
+                         last_resolved_at)
                     VALUES
                         ($url, $name, $thumbnailUrl, $bannerUrl, $tags, $synopsis,
-                         $lastSyncedAt, $lastError, $videoCount, $publishedAnchorId)
+                         $lastSyncedAt, $lastError, $videoCount, $publishedAnchorId,
+                         $lastResolvedAt)
                     ON CONFLICT(url) DO UPDATE SET
                         name                 = excluded.name,
                         series_thumbnail_url = excluded.series_thumbnail_url,
@@ -298,6 +327,7 @@ namespace Jellyfin.Plugin.VOD.Data
                         tags                 = excluded.tags,
                         series_synopsis      = excluded.series_synopsis,
                         last_synced_at       = excluded.last_synced_at,
+                        last_resolved_at     = excluded.last_resolved_at,
                         last_error           = excluded.last_error,
                         video_count          = excluded.video_count,
                         published_anchor_id  = excluded.published_anchor_id;
@@ -309,6 +339,8 @@ namespace Jellyfin.Plugin.VOD.Data
                 cmd.Parameters.AddWithValue("$tags", (object?)source.Tags ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$synopsis", (object?)source.SeriesSynopsis ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$lastSyncedAt", (object?)source.LastSyncedAt?.ToString("O") ?? DBNull.Value);
+                cmd.Parameters.AddWithValue(
+                    "$lastResolvedAt", (object?)source.LastResolvedAt?.ToString("O") ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$lastError", (object?)source.LastError ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$videoCount", source.VideoCount);
                 cmd.Parameters.AddWithValue(
@@ -361,13 +393,17 @@ namespace Jellyfin.Plugin.VOD.Data
                          published_at, duration_seconds,
                          season_number, episode_number, synced_at,
                          thumbnail_url, extras,
-                         description, live_status, first_seen_at)
+                         description, live_status, first_seen_at,
+                         resolution_state, resolution_attempted_at, resolution_attempts,
+                         resolution_error, listing_position)
                     VALUES
                         ($id, $sourceUrl, $extractorKey, $nativeId, $videoUrl, $title,
                          $publishedAt, $durationSeconds,
                          $seasonNumber, $episodeNumber, $syncedAt,
                          $thumbnailUrl, $extras,
-                         $description, $liveStatus, $firstSeenAt)
+                         $description, $liveStatus, $firstSeenAt,
+                         $resolutionState, $resolutionAttemptedAt, $resolutionAttempts,
+                         $resolutionError, $listingPosition)
                     ON CONFLICT(id) DO UPDATE SET
                         source_url       = excluded.source_url,
                         extractor_key    = excluded.extractor_key,
@@ -383,6 +419,11 @@ namespace Jellyfin.Plugin.VOD.Data
                         extras           = excluded.extras,
                         description      = excluded.description,
                         live_status      = excluded.live_status,
+                        resolution_state        = excluded.resolution_state,
+                        resolution_attempted_at = excluded.resolution_attempted_at,
+                        resolution_attempts     = excluded.resolution_attempts,
+                        resolution_error        = excluded.resolution_error,
+                        listing_position        = excluded.listing_position,
                         -- Never overwritten: an existing discovery date always beats the one the new
                         -- upsert proposes. This COALESCE is what enforces "set once, never updated".
                         first_seen_at    = COALESCE(videos.first_seen_at, excluded.first_seen_at);
@@ -402,6 +443,76 @@ namespace Jellyfin.Plugin.VOD.Data
                 cmd.Parameters.AddWithValue("$id", uuid);
                 using var r = cmd.ExecuteReader();
                 return r.Read() ? MapVideo(r) : null;
+            }
+        }
+
+        /// <inheritdoc />
+        public void SetListingPositions(string sourceUrl, IReadOnlyDictionary<string, int> positions)
+        {
+            ArgumentNullException.ThrowIfNull(positions);
+
+            if (positions.Count == 0)
+                return;
+
+            lock (_sync)
+            {
+                using var txn = Connection.BeginTransaction();
+                using var cmd = Connection.CreateCommand();
+                cmd.Transaction = txn;
+                cmd.CommandText =
+                    "UPDATE videos SET listing_position = $position "
+                    + "WHERE source_url = $url AND native_id = $nativeId";
+                var url = cmd.Parameters.Add("$url", SqliteType.Text);
+                var nativeId = cmd.Parameters.Add("$nativeId", SqliteType.Text);
+                var position = cmd.Parameters.Add("$position", SqliteType.Integer);
+                url.Value = sourceUrl;
+
+                foreach (var (id, rank) in positions)
+                {
+                    nativeId.Value = id;
+                    position.Value = rank;
+                    cmd.ExecuteNonQuery();
+                }
+
+                txn.Commit();
+            }
+        }
+
+        /// <inheritdoc />
+        public IReadOnlyList<VideoRecord> GetPublishableVideosBySource(string sourceUrl)
+        {
+            lock (_sync)
+            {
+                using var cmd = Connection.CreateCommand();
+                cmd.CommandText =
+                    "SELECT * FROM videos WHERE source_url = $url AND resolution_state = $resolved "
+                    + "ORDER BY published_at, id";
+                cmd.Parameters.AddWithValue("$url", sourceUrl);
+                cmd.Parameters.AddWithValue("$resolved", nameof(ResolutionState.Resolved));
+                using var r = cmd.ExecuteReader();
+                var list = new List<VideoRecord>();
+                while (r.Read())
+                {
+                    list.Add(MapVideo(r));
+                }
+
+                return list;
+            }
+        }
+
+        /// <inheritdoc />
+        public IReadOnlyList<string> GetPublishableVideoIds()
+        {
+            lock (_sync)
+            {
+                using var cmd = Connection.CreateCommand();
+                cmd.CommandText = "SELECT id FROM videos WHERE resolution_state = $resolved";
+                cmd.Parameters.AddWithValue("$resolved", nameof(ResolutionState.Resolved));
+                using var r = cmd.ExecuteReader();
+                var list = new List<string>();
+                while (r.Read())
+                    list.Add(r.GetString(0));
+                return list;
             }
         }
 
@@ -630,6 +741,12 @@ namespace Jellyfin.Plugin.VOD.Data
             cmd.Parameters.AddWithValue("$firstSeenAt", (object?)v.FirstSeenAt?.ToString("O") ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$description", (object?)v.Description ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$liveStatus", v.LiveStatus.ToString());
+            cmd.Parameters.AddWithValue("$resolutionState", v.ResolutionState.ToString());
+            cmd.Parameters.AddWithValue(
+                "$resolutionAttemptedAt", (object?)v.ResolutionAttemptedAt?.ToString("O") ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$resolutionAttempts", v.ResolutionAttempts);
+            cmd.Parameters.AddWithValue("$resolutionError", (object?)v.ResolutionError ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$listingPosition", (object?)v.ListingPosition ?? DBNull.Value);
         }
 
         private static SourceRecord MapSource(SqliteDataReader r)
@@ -665,7 +782,8 @@ namespace Jellyfin.Plugin.VOD.Data
                 LastSyncedAt = D("last_synced_at"),
                 LastError = S("last_error"),
                 VideoCount = r.GetInt32(r.GetOrdinal("video_count")),
-                PublishedAnchorId = G("published_anchor_id")
+                PublishedAnchorId = G("published_anchor_id"),
+                LastResolvedAt = D("last_resolved_at")
             };
         }
 
@@ -712,6 +830,17 @@ namespace Jellyfin.Plugin.VOD.Data
                 LiveStatus = Enum.TryParse<LiveStatus>(S("live_status"), out var ls) && Enum.IsDefined(ls)
                     ? ls
                     : LiveStatus.NotLive,
+
+                // An unparseable state means a newer build wrote it; pending is the safe reading,
+                // since it only costs one resolution and never publishes anything wrong.
+                ResolutionState =
+                    Enum.TryParse<ResolutionState>(S("resolution_state"), out var rs) && Enum.IsDefined(rs)
+                        ? rs
+                        : ResolutionState.Pending,
+                ResolutionAttemptedAt = D("resolution_attempted_at"),
+                ResolutionAttempts = r.GetInt32(r.GetOrdinal("resolution_attempts")),
+                ResolutionError = S("resolution_error"),
+                ListingPosition = I("listing_position"),
             };
         }
 

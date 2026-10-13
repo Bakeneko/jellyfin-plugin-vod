@@ -15,6 +15,40 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
     /// </remarks>
     public static class PlatformRules
     {
+        /// <summary>
+        /// Whether a flat listing from this extractor is informative enough that an entry it says
+        /// nothing about can be called gone — without spending a call to find out.
+        /// </summary>
+        /// <param name="ieKey">The extractor key the listing entry carries.</param>
+        /// <returns><see langword="true"/> only for a platform measured to answer this way.</returns>
+        /// <remarks>
+        /// Measured on 2026-10-12, one platform at a time, because the three disagree on all of it:
+        /// <list type="bullet">
+        /// <item>
+        /// <b>YouTube — true.</b> A dead entry comes back as a template of nulls: no title,
+        /// duration, view count, channel, uploader or availability, only id, url, ie_key and
+        /// thumbnails. Exactly 10 of 43 entries of the playlist under diagnosis had a title, and
+        /// those were exactly the 10 YouTube itself said were watchable ("33 unavailable videos
+        /// have been hidden"). So an untitled entry is gone, for free.
+        /// </item>
+        /// <item>
+        /// <b>Arte — false.</b> The flat listing carries only ie_key and url: 0 titles out of 79.
+        /// The absence of a title means nothing whatsoever.
+        /// </item>
+        /// <item>
+        /// <b>Twitch — false.</b> All 15 of 15 entries titled. A deleted VOD disappears from the
+        /// listing instead, which the orphan sweep already handles.
+        /// </item>
+        /// <item><b>Anything else — false</b>, the prudent answer.</item>
+        /// </list>
+        /// <b>Never</b> replace this with a heuristic such as "the listing is informative when at
+        /// least one entry has a title": applied to Arte, that declares all 79 videos of every
+        /// collection dead. Adding a platform to this list is a measurement, not a deduction.
+        /// </remarks>
+        public static bool ListingTellsUnavailable(string? ieKey)
+            => ieKey is not null
+                && ieKey.StartsWith("Youtube", StringComparison.OrdinalIgnoreCase);
+
         /// <summary>Whether <paramref name="meta"/> was extracted by a Twitch extractor.</summary>
         /// <param name="meta">The metadata yt-dlp returned.</param>
         /// <returns><see langword="true"/> for <c>TwitchStream</c> and <c>TwitchVod</c>.</returns>

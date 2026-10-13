@@ -37,6 +37,36 @@ namespace Jellyfin.Plugin.VOD.Data
         /// <returns>A read-only list of matching <see cref="VideoRecord"/> entries.</returns>
         IReadOnlyList<VideoRecord> GetVideosBySource(string sourceUrl);
 
+        /// <summary>Every row of a source that may be published — those that are resolved.</summary>
+        /// <param name="sourceUrl">The source's URL.</param>
+        /// <returns>The resolved rows, oldest publication date first.</returns>
+        /// <remarks>
+        /// A pending row has no date, no season and no episode number, and an unavailable one is
+        /// exactly what must leave the library. Pairs with <see cref="GetPublishableVideoIds"/>:
+        /// the publisher needs both the rows it should hold and the ids it must not reap, and the
+        /// two have to agree or an excluded row keeps its item for ever.
+        /// </remarks>
+        IReadOnlyList<VideoRecord> GetPublishableVideosBySource(string sourceUrl);
+
+        /// <summary>Records each video's rank in the listing that was just read.</summary>
+        /// <param name="sourceUrl">The source the listing belongs to.</param>
+        /// <param name="positions">Native id to rank, 0 being the newest entry.</param>
+        /// <remarks>
+        /// The rank belongs to the listing, not to a fetch, so it is written for every row the
+        /// listing carries — including the ones a pass does not resolve, which are exactly the
+        /// rows a resolver has to order, since a video that has never been resolved has no date.
+        /// </remarks>
+        void SetListingPositions(string sourceUrl, IReadOnlyDictionary<string, int> positions);
+
+        /// <summary>The ids of every publishable row, across every source.</summary>
+        /// <returns>The resolved rows' ids.</returns>
+        /// <remarks>
+        /// What protects a library item from the orphan sweep. Across all sources on purpose: a
+        /// video another source still resolves is not this pass's to delete.
+        /// </remarks>
+        IReadOnlyList<string> GetPublishableVideoIds();
+
+
         /// <summary>
         /// Returns the video for a given source and platform-native ID, or <see langword="null"/> when not found.
         /// Nothing in the plugin calls this: the sync path keys on the video UUID. It is kept as the

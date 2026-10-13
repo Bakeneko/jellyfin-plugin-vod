@@ -405,6 +405,43 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         }
 
         [Fact]
+        public async Task ProbeSourceCoreAsync_MarksTheRowItWritesAsResolved()
+        {
+            // The probe resolves a broadcast's metadata itself, so the row it writes is resolved.
+            // Left pending, it would be published by this pass — the probe passes its own list —
+            // and then RETIRED by the next sync, which only offers resolved rows to the library.
+            var db = Substitute.For<IVodDatabase>();
+            const string sourceUrl = "https://www.youtube.com/@live2/videos";
+            db.GetVideosBySource(sourceUrl).Returns([]);
+            db.GetAllVideoIds().Returns([]);
+
+            VideoRecord? stored = null;
+            db.When(d => d.UpsertVideo(Arg.Any<VideoRecord>()))
+              .Do(c => stored = c.Arg<VideoRecord>());
+
+            var meta = new VideoMetadata
+            {
+                Id = "airing",
+                ExtractorKey = "Youtube",
+                Title = "On air",
+                FullTitle = "On air",
+                UploadDate = "20261013",
+                LiveStatus = LiveStatus.Live
+            };
+
+            await MakeService(db).ProbeSourceCoreAsync(
+                new PluginConfiguration { SeriesLibraryName = string.Empty },
+                new SourceDefinition { Url = sourceUrl, Mode = SourceMode.Series },
+                SourceType.YoutubeChannel,
+                new SourceRecord { Url = sourceUrl, Name = "A channel" },
+                new ProbeOutcome(true, [meta]),
+                CancellationToken.None);
+
+            Assert.NotNull(stored);
+            Assert.Equal(ResolutionState.Resolved, stored!.ResolutionState);
+        }
+
+        [Fact]
         public async Task ProbeSourceCoreAsync_DoesNotSpendADayRank_OnABroadcastItAlreadyNumbered()
         {
             // A pass re-finds a broadcast it numbered earlier and finds a second, new one. The
