@@ -155,16 +155,20 @@ namespace Jellyfin.Plugin.VOD.Tests.Controllers
             var synced = DateTimeOffset.UtcNow.AddHours(-2);
 
             var rows = VodController.ProjectSourceStatus(
-            [
-                new SourceRecord
+                [
+                    new SourceRecord
+                    {
+                        Url = "https://www.youtube.com/@arte",
+                        Name = "ARTE",
+                        LastSyncedAt = synced,
+                        LastError = null,
+                        VideoCount = 42
+                    }
+                ],
+                new Dictionary<string, ResolutionSummary>(StringComparer.OrdinalIgnoreCase)
                 {
-                    Url = "https://www.youtube.com/@arte",
-                    Name = "ARTE",
-                    LastSyncedAt = synced,
-                    LastError = null,
-                    VideoCount = 42
-                }
-            ]);
+                    ["https://www.youtube.com/@ARTE"] = new(38, 2, 1, 1, false, "boom"),
+                });
 
             var row = Assert.Single(rows);
             Assert.Equal("https://www.youtube.com/@arte", row.Url);
@@ -172,6 +176,22 @@ namespace Jellyfin.Plugin.VOD.Tests.Controllers
             Assert.Equal(synced, row.LastSyncedAt);
             Assert.Null(row.LastError);
             Assert.Equal(42, row.VideoCount);
+            Assert.Equal((38, 2, 1, 1), (row.Resolved, row.Pending, row.Failed, row.Unavailable));
+            Assert.False(row.Settled);
+            Assert.Equal("boom", row.LastResolutionError);
+        }
+
+        [Fact]
+        public void ProjectSourceStatus_ASourceWithNoRows_IsSettledWithZeroCounts()
+        {
+            var rows = VodController.ProjectSourceStatus(
+                [new SourceRecord { Url = "https://example.test/empty" }],
+                new Dictionary<string, ResolutionSummary>(StringComparer.OrdinalIgnoreCase));
+
+            var row = Assert.Single(rows);
+            Assert.Equal((0, 0, 0, 0), (row.Resolved, row.Pending, row.Failed, row.Unavailable));
+            Assert.True(row.Settled);
+            Assert.Null(row.LastResolutionError);
         }
 
         [Fact]
@@ -187,7 +207,8 @@ namespace Jellyfin.Plugin.VOD.Tests.Controllers
                     LastSyncedAt = null,
                     LastError = "No library named 'Vods'."
                 }
-            ]);
+            ],
+            new Dictionary<string, ResolutionSummary>());
 
             var row = Assert.Single(rows);
             Assert.Null(row.LastSyncedAt);
@@ -197,7 +218,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Controllers
 
         [Fact]
         public void ProjectSourceStatus_ReturnsEmptyRatherThanNull_WhenNothingIsConfigured()
-            => Assert.Empty(VodController.ProjectSourceStatus([]));
+            => Assert.Empty(VodController.ProjectSourceStatus([], new Dictionary<string, ResolutionSummary>()));
 
         [Theory]
         [InlineData(null, null, true)]      // no selection: the default rule applies

@@ -50,7 +50,8 @@
       "height": null,
       "fps": null,
       "tbr": null,
-      "language": null
+      "language": null,
+      "manifest_url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/9999999999/ei/fake/ip/0.0.0.0/id/dQw4w9WgXcQ.1/itag/0/source/yt/requiressl/yes/xpc/fake/pc/ytgm/gcr/fr/playlist_type/DVR/manifest.m3u8"
     },
     {
       "format_id": "234",
@@ -60,7 +61,8 @@
       "height": null,
       "fps": null,
       "tbr": null,
-      "language": null
+      "language": null,
+      "manifest_url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/9999999999/ei/fake/ip/0.0.0.0/id/dQw4w9WgXcQ.1/itag/0/source/yt/requiressl/yes/xpc/fake/pc/ytgm/gcr/fr/playlist_type/DVR/manifest.m3u8"
     },
     {
       "format_id": "139-drc",
@@ -170,7 +172,8 @@
       "height": 144,
       "fps": 15.0,
       "tbr": 93.236,
-      "language": null
+      "language": null,
+      "manifest_url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/9999999999/ei/fake/ip/0.0.0.0/id/dQw4w9WgXcQ.1/itag/0/source/yt/requiressl/yes/xpc/fake/pc/ytgm/gcr/fr/playlist_type/DVR/manifest.m3u8"
     },
     {
       "format_id": "269",
@@ -180,7 +183,8 @@
       "height": 144,
       "fps": 30.0,
       "tbr": 169.684,
-      "language": null
+      "language": null,
+      "manifest_url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/9999999999/ei/fake/ip/0.0.0.0/id/dQw4w9WgXcQ.1/itag/0/source/yt/requiressl/yes/xpc/fake/pc/ytgm/gcr/fr/playlist_type/DVR/manifest.m3u8"
     },
     {
       "format_id": "160",
@@ -200,7 +204,8 @@
       "height": 144,
       "fps": 30.0,
       "tbr": 163.17,
-      "language": null
+      "language": null,
+      "manifest_url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/9999999999/ei/fake/ip/0.0.0.0/id/dQw4w9WgXcQ.1/itag/0/source/yt/requiressl/yes/xpc/fake/pc/ytgm/gcr/fr/playlist_type/DVR/manifest.m3u8"
     },
     {
       "format_id": "278",
@@ -230,7 +235,8 @@
       "height": 240,
       "fps": 30.0,
       "tbr": 310.801,
-      "language": null
+      "language": null,
+      "manifest_url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/9999999999/ei/fake/ip/0.0.0.0/id/dQw4w9WgXcQ.1/itag/0/source/yt/requiressl/yes/xpc/fake/pc/ytgm/gcr/fr/playlist_type/DVR/manifest.m3u8"
     },
     {
       "format_id": "133",
@@ -250,7 +256,8 @@
       "height": 240,
       "fps": 30.0,
       "tbr": 296.277,
-      "language": null
+      "language": null,
+      "manifest_url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/9999999999/ei/fake/ip/0.0.0.0/id/dQw4w9WgXcQ.1/itag/0/source/yt/requiressl/yes/xpc/fake/pc/ytgm/gcr/fr/playlist_type/DVR/manifest.m3u8"
     },
     {
       "format_id": "242",
@@ -280,7 +287,8 @@
       "height": 360,
       "fps": 30.0,
       "tbr": 813.45,
-      "language": null
+      "language": null,
+      "manifest_url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/9999999999/ei/fake/ip/0.0.0.0/id/dQw4w9WgXcQ.1/itag/0/source/yt/requiressl/yes/xpc/fake/pc/ytgm/gcr/fr/playlist_type/DVR/manifest.m3u8"
     },
     {
       "format_id": "134",
@@ -300,7 +308,8 @@
       "height": 360,
       "fps": 30.0,
       "tbr": 739.728,
-      "language": null
+      "language": null,
+      "manifest_url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/9999999999/ei/fake/ip/0.0.0.0/id/dQw4w9WgXcQ.1/itag/0/source/yt/requiressl/yes/xpc/fake/pc/ytgm/gcr/fr/playlist_type/DVR/manifest.m3u8"
     },
     {
       "format_id": "243",
@@ -330,7 +339,8 @@
       "height": 480,
       "fps": 30.0,
       "tbr": 1291.038,
-      "language": null
+      "language": null,
+      "manifest_url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/9999999999/ei/fake/ip/0.0.0.0/id/dQw4w9WgXcQ.1/itag/0/source/yt/requiressl/yes/xpc/fake/pc/ytgm/gcr/fr/playlist_type/DVR/manifest.m3u8"
     },
     {
       "format_id": "135",
@@ -350,7 +360,8 @@
       "height": 480,
       "fps": 30.0,
       "tbr": 1137.974,
-      "language": null
+      "language": null,
+      "manifest_url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/9999999999/ei/fake/ip/0.0.0.0/id/dQw4w9WgXcQ.1/itag/0/source/yt/requiressl/yes/xpc/fake/pc/ytgm/gcr/fr/playlist_type/DVR/manifest.m3u8"
     },
     {
       "format_id": "244",
@@ -380,7 +391,8 @@
       "height": 720,
       "fps": 60.0,
       "tbr": 4553.846,
-      "language": null
+      "language": null,
+      "manifest_url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/9999999999/ei/fake/ip/0.0.0.0/id/dQw4w9WgXcQ.1/itag/0/source/yt/requiressl/yes/xpc/fake/pc/ytgm/gcr/fr/playlist_type/DVR/manifest.m3u8"
     },
     {
       "format_id": "298",
@@ -400,7 +412,8 @@
       "height": 720,
       "fps": 60.0,
       "tbr": 3042.627,
-      "language": null
+      "language": null,
+      "manifest_url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/9999999999/ei/fake/ip/0.0.0.0/id/dQw4w9WgXcQ.1/itag/0/source/yt/requiressl/yes/xpc/fake/pc/ytgm/gcr/fr/playlist_type/DVR/manifest.m3u8"
     },
     {
       "format_id": "302",
@@ -430,7 +443,8 @@
       "height": 1080,
       "fps": 60.0,
       "tbr": 7417.746,
-      "language": null
+      "language": null,
+      "manifest_url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/9999999999/ei/fake/ip/0.0.0.0/id/dQw4w9WgXcQ.1/itag/0/source/yt/requiressl/yes/xpc/fake/pc/ytgm/gcr/fr/playlist_type/DVR/manifest.m3u8"
     },
     {
       "format_id": "299",
@@ -450,7 +464,8 @@
       "height": 1080,
       "fps": 60.0,
       "tbr": 5022.446,
-      "language": null
+      "language": null,
+      "manifest_url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/9999999999/ei/fake/ip/0.0.0.0/id/dQw4w9WgXcQ.1/itag/0/source/yt/requiressl/yes/xpc/fake/pc/ytgm/gcr/fr/playlist_type/DVR/manifest.m3u8"
     },
     {
       "format_id": "303",
@@ -480,7 +495,8 @@
       "height": 1440,
       "fps": 60.0,
       "tbr": 14050.349,
-      "language": null
+      "language": null,
+      "manifest_url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/9999999999/ei/fake/ip/0.0.0.0/id/dQw4w9WgXcQ.1/itag/0/source/yt/requiressl/yes/xpc/fake/pc/ytgm/gcr/fr/playlist_type/DVR/manifest.m3u8"
     },
     {
       "format_id": "308",
@@ -510,7 +526,8 @@
       "height": 2160,
       "fps": 60.0,
       "tbr": 27987.109,
-      "language": null
+      "language": null,
+      "manifest_url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/9999999999/ei/fake/ip/0.0.0.0/id/dQw4w9WgXcQ.1/itag/0/source/yt/requiressl/yes/xpc/fake/pc/ytgm/gcr/fr/playlist_type/DVR/manifest.m3u8"
     },
     {
       "format_id": "315",

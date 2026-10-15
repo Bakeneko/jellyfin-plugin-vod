@@ -103,21 +103,28 @@ namespace Jellyfin.Plugin.VOD.Configuration
         public int YtDlpCallsPerMinute { get; set; } = 20;
 
         /// <summary>
-        /// Gets or sets how many videos the stream description task describes per pass.
-        /// Zero or less disables the task; the description at playback stays active either way.
+        /// Gets or sets how many videos one resolution wave fetches before republishing its source.
         /// </summary>
         /// <remarks>
-        /// Each video costs one yt-dlp resolution and at most one heavy probe (up to ~25 MB read).
-        /// Ten videos every fifteen minutes is about 960 a day, which clears a large library in a
-        /// day or two without the burst that earns an anti-bot answer.
+        /// The scheduling grain, not a brake: the throttle holds the rate. At the default rate of
+        /// 20 calls a minute per platform, a wave is exactly one minute of that platform's budget —
+        /// so a video added to any source is visible within about a minute, whatever the backlog,
+        /// and a source is republished once a minute while it is being served.
         /// </remarks>
-        public int StreamDescriptionBatchSize { get; set; } = 10;
+        public int ResolutionWaveSize { get; set; } = 20;
 
         /// <summary>
-        /// Gets or sets how many hours a video whose description failed is left alone before
-        /// another pass tries it again.
+        /// Gets or sets the base backoff, in minutes, before a video whose resolution failed is
+        /// tried again.
         /// </summary>
-        public int StreamDescriptionRetryHours { get; set; } = 24;
+        /// <remarks>
+        /// Doubled on each consecutive failure and capped at seven days: 15 min, 30 min, 1 h, 2 h…
+        /// which reaches the cap on the eleventh attempt, so a permanently broken video costs
+        /// about ten calls over eleven days. A failure the platform caused — a rate limit, a
+        /// timeout — does not count towards this, or one bad window would push every video of a
+        /// source a step further out.
+        /// </remarks>
+        public int ResolutionRetryMinutes { get; set; } = 15;
 
         // ── Sync ─────────────────────────────────────────────────────────────────
 

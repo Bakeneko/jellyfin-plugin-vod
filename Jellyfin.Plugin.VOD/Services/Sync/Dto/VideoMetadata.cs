@@ -34,6 +34,17 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
         /// <summary>How many formats yt-dlp listed, whatever their kind.</summary>
         public int FormatCount { get; init; }
 
+        /// <summary>The HLS master URL this video's formats point at, when any of them does.</summary>
+        /// <remarks>
+        /// Every <c>m3u8_native</c> format of one video names the same master (measured
+        /// 2026-10-12: 17 of 53 formats, one URL), so carrying it here means a resolution costs
+        /// exactly one yt-dlp call — the metadata and the master arrive together. The URL's
+        /// <c>expire</c> parameter puts its validity at six hours, which is ample for a
+        /// description that happens seconds later. Null when the video is not served over HLS at
+        /// all, which is not a failure: the metadata is complete either way.
+        /// </remarks>
+        public string? ManifestUrl { get; init; }
+
         /// <summary>Whether the extraction proves nothing can be played.</summary>
         /// <remarks>
         /// <c>--ignore-no-formats-error</c> is required to read a scheduled live, which has no format
@@ -155,6 +166,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
                 var audioTracks = new List<AudioTrack>();
                 var formatCount = 0;
                 var seenQualities = new HashSet<(int, string, int?)>();
+                string? manifestUrl = null;
 
                 if (root.TryGetProperty("formats", out var formats)
                     && formats.ValueKind == JsonValueKind.Array)
@@ -164,6 +176,19 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
                         formatCount++;
                         if (!IsHlsFormat(fmt))
                             continue;
+
+                        // The first m3u8 master is the master: every HLS format of one video names
+                        // the same one.
+                        if (manifestUrl is null
+                            && fmt.TryGetProperty("manifest_url", out var manifest)
+                            && manifest.ValueKind == JsonValueKind.String
+                            && fmt.TryGetProperty("protocol", out var protocol)
+                            && protocol.ValueKind == JsonValueKind.String
+                            && (protocol.GetString() ?? string.Empty)
+                                .StartsWith("m3u8", StringComparison.OrdinalIgnoreCase))
+                        {
+                            manifestUrl = manifest.GetString();
+                        }
 
                         var vcodec = ReadString(fmt, "vcodec");
                         if (string.Equals(vcodec, "none", StringComparison.OrdinalIgnoreCase))
@@ -225,6 +250,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
                     ReleaseTimestamp = root.TryGetProperty("release_timestamp", out var rt) && rt.ValueKind == JsonValueKind.Number
                         ? rt.GetInt64() : null,
                     FormatCount = formatCount,
+                    ManifestUrl = manifestUrl,
                     Qualities = qualities,
                     AudioTracks = audioTracks,
                     SubtitleLanguages = subLangs,

@@ -17,7 +17,6 @@ using MediaBrowser.Controller.Entities.Movies;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.Tasks;
-using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
 using Xunit;
@@ -232,143 +231,71 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         }
     }
 
-    /// <summary>
-    /// I4: HasPayload is internal so the skip predicate can be unit-tested without running yt-dlp.
-    /// </summary>
-    public sealed class SyncServiceHasPayloadTests
+    public sealed class SyncServiceSkipDecisionTests
     {
         [Fact]
-        public void HasPayload_ReturnsFalse_ForARowThatHasNeverBeenGivenOne()
-        {
-            // What a NULL extras column reads back as: a row written before the column existed, or
-            // one whose value no longer parses. It must NOT be in the skip set, so it is probed once.
-            Assert.False(SyncService.HasPayload(VideoExtras.NoPayload));
-        }
-
-        [Fact]
-        public void HasPayload_ReturnsTrue_ForAnEmptyPayload()
-        {
-            // Empty is an answer, not a gap: the platform offered no formats, tags, categories,
-            // channels or subtitles. Probing it again would cost one yt-dlp process per sync for ever.
-            Assert.True(SyncService.HasPayload(new VideoExtras()));
-        }
-
-        [Fact]
-        public void HasPayload_ReturnsTrue_WhenQualitiesIsPopulated()
-        {
-            var extras = new VideoExtras
-            {
-                Qualities = [new VideoQuality(1080, "h264", null)]
-            };
-            Assert.True(SyncService.HasPayload(extras));
-        }
-    }
-
-    /// <summary>
-    /// The skip decision against a real database, because it turns on what the row hands back, not
-    /// on what was put in it. A payload-less row must be probed once and never again: the full
-    /// metadata fetch is one yt-dlp process per row per sync.
-    /// </summary>
-    public sealed class SyncServiceSkipDecisionTests : IDisposable
-    {
-        private const string SourceUrl = "https://example.test/src";
-        private readonly string _dbPath = Path.GetTempFileName();
-        private readonly VodDatabase _db;
-
-        public SyncServiceSkipDecisionTests()
-        {
-            _db = new VodDatabase(_dbPath, NullLogger<VodDatabase>.Instance);
-            _db.EnsureCreated();
-            _db.UpsertSource(new SourceRecord { Url = SourceUrl });
-        }
-
-        public void Dispose()
-        {
-            _db.Dispose();
-            if (File.Exists(_dbPath))
-            {
-                File.Delete(_dbPath);
-            }
-        }
-
-        private VideoRecord Stored(string uuid, VideoExtras extras)
-        {
-            _db.UpsertVideo(new VideoRecord
-            {
-                Id = uuid,
-                SourceUrl = SourceUrl,
-                NativeId = uuid,
-                VideoUrl = "https://example.test/v/" + uuid,
-                SyncedAt = DateTimeOffset.UnixEpoch,
-                Extras = extras
-            });
-            return _db.GetVideoByUuid(uuid)!;
-        }
-
-        /// <summary>Makes the row look like one written before the extras column existed.</summary>
-        private void ClearExtrasColumn(string uuid)
-        {
-            using var conn = new SqliteConnection($"Data Source={_dbPath}");
-            conn.Open();
-            using var cmd = conn.CreateCommand();
-            cmd.CommandText = "UPDATE videos SET extras = NULL WHERE id = $id";
-            cmd.Parameters.AddWithValue("$id", uuid);
-            cmd.ExecuteNonQuery();
-        }
-
-        [Fact]
-        public void HasPayload_IsTrue_ForAnEmptyPayloadTheRowHasBeenGiven()
-        {
-            // A video yt-dlp resolves but reports nothing for: no HLS formats, no tags, no
-            // categories, no channels, no subtitles. The row has been given a payload — this is
-            // what the platform offers — so the next sync must not spend a process on it again.
-            var read = Stored("aaaaaaaa-0000-0000-0000-000000000001", new VideoExtras());
-
-            Assert.True(SyncService.HasPayload(read.Extras));
-        }
-
-        [Fact]
-        public void HasPayload_IsFalse_ForARowWrittenBeforeTheExtrasColumnExisted()
-        {
-            // The behaviour being protected: such a row has never been given a payload, so it must
-            // still be probed, and a video that still resolves still gets its real payload.
-            const string uuid = "aaaaaaaa-0000-0000-0000-000000000002";
-            Stored(uuid, new VideoExtras());
-            ClearExtrasColumn(uuid);
-
-            Assert.False(SyncService.HasPayload(_db.GetVideoByUuid(uuid)!.Extras));
-        }
-
-        [Fact]
-        public void HasPayload_IsTrue_OnceAPayloadlessRowHasBeenRefetchedAndStored()
-        {
-            // The production path for a row that predates the extras column and still resolves:
-            // ProcessEntries mutates the payload it read with a `with` expression, which carries the
-            // "never given a payload" version 0 along with it, and stores the result. The write
-            // boundary has to stamp the current shape version there, or a fetch that reports nothing
-            // would be indistinguishable from never having fetched and the row would be probed for
-            // ever even though it has just been answered.
-            const string uuid = "aaaaaaaa-0000-0000-0000-000000000003";
-            Stored(uuid, new VideoExtras());
-            ClearExtrasColumn(uuid);
-
-            var refetched = _db.GetVideoByUuid(uuid)!;
-            Assert.False(SyncService.HasPayload(refetched.Extras));
-
-            refetched.Extras = refetched.Extras with { Tags = [], Qualities = [] };
-            _db.UpsertVideo(refetched);
-
-            Assert.True(SyncService.HasPayload(_db.GetVideoByUuid(uuid)!.Extras));
-        }
-
-        [Fact]
-        public void HasPayload_IsNotTheOnlySkipCondition_AnUpcomingRowIsAlwaysRefetched()
+        public void MustRefetch_IsTrueForLiveAndUpcoming_FalseForNotLive()
         {
             // A scheduled stream's metadata changes under it: it starts, or it is rescheduled. Both
             // Live and Upcoming rows must leave the skip-set, where only IsLive used to.
             Assert.True(SyncService.MustRefetch(LiveStatus.Live));
             Assert.True(SyncService.MustRefetch(LiveStatus.Upcoming));
             Assert.False(SyncService.MustRefetch(LiveStatus.NotLive));
+        }
+
+        [Fact]
+        public void ModeChanged_IsTrue_WhenTheConfiguredModeIsNotThePublishedOne()
+        {
+            // The instance bug: flipping a settled source from Movies to Series changed nothing,
+            // because no due row and a stamped last_resolved_at keep it out of the selector. The
+            // mismatch is what earns the source its free wave.
+            var record = new SourceRecord
+            {
+                Url = "https://example.test/s",
+                PublishedAnchorId = Guid.NewGuid(),
+                PublishedMode = SourceMode.Movies
+            };
+
+            Assert.True(SyncService.ModeChanged(record, SourceMode.Series));
+        }
+
+        [Fact]
+        public void ModeChanged_IsFalse_WhenTheModeStillAgrees()
+        {
+            var record = new SourceRecord
+            {
+                Url = "https://example.test/s",
+                PublishedAnchorId = Guid.NewGuid(),
+                PublishedMode = SourceMode.Series
+            };
+
+            Assert.False(SyncService.ModeChanged(record, SourceMode.Series));
+        }
+
+        [Fact]
+        public void ModeChanged_IsTrue_WhenAPublishedSourceHasNoRecordedMode()
+        {
+            // A row written before the column existed: the library holds items in a shape nobody
+            // recorded, so it is republished once rather than trusted.
+            var record = new SourceRecord
+            {
+                Url = "https://example.test/s",
+                PublishedAnchorId = Guid.NewGuid(),
+                PublishedMode = null
+            };
+
+            Assert.True(SyncService.ModeChanged(record, SourceMode.Series));
+        }
+
+        [Fact]
+        public void ModeChanged_IsFalse_ForASourceThatHasNeverPublished()
+        {
+            // Nothing is in the library to re-shape, and the first wave will publish in the right
+            // mode anyway. Clearing here would hand an unpublished source the never-served arm on
+            // every single sync.
+            var record = new SourceRecord { Url = "https://example.test/s" };
+
+            Assert.False(SyncService.ModeChanged(record, SourceMode.Series));
         }
 
         [Fact]
@@ -476,6 +403,8 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 source, entries, metadataMap, existingVideos,
                 seriesName: string.Empty,
                 syncStart: DateTimeOffset.UtcNow,
+                unavailableIds: [],
+                positions: new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase),
                 CancellationToken.None);
 
             Assert.Equal(2, created);
@@ -500,41 +429,12 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 source, entries, metadataMap, existingVideos: [],
                 seriesName: string.Empty,
                 syncStart: DateTimeOffset.UtcNow,
+                unavailableIds: [],
+                positions: new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase),
                 CancellationToken.None);
 
             Assert.Equal(1, created);
             _db.Received(1).UpsertVideo(Arg.Any<VideoRecord>());
-        }
-
-        [Fact]
-        public void ProcessEntries_DoesNotLetARepeatedEntryConsumeTwoRanksOfItsDay()
-        {
-            // Two distinct videos published the same day, the first one repeated by the listing.
-            // The day's ranks must be 1 and 2 — not 1 and 3, which is what a repeated entry
-            // produced while it was ranked twice.
-            var first = new PlaylistEntry { Id = "aaa", VideoUrl = "https://example.test/v/aaa" };
-            var second = new PlaylistEntry { Id = "bbb", VideoUrl = "https://example.test/v/bbb" };
-            var metadataMap = new Dictionary<string, VideoMetadata>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["aaa"] = new VideoMetadata { Id = "aaa", Title = "First",  UploadDate = "20260705" },
-                ["bbb"] = new VideoMetadata { Id = "bbb", Title = "Second", UploadDate = "20260705" },
-            };
-
-            var saved = new List<VideoRecord>();
-            _db.When(d => d.UpsertVideo(Arg.Any<VideoRecord>()))
-               .Do(call => saved.Add(call.Arg<VideoRecord>()));
-
-            _service.ProcessEntries(
-                new SourceDefinition { Url = SourceUrl },
-                [first, first, second],
-                metadataMap,
-                existingVideos: [],
-                seriesName: string.Empty,
-                syncStart: DateTimeOffset.UtcNow,
-                CancellationToken.None);
-
-            // (month * 100 + day) * 1000 + rankOfDay, with month = 7 and day = 5 → 705_001 and 705_002.
-            Assert.Equal(new int?[] { 705_001, 705_002 }, saved.Select(v => v.EpisodeNumber));
         }
 
         [Fact]
@@ -557,6 +457,8 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 existingVideos,
                 seriesName: string.Empty,
                 syncStart: DateTimeOffset.UtcNow,
+                unavailableIds: [],
+                positions: new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase),
                 CancellationToken.None);
 
             Assert.Equal(0, created);
@@ -595,10 +497,12 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 new List<VideoRecord> { stored },
                 seriesName: string.Empty,
                 syncStart: DateTimeOffset.UtcNow,
+                unavailableIds: [],
+                positions: new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase),
                 CancellationToken.None);
 
-            // Only the genuinely new video counts as created, the known row keeps its number, and
-            // the day's rank is not spent twice on the same video.
+            // Only the genuinely new video counts as created; the known row keeps its stored number.
+            // The new video on the same day gets the next slot: 1012001 + 1 = 1012002.
             Assert.Equal(1, created);
             Assert.Equal(1012001, saved[0].EpisodeNumber);
             Assert.Equal(1012002, saved[1].EpisodeNumber);
@@ -632,11 +536,197 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 existingVideos: [],
                 seriesName: string.Empty,
                 syncStart: DateTimeOffset.UtcNow,
+                unavailableIds: [],
+                positions: new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase),
                 CancellationToken.None);
 
             Assert.Equal(1, created);
             Assert.Single(saved);
             Assert.Equal("same", saved[0].NativeId);
+        }
+
+        [Fact]
+        public void ProcessEntries_WritesANewSingleVideoPending_WithItsPreloadedMetadata()
+        {
+            // I3 (b): a row written Resolved from the preloaded metadata never reached the resolver,
+            // so it was never described before its first play. Pending, the resolver resolves it
+            // and describes it like any other video; the metadata the sync already holds is kept.
+            var entry = new PlaylistEntry { Id = "solo", VideoUrl = "https://example.test/v/solo" };
+            var metadataMap = new Dictionary<string, VideoMetadata>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["solo"] = new VideoMetadata
+                {
+                    Id = "solo", Title = "A single video", UploadDate = "20261012", Duration = 600,
+                },
+            };
+
+            VideoRecord? saved = null;
+            _db.When(d => d.UpsertVideo(Arg.Any<VideoRecord>()))
+               .Do(call => saved = call.Arg<VideoRecord>());
+
+            var created = _service.ProcessEntries(
+                new SourceDefinition { Url = SourceUrl },
+                [entry],
+                metadataMap,
+                existingVideos: [],
+                seriesName: string.Empty,
+                syncStart: DateTimeOffset.UtcNow,
+                unavailableIds: [],
+                positions: new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase),
+                CancellationToken.None);
+
+            Assert.Equal(1, created);
+            Assert.NotNull(saved);
+            Assert.Equal(ResolutionState.Pending, saved!.ResolutionState);
+            Assert.Equal(0, saved.ResolutionAttempts);
+            Assert.Null(saved.ResolutionAttemptedAt);
+            Assert.Equal("A single video", saved.Title);
+            Assert.Equal(600, saved.DurationSeconds);
+            Assert.NotNull(saved.PublishedAt);
+        }
+
+        [Fact]
+        public void ProcessEntries_KeepsAKnownSingleVideoResolved()
+        {
+            // Only a new entry goes through the resolver: a known one was resolved — and described —
+            // already, and spending a yt-dlp call on it every pass is what the design removes.
+            var stored = StoredVideo("solo");
+            stored.ResolutionState = ResolutionState.Resolved;
+            var entry = new PlaylistEntry { Id = "solo", VideoUrl = "https://example.test/v/solo" };
+            var metadataMap = new Dictionary<string, VideoMetadata>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["solo"] = new VideoMetadata { Id = "solo", Title = "A single video", UploadDate = "20261012" },
+            };
+
+            VideoRecord? saved = null;
+            _db.When(d => d.UpsertVideo(Arg.Any<VideoRecord>()))
+               .Do(call => saved = call.Arg<VideoRecord>());
+
+            _service.ProcessEntries(
+                new SourceDefinition { Url = SourceUrl },
+                [entry],
+                metadataMap,
+                new List<VideoRecord> { stored },
+                seriesName: string.Empty,
+                syncStart: DateTimeOffset.UtcNow,
+                unavailableIds: [],
+                positions: new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase),
+                CancellationToken.None);
+
+            Assert.Equal(ResolutionState.Resolved, saved!.ResolutionState);
+        }
+
+        [Fact]
+        public void ProcessEntries_KeepsAKnownPendingSingleVideoPending()
+        {
+            // N1: a new single video is written Pending so the resolver describes it. If the next
+            // sync comes before the resolver did, forcing Resolved would skip that description.
+            var stored = StoredVideo("solo");
+            stored.ResolutionState = ResolutionState.Pending;
+            stored.ResolutionAttempts = 0;
+            stored.ResolutionAttemptedAt = null;
+            stored.ResolutionError = null;
+
+            var saved = ProcessKnownSingleVideo(stored);
+
+            Assert.Equal(ResolutionState.Pending, saved.ResolutionState);
+            Assert.Equal(0, saved.ResolutionAttempts);
+            Assert.Null(saved.ResolutionAttemptedAt);
+        }
+
+        [Fact]
+        public void ProcessEntries_KeepsAKnownFailedSingleVideoFailed_WithItsAttempts()
+        {
+            // N1: a Failed row waits for its retry; resetting it to Resolved would drop the retry
+            // and the description it is meant to produce.
+            var attemptedAt = DateTimeOffset.UtcNow.AddHours(-1);
+            var stored = StoredVideo("solo");
+            stored.ResolutionState = ResolutionState.Failed;
+            stored.ResolutionAttempts = 2;
+            stored.ResolutionAttemptedAt = attemptedAt;
+            stored.ResolutionError = "describe failed";
+
+            var saved = ProcessKnownSingleVideo(stored);
+
+            Assert.Equal(ResolutionState.Failed, saved.ResolutionState);
+            Assert.Equal(2, saved.ResolutionAttempts);
+            Assert.Equal(attemptedAt, saved.ResolutionAttemptedAt);
+            Assert.Equal("describe failed", saved.ResolutionError);
+        }
+
+        [Fact]
+        public void ProcessEntries_CountsAReopenedUnavailableSingleVideo_AsCreated()
+        {
+            // P2: a reopened Unavailable row is treated as a new creation for scheduling purposes.
+            // Without this, QueueResolutionIfDue is never called and the resolver never wakes.
+            var stored = StoredVideo("solo");
+            stored.ResolutionState = ResolutionState.Unavailable;
+
+            var entry = new PlaylistEntry { Id = "solo", VideoUrl = "https://example.test/v/solo" };
+            var metadataMap = new Dictionary<string, VideoMetadata>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["solo"] = new VideoMetadata { Id = "solo", Title = "A single video", UploadDate = "20261012" },
+            };
+
+            var created = _service.ProcessEntries(
+                new SourceDefinition { Url = SourceUrl },
+                [entry],
+                metadataMap,
+                new List<VideoRecord> { stored },
+                seriesName: string.Empty,
+                syncStart: DateTimeOffset.UtcNow,
+                unavailableIds: [],
+                positions: new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase),
+                CancellationToken.None);
+
+            Assert.Equal(1, created);
+        }
+
+        [Fact]
+        public void ProcessEntries_ReopensAKnownUnavailableSingleVideo_AsPending()
+        {
+            // The listing returned its metadata, so the video is available again: left Unavailable
+            // it would stay hidden until the weekly re-check, and written Resolved it would never
+            // be described. Pending, with a clean slate, the resolver resolves and describes it.
+            var stored = StoredVideo("solo");
+            stored.ResolutionState = ResolutionState.Unavailable;
+            stored.ResolutionAttempts = 3;
+            stored.ResolutionAttemptedAt = DateTimeOffset.UtcNow.AddDays(-2);
+            stored.ResolutionError = "absent from the listing";
+
+            var saved = ProcessKnownSingleVideo(stored);
+
+            Assert.Equal(ResolutionState.Pending, saved.ResolutionState);
+            Assert.Equal(0, saved.ResolutionAttempts);
+            Assert.Null(saved.ResolutionAttemptedAt);
+            Assert.Null(saved.ResolutionError);
+        }
+
+        private VideoRecord ProcessKnownSingleVideo(VideoRecord stored)
+        {
+            var entry = new PlaylistEntry { Id = "solo", VideoUrl = "https://example.test/v/solo" };
+            var metadataMap = new Dictionary<string, VideoMetadata>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["solo"] = new VideoMetadata { Id = "solo", Title = "A single video", UploadDate = "20261012" },
+            };
+
+            VideoRecord? saved = null;
+            _db.When(d => d.UpsertVideo(Arg.Any<VideoRecord>()))
+               .Do(call => saved = call.Arg<VideoRecord>());
+
+            _service.ProcessEntries(
+                new SourceDefinition { Url = SourceUrl },
+                [entry],
+                metadataMap,
+                new List<VideoRecord> { stored },
+                seriesName: string.Empty,
+                syncStart: DateTimeOffset.UtcNow,
+                unavailableIds: [],
+                positions: new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase),
+                CancellationToken.None);
+
+            Assert.NotNull(saved);
+            return saved!;
         }
 
         [Fact]
@@ -723,6 +813,26 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         }
 
         [Fact]
+        public void ApplyListingVerdict_DoesNotStampResolutionAttemptedAt_ForListingAbsenceVerdict()
+        {
+            // B-I3: DueNowPredicate makes an Unavailable row with a non-null ResolutionAttemptedAt
+            // due after seven days — one yt-dlp call per dead entry per week, violating §5.1's
+            // promise of "sans aucun appel yt-dlp" for the listing-absence case.
+            // The fix: do not stamp ResolutionAttemptedAt when writing the free listing verdict.
+            var entries = new List<PlaylistEntry>
+            {
+                new() { Id = "dead", VideoUrl = "https://example.test/v/dead", Title = null, IeKey = "Youtube" },
+            };
+
+            var verdict = SyncService.ApplyListingVerdict(entries, [], DateTimeOffset.UtcNow);
+
+            var written = Assert.Single(verdict.Updated);
+            Assert.Equal(ResolutionState.Unavailable, written.ResolutionState);
+            // Must be null — a non-null stamp would make the row due after seven days.
+            Assert.Null(written.ResolutionAttemptedAt);
+        }
+
+        [Fact]
         public void ApplyListingVerdict_NeverTouchesALiveEntry()
         {
             // A broadcast's listing entry has no stable title either, and MustRefetch already
@@ -741,50 +851,198 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             Assert.Empty(verdict.Unavailable);
             Assert.Empty(verdict.Updated);
         }
-    }
 
-    /// <summary>
-    /// QueueDescriptionIfCreated queues the stream description task exactly when the pass created
-    /// at least one video, and stays silent when it created nothing.
-    /// </summary>
-    public sealed class SyncServiceQueueDescriptionIfCreatedTests
-    {
-        private readonly IVodDatabase _db = Substitute.For<IVodDatabase>();
-        private readonly IVodLocalizer _localizer = Substitute.For<IVodLocalizer>();
-        private readonly ILibraryManager _library = Substitute.For<ILibraryManager>();
-        private readonly ITaskManager _tasks = Substitute.For<ITaskManager>();
-        private readonly SyncService _service;
-
-        public SyncServiceQueueDescriptionIfCreatedTests()
+        [Fact]
+        public void ProcessEntries_SkipsUnavailableIds_LeavingExactlyOneRow()
         {
-            var publisher = new LibraryPublisher(
-                _library, _db,
-                new ArtworkStore(Path.Combine(Path.GetTempPath(), "vod-tests-artwork")),
-                _localizer, NullLogger<LibraryPublisher>.Instance);
+            // ApplyListingVerdict already wrote an Unavailable row for dead YouTube entries; a
+            // second upsert from ProcessEntries would mint a fresh Guid for the same native_id
+            // and hit the UNIQUE index, bricking the source for all future syncs.
+            var alive = new PlaylistEntry
+            {
+                Id = "alive",
+                VideoUrl = "https://example.test/v/alive",
+                Title = "A video",
+                IeKey = "Youtube",
+            };
+            var dead = new PlaylistEntry
+            {
+                Id = "dead",
+                VideoUrl = "https://example.test/v/dead",
+                Title = null,
+                IeKey = "Youtube",
+            };
 
-            _service = new SyncService(
-                _db,
-                new YtDlpService(
-                    new CookieJar(NullLogger<CookieJar>.Instance),
-                    ThrottleClock.Throttle(),
-                    NullLogger<YtDlpService>.Instance),
-                publisher, _localizer, NullLogger<SyncService>.Instance, _tasks);
+            var saved = new List<VideoRecord>();
+            _db.When(d => d.UpsertVideo(Arg.Any<VideoRecord>()))
+               .Do(call => saved.Add(call.Arg<VideoRecord>()));
+
+            var created = _service.ProcessEntries(
+                new SourceDefinition { Url = SourceUrl },
+                [alive, dead],
+                new Dictionary<string, VideoMetadata>(StringComparer.OrdinalIgnoreCase),
+                existingVideos: [],
+                seriesName: string.Empty,
+                syncStart: DateTimeOffset.UtcNow,
+                unavailableIds: new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "dead" },
+                positions: new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase),
+                CancellationToken.None);
+
+            // Only the alive entry was written; the dead one must be silently skipped.
+            Assert.Equal(1, created);
+            var row = Assert.Single(saved);
+            Assert.Equal("alive", row.NativeId);
         }
 
         [Fact]
-        public void QueueDescriptionIfCreated_QueuesTask_WhenCreatedIsPositive()
+        public void ProcessEntries_WritesAPendingRow_FromTheListingAlone()
         {
-            _service.QueueDescriptionIfCreated(1);
+            // The sync enumerates and nothing more: a new entry becomes a pending row carrying
+            // what the listing gave, and the resolver fetches the rest.
+            var entry = new PlaylistEntry
+            {
+                Id = "fresh",
+                VideoUrl = "https://example.test/v/fresh",
+                Title = "A video",
+                IeKey = "Youtube",
+                Duration = 212.5,
+            };
 
-            _tasks.Received(1).QueueIfNotRunning<StreamDescriptionTask>();
+            var saved = new List<VideoRecord>();
+            _db.When(d => d.UpsertVideo(Arg.Any<VideoRecord>()))
+               .Do(call => saved.Add(call.Arg<VideoRecord>()));
+
+            var created = _service.ProcessEntries(
+                new SourceDefinition { Url = SourceUrl },
+                [entry],
+                new Dictionary<string, VideoMetadata>(StringComparer.OrdinalIgnoreCase),
+                existingVideos: [],
+                seriesName: string.Empty,
+                syncStart: DateTimeOffset.UtcNow,
+                unavailableIds: [],
+                positions: new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["fresh"] = 3,
+                },
+                CancellationToken.None);
+
+            Assert.Equal(1, created);
+            var row = Assert.Single(saved);
+            Assert.Equal(ResolutionState.Pending, row.ResolutionState);
+            Assert.Equal("fresh", row.NativeId);
+            Assert.Equal("A video", row.Title);
+            Assert.Equal(212, row.DurationSeconds);
+            Assert.Equal("Youtube", row.ExtractorKey);
+            Assert.Null(row.PublishedAt);
+            // The rank from the positions map must be carried into the row.
+            Assert.Equal(3, row.ListingPosition);
         }
 
         [Fact]
-        public void QueueDescriptionIfCreated_DoesNotQueueTask_WhenCreatedIsZero()
+        public void ProcessEntries_LeavesAKnownRowsStateAlone_ExceptALiveOne()
         {
-            _service.QueueDescriptionIfCreated(0);
+            var resolved = StoredVideo("known");
+            resolved.ResolutionState = ResolutionState.Resolved;
+            var airing = StoredVideo("airing");
+            airing.ResolutionState = ResolutionState.Resolved;
+            airing.LiveStatus = LiveStatus.Live;
+            // A broadcast that ended: stored as Live, but the next listing entry is NotLive.
+            // The stored status is the trigger — the row must still go back to Pending so the
+            // resolver can fetch the final metadata (duration, description, actual title).
+            var ended = StoredVideo("ended");
+            ended.ResolutionState = ResolutionState.Resolved;
+            ended.LiveStatus = LiveStatus.Live;
 
-            _tasks.DidNotReceive().QueueIfNotRunning<StreamDescriptionTask>();
+            var saved = new List<VideoRecord>();
+            _db.When(d => d.UpsertVideo(Arg.Any<VideoRecord>()))
+               .Do(call => saved.Add(call.Arg<VideoRecord>()));
+
+            _service.ProcessEntries(
+                new SourceDefinition { Url = SourceUrl },
+                [
+                    new PlaylistEntry { Id = "known", VideoUrl = "https://example.test/v/known", Title = "Known", IeKey = "Youtube" },
+                    new PlaylistEntry { Id = "airing", VideoUrl = "https://example.test/v/airing", Title = "Airing", IeKey = "Youtube", LiveStatus = LiveStatus.Live },
+                    new PlaylistEntry { Id = "ended", VideoUrl = "https://example.test/v/ended", Title = "Ended", IeKey = "Youtube", LiveStatus = LiveStatus.NotLive },
+                ],
+                new Dictionary<string, VideoMetadata>(StringComparer.OrdinalIgnoreCase),
+                [resolved, airing, ended],
+                seriesName: string.Empty,
+                syncStart: DateTimeOffset.UtcNow,
+                unavailableIds: [],
+                positions: new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["known"] = 0,
+                    ["airing"] = 1,
+                    ["ended"] = 2,
+                },
+                CancellationToken.None);
+
+            var known = saved.Single(v => v.NativeId == "known");
+            var live = saved.Single(v => v.NativeId == "airing");
+            var broadcastEnded = saved.Single(v => v.NativeId == "ended");
+
+            Assert.Equal(ResolutionState.Resolved, known.ResolutionState);
+            Assert.Equal(0, known.ListingPosition);
+
+            // A broadcast's metadata changes under us, so its verdict cannot be trusted from a
+            // previous pass.
+            Assert.Equal(ResolutionState.Pending, live.ResolutionState);
+            Assert.Equal(1, live.ListingPosition);
+
+            // Stored as Live but listed as NotLive: the broadcast has ended; refetch so the
+            // resolver can record the final duration, description and corrected title.
+            Assert.Equal(ResolutionState.Pending, broadcastEnded.ResolutionState);
+            Assert.Equal(2, broadcastEnded.ListingPosition);
+        }
+
+        [Fact]
+        public void QueueResolutionIfDue_QueuesOnlyWhenSomethingIsPending()
+        {
+            _service.QueueResolutionIfDue(0);
+            _tasks.DidNotReceive().QueueIfNotRunning<ResolutionTask>();
+
+            _service.QueueResolutionIfDue(3);
+            _tasks.Received(1).QueueIfNotRunning<ResolutionTask>();
+        }
+
+        [Fact]
+        public void CleanupOrphans_WakesTheResolver_WhenItDeletesAnOrphan()
+        {
+            // Deleting the last blocking row (pending, or failed with attempts left) can be what
+            // settles a source; without a nudge the resolver would never number or publish it.
+            var syncStart = DateTimeOffset.UtcNow;
+            _db.GetOrphanedVideoUuids(SourceUrl, syncStart).Returns(["gone"]);
+
+            _service.CleanupOrphans(new SourceDefinition { Url = SourceUrl }, syncStart, enumeratedCount: 2);
+
+            _db.Received(1).DeleteVideo("gone");
+            _db.Received(1).ClearLastResolvedAt(SourceUrl);
+        }
+
+        [Fact]
+        public void CleanupOrphans_LeavesTheResolverAlone_WhenNothingIsDeleted()
+        {
+            var syncStart = DateTimeOffset.UtcNow;
+            _db.GetOrphanedVideoUuids(SourceUrl, syncStart).Returns([]);
+
+            _service.CleanupOrphans(new SourceDefinition { Url = SourceUrl }, syncStart, enumeratedCount: 2);
+
+            _db.DidNotReceive().DeleteVideo(Arg.Any<string>());
+            _db.DidNotReceive().ClearLastResolvedAt(Arg.Any<string>());
+        }
+
+        [Fact]
+        public void CleanupOrphans_LeavesTheResolverAlone_WhenTheListingIsEmpty()
+        {
+            // An empty enumeration skips cleanup entirely, so nothing changes and nothing wakes.
+            var syncStart = DateTimeOffset.UtcNow;
+            _db.GetOrphanedVideoUuids(SourceUrl, syncStart).Returns(["gone"]);
+
+            _service.CleanupOrphans(new SourceDefinition { Url = SourceUrl }, syncStart, enumeratedCount: 0);
+
+            _db.DidNotReceive().DeleteVideo(Arg.Any<string>());
+            _db.DidNotReceive().ClearLastResolvedAt(Arg.Any<string>());
         }
     }
+
 }

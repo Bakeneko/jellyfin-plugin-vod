@@ -6,6 +6,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Data.Enums;
 using Jellyfin.Plugin.VOD.Configuration;
+using Jellyfin.Plugin.VOD.Data.Models;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
@@ -94,24 +95,6 @@ namespace Jellyfin.Plugin.VOD.Services
             _logger = logger;
         }
 
-        /// <summary>Whether any member of this video's group still lacks a video stream.</summary>
-        /// <param name="vodUuid">The video's opaque VOD uuid.</param>
-        /// <returns><see langword="true"/> when at least one member would be described.</returns>
-        public bool NeedsDescription(string vodUuid)
-        {
-            ArgumentException.ThrowIfNullOrEmpty(vodUuid);
-
-            foreach (var member in Members(vodUuid))
-            {
-                if (!HasVideoStream(member.Item.Id))
-                {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
         /// <summary>
         /// Describes every member of one group that has no description yet, from a master already
         /// in hand.
@@ -181,6 +164,166 @@ namespace Jellyfin.Plugin.VOD.Services
             return new DescribeOutcome(attempted, described);
         }
 
+        /// <summary>
+        /// Describes every member a video will have once published — the primary and each offered
+        /// tier — from its stored ladder, without the library.
+        /// </summary>
+        /// <param name="config">The current plugin configuration.</param>
+        /// <param name="video">The video being resolved.</param>
+        /// <param name="upstreamMaster">The complete upstream master playlist.</param>
+        /// <param name="masterBaseUri">The URI the master was fetched from, for absolutising.</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        /// <returns>
+        /// Each member's prepared streams keyed by <see cref="StoredStreams.KeyFor"/>, or null when
+        /// a probe failed or came back empty — the resolver then marks the video failed (spec E1).
+        /// A tier the master no longer carries is skipped, not a failure.
+        /// </returns>
+        /// <remarks>
+        /// Runs before publication, because publication now waits for the whole source to settle
+        /// while the manifest URL only lives for the wave. Our stream route reads only the plugin
+        /// database, so the probe works before any library item exists; the members come from the
+        /// same ladder the publisher builds them from (<see cref="QualityLadder.OfferedTiers"/>).
+        /// </remarks>
+        public async Task<IReadOnlyDictionary<string, IReadOnlyList<MediaStream>>?> DescribeVideoAsync(
+            PluginConfiguration config,
+            VideoRecord video,
+            string upstreamMaster,
+            Uri masterBaseUri,
+            CancellationToken cancellationToken)
+        {
+            ArgumentNullException.ThrowIfNull(config);
+            ArgumentNullException.ThrowIfNull(video);
+            ArgumentException.ThrowIfNullOrEmpty(upstreamMaster);
+            ArgumentNullException.ThrowIfNull(masterBaseUri);
+
+            var audioLangs = StreamCacheKey.JoinLanguages(config.PreferredAudioLanguages);
+            var subLangs = StreamCacheKey.JoinLanguages(config.PreferredSubtitleLanguages);
+
+            var tiers = new List<Tier?> { null };
+            foreach (var offered in QualityLadder.OfferedTiers(video.Extras.Qualities))
+            {
+                // Fps is null on purpose: it only ever reaches a tier's display label, never its URL.
+                tiers.Add(new Tier(offered.Height, offered.Codec, null));
+            }
+
+            var described = new Dictionary<string, IReadOnlyList<MediaStream>>(StringComparer.Ordinal);
+            IReadOnlyList<MediaStream>? primaryProbed = null;
+            string? primaryVariant = null;
+
+            // The primary leads, then the tiers tallest first: a tier serving the primary's variant
+            // copies its description, which only works once the primary has been probed.
+            foreach (var tier in tiers.OrderByDescending(t => t is null ? int.MaxValue : t.Height))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var filtered = Filter(upstreamMaster, masterBaseUri, tier?.Height, tier?.Codec, audioLangs, subLangs);
+                if (filtered is null)
+                {
+                    LogTierGone(video.Id, tier?.Height, tier?.Codec);
+                    continue;
+                }
+
+                // Primed under the very key the route reads, so the probe is served this playlist
+                // from memory and yt-dlp is not run a second time.
+                _cache.Set(
+                    StreamCacheKey.For(
+                        video.Id, StreamCacheKey.DefaultFormat, tier?.Height, tier?.Codec,
+                        audioLangs, subLangs),
+                    filtered);
+
+                var key = StoredStreams.KeyFor(tier?.Height, tier?.Codec);
+
+                if (tier is not null
+                    && primaryProbed is not null
+                    && SelectedVariant(filtered) is { } mine
+                    && string.Equals(mine, primaryVariant, StringComparison.Ordinal))
+                {
+                    // Cloned: Prepare relabels in place, and the primary's streams must not change.
+                    described[key] = Prepare(StoredStreams.Clone(primaryProbed), filtered);
+                    continue;
+                }
+
+                var probed = await ProbeAsync(config, video.Id, tier, cancellationToken).ConfigureAwait(false);
+                if (probed is null)
+                {
+                    return null;
+                }
+
+                if (tier is null)
+                {
+                    primaryProbed = StoredStreams.Clone(probed);
+                    primaryVariant = SelectedVariant(filtered);
+                }
+
+                described[key] = Prepare(probed, filtered);
+            }
+
+            return described;
+        }
+
+        /// <summary>
+        /// Writes a stored description onto every published member of a video that has no video
+        /// stream yet.
+        /// </summary>
+        /// <param name="vodUuid">The video's opaque VOD uuid.</param>
+        /// <param name="storedJson">The row's <c>stream_descriptions</c>.</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        /// <returns>How many members were written.</returns>
+        /// <remarks>
+        /// A member that already has a video stream is left alone: Jellyfin or the playback
+        /// failsafe described it, and that description is at least as fresh as ours.
+        /// <para>
+        /// Never throws, except on cancellation: a failure is logged and the members it did not
+        /// reach are left to the playback failsafe.
+        /// </para>
+        /// </remarks>
+        public int ApplyStored(string vodUuid, string? storedJson, CancellationToken cancellationToken)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(vodUuid);
+
+            var stored = StoredStreams.Deserialize(storedJson);
+            if (stored is null)
+            {
+                return 0;
+            }
+
+            var applied = 0;
+            try
+            {
+                foreach (var member in Members(vodUuid))
+                {
+                    if (HasVideoStream(member.Item.Id))
+                    {
+                        continue;
+                    }
+
+                    if (!stored.TryGetValue(StoredStreams.KeyFor(member.Height, member.Codec), out var streams)
+                        || streams.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    _repository.SaveMediaStreams(member.Item.Id, streams, cancellationToken);
+                    LogDescribed(member.Item.Name, streams.Count);
+                    applied++;
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+#pragma warning disable CA1031 // a description is an optimisation: the playback failsafe covers it
+            catch (Exception ex)
+#pragma warning restore CA1031
+            {
+                // Called right after a reconcile that succeeded: throwing here would abort that
+                // publication, leave its anchor unrecorded and have the wave retried for nothing.
+                LogApplyStoredFailed(ex, vodUuid);
+            }
+
+            return applied;
+        }
+
         private async Task<bool> DescribeMemberAsync(
             PluginConfiguration config,
             string vodUuid,
@@ -217,7 +360,23 @@ namespace Jellyfin.Plugin.VOD.Services
                 return true;
             }
 
-            var url = VersionGroup.PathFor(config.LocalBaseUrl, vodUuid, member.Tier);
+            var streams = await ProbeAsync(config, vodUuid, member.Tier, cancellationToken)
+                .ConfigureAwait(false);
+            if (streams is null)
+            {
+                return false;
+            }
+
+            Save(member.Item, streams, filtered, cancellationToken);
+            return true;
+        }
+
+        /// <summary>Probes one member through our own route, one heavy probe at a time.</summary>
+        /// <returns>The streams, or null when the probe failed or found none.</returns>
+        private async Task<IReadOnlyList<MediaStream>?> ProbeAsync(
+            PluginConfiguration config, string vodUuid, Tier? tier, CancellationToken cancellationToken)
+        {
+            var url = VersionGroup.PathFor(config.LocalBaseUrl, vodUuid, tier);
 
             MediaInfo? info;
             await _probeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -237,12 +396,16 @@ namespace Jellyfin.Plugin.VOD.Services
                         cancellationToken)
                     .ConfigureAwait(false);
             }
-#pragma warning disable CA1031 // a failed probe must not take down a batch: the member is retried later
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+#pragma warning disable CA1031 // a failed probe is reported to the caller, never propagated
             catch (Exception ex)
 #pragma warning restore CA1031
             {
                 LogProbeFailed(ex, url);
-                return false;
+                return null;
             }
             finally
             {
@@ -255,19 +418,14 @@ namespace Jellyfin.Plugin.VOD.Services
                 // Storing an empty list would mark this member described for ever, and nothing would
                 // ever probe it again. Leaving it empty is what makes the next pass retry.
                 LogProbeEmpty(url);
-                return false;
+                return null;
             }
 
-            Save(member.Item, streams, filtered, cancellationToken);
-            return true;
+            return streams;
         }
 
-        /// <summary>Stores a probed description, re-indexed and carrying our track labels.</summary>
-        private void Save(
-            BaseItem item,
-            IReadOnlyList<MediaStream> described,
-            string filteredMaster,
-            CancellationToken cancellationToken)
+        /// <summary>A probed description, re-indexed and carrying our track labels.</summary>
+        private static List<MediaStream> Prepare(IReadOnlyList<MediaStream> described, string filteredMaster)
         {
             var streams = new List<MediaStream>(described);
 
@@ -280,8 +438,18 @@ namespace Jellyfin.Plugin.VOD.Services
 
             TrackLabels.Apply(streams, MediaStreamBuilder.Build(filteredMaster));
             StreamBitRates.FillMissingVideo(streams, StreamBitRates.VariantBandwidth(filteredMaster));
-            _repository.SaveMediaStreams(item.Id, streams, cancellationToken);
-            LogDescribed(item.Name, streams.Count);
+            return streams;
+        }
+
+        /// <summary>Stores a probed description, re-indexed and carrying our track labels.</summary>
+        private void Save(
+            BaseItem item,
+            IReadOnlyList<MediaStream> described,
+            string filteredMaster,
+            CancellationToken cancellationToken)
+        {
+            _repository.SaveMediaStreams(item.Id, Prepare(described, filteredMaster), cancellationToken);
+            LogDescribed(item.Name, described.Count);
         }
 
         /// <summary>The variant a filtered master retained, as its declaration plus its URI.</summary>
@@ -369,11 +537,20 @@ namespace Jellyfin.Plugin.VOD.Services
             GroupMember member,
             string audioLangs,
             string subLangs)
+            => Filter(upstreamMaster, masterBaseUri, member.Height, member.Codec, audioLangs, subLangs);
+
+        private string? Filter(
+            string upstreamMaster,
+            Uri masterBaseUri,
+            int? height,
+            string? codec,
+            string audioLangs,
+            string subLangs)
             => HlsPlaylistFilter.FilterMaster(
                 upstreamMaster,
                 masterBaseUri,
-                member.Height,
-                member.Codec,
+                height,
+                codec,
                 audioLangs.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries),
                 subLangs.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries),
                 _subtitles.Rewrite);
@@ -453,6 +630,10 @@ namespace Jellyfin.Plugin.VOD.Services
         [LoggerMessage(EventId = 4, Level = LogLevel.Warning,
             Message = "Probing {Url} returned no stream; leaving it undescribed for a later pass")]
         private partial void LogProbeEmpty(string url);
+
+        [LoggerMessage(EventId = 6, Level = LogLevel.Warning,
+            Message = "Writing the stored description of {VodUuid} failed; the playback failsafe will describe it")]
+        private partial void LogApplyStoredFailed(Exception exception, string vodUuid);
 
         [LoggerMessage(EventId = 5, Level = LogLevel.Debug,
             Message = "Copied the description of {PrimaryName} onto {ItemName}: both serve the same variant")]

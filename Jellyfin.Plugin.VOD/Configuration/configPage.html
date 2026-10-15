@@ -143,32 +143,34 @@
                                is="emby-input" class="emby-input"
                                placeholder="20" />
                         <div class="fieldDescription">
-                            How fast background work may call yt-dlp for one platform — sync, stream
-                            descriptions and the live probe share this budget, and two platforms advance
+                            How fast background work may call yt-dlp for one platform — sync enumerations,
+                            resolution waves and the live probe share this budget, and two platforms advance
                             independently. A started video is never held back by it.
                             Raising it risks the platform rate-limiting the whole session for up to an hour.
                         </div>
                     </div>
 
                     <div class="inputContainer">
-                        <label class="inputLabel inputLabelUnfocused" for="streamDescriptionBatchSize">Stream descriptions per pass</label>
-                        <input id="streamDescriptionBatchSize" name="StreamDescriptionBatchSize" type="number" min="0"
+                        <label class="inputLabel inputLabelUnfocused" for="resolutionWaveSize">Videos resolved per wave</label>
+                        <input id="resolutionWaveSize" name="ResolutionWaveSize" type="number" min="1"
                                is="emby-input" class="emby-input"
-                               placeholder="10" />
+                               placeholder="20" />
                         <div class="fieldDescription">
-                            How many videos the stream description task describes each time it runs, every 15 minutes.
-                            Set to 0 to disable the task; descriptions still happen when something is played.
-                            Each video costs one yt-dlp call and at most one probe, so a high value risks an anti-bot answer.
+                            How many unresolved videos a single wave fetches before the library is updated.
+                            Each video costs one yt-dlp call, paced by the rate-limit setting above; this is
+                            the granularity at which new videos appear — a smaller value publishes more often,
+                            a larger one covers more ground per pass.
                         </div>
                     </div>
 
                     <div class="inputContainer">
-                        <label class="inputLabel inputLabelUnfocused" for="streamDescriptionRetryHours">Retry a failed description after (hours)</label>
-                        <input id="streamDescriptionRetryHours" name="StreamDescriptionRetryHours" type="number" min="0"
+                        <label class="inputLabel inputLabelUnfocused" for="resolutionRetryMinutes">Retry a failed video after (minutes)</label>
+                        <input id="resolutionRetryMinutes" name="ResolutionRetryMinutes" type="number" min="1"
                                is="emby-input" class="emby-input"
-                               placeholder="24" />
+                               placeholder="15" />
                         <div class="fieldDescription">
-                            How long a video whose description failed is left alone before another pass tries it again.
+                            Initial delay before a failed video is retried. The delay doubles on each
+                            consecutive failure and is capped unconditionally at seven days.
                         </div>
                     </div>
 
@@ -450,11 +452,26 @@
                             cell.style.color = '#ff8a80';
                             return;
                         }
-                        cell.style.color = '';
-                        cell.title = '';
-                        cell.textContent = row.LastSyncedAt
-                            ? row.VideoCount + ' videos, ' + new Date(row.LastSyncedAt).toLocaleString()
-                            : 'never synced';
+                        if (!row.LastSyncedAt) {
+                            cell.style.color = '';
+                            cell.title = '';
+                            cell.textContent = 'never synced';
+                            return;
+                        }
+                        // "300 videos — 280 resolved, 15 pending, 3 failed · waiting for resolution, <date>".
+                        // A source that is not settled publishes none of its new videos yet; saying
+                        // so is the point of this cell.
+                        var parts = [];
+                        if (row.Resolved) { parts.push(row.Resolved + ' resolved'); }
+                        if (row.Pending) { parts.push(row.Pending + ' pending'); }
+                        if (row.Failed) { parts.push(row.Failed + ' failed'); }
+                        if (row.Unavailable) { parts.push(row.Unavailable + ' unavailable'); }
+                        var text = row.VideoCount + ' videos';
+                        if (parts.length) { text += ' — ' + parts.join(', '); }
+                        if (!row.Settled) { text += ' · waiting for resolution'; }
+                        cell.textContent = text + ', ' + new Date(row.LastSyncedAt).toLocaleString();
+                        cell.title = row.LastResolutionError || '';
+                        cell.style.color = row.Failed ? '#ffb74d' : '';
                     }
                 );
             }
@@ -558,8 +575,8 @@
                             document.querySelector('#cacheMinutes').value      = config.CacheMinutes || 5;
                             document.querySelector('#liveProbeIntervalMinutes').value = config.LiveProbeIntervalMinutes != null ? config.LiveProbeIntervalMinutes : 5;
                             document.querySelector('#ytDlpCallsPerMinute').value = config.YtDlpCallsPerMinute != null ? config.YtDlpCallsPerMinute : 20;
-                            document.querySelector('#streamDescriptionBatchSize').value = config.StreamDescriptionBatchSize != null ? config.StreamDescriptionBatchSize : 10;
-                            document.querySelector('#streamDescriptionRetryHours').value = config.StreamDescriptionRetryHours != null ? config.StreamDescriptionRetryHours : 24;
+                            document.querySelector('#resolutionWaveSize').value = config.ResolutionWaveSize != null ? config.ResolutionWaveSize : 20;
+                            document.querySelector('#resolutionRetryMinutes').value = config.ResolutionRetryMinutes != null ? config.ResolutionRetryMinutes : 15;
                             document.querySelector('#preferredAudioLanguages').value =
                                 (config.PreferredAudioLanguages || []).join(', ');
                             document.querySelector('#preferredSubtitleLanguages').value =
@@ -597,10 +614,10 @@
                             config.LiveProbeIntervalMinutes = parseInt(document.querySelector('#liveProbeIntervalMinutes').value, 10) || 0;
                             var ytDlpCallsPerMinute = parseInt(document.querySelector('#ytDlpCallsPerMinute').value, 10);
                             config.YtDlpCallsPerMinute = isNaN(ytDlpCallsPerMinute) || ytDlpCallsPerMinute < 1 ? 20 : ytDlpCallsPerMinute;
-                            var descriptionBatchSize = parseInt(document.querySelector('#streamDescriptionBatchSize').value, 10);
-                            config.StreamDescriptionBatchSize = isNaN(descriptionBatchSize) ? 10 : descriptionBatchSize;
-                            var descriptionRetryHours = parseInt(document.querySelector('#streamDescriptionRetryHours').value, 10);
-                            config.StreamDescriptionRetryHours = isNaN(descriptionRetryHours) ? 24 : descriptionRetryHours;
+                            var resolutionWaveSize = parseInt(document.querySelector('#resolutionWaveSize').value, 10);
+                            config.ResolutionWaveSize = isNaN(resolutionWaveSize) ? 20 : resolutionWaveSize;
+                            var resolutionRetryMinutes = parseInt(document.querySelector('#resolutionRetryMinutes').value, 10);
+                            config.ResolutionRetryMinutes = isNaN(resolutionRetryMinutes) ? 15 : resolutionRetryMinutes;
                             config.PreferredAudioLanguages = document.querySelector('#preferredAudioLanguages').value
                                 .split(',').map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; });
                             config.PreferredSubtitleLanguages = document.querySelector('#preferredSubtitleLanguages').value

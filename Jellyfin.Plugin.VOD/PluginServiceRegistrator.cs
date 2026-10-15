@@ -55,14 +55,16 @@ namespace Jellyfin.Plugin.VOD
 
             // Sync services
             serviceCollection.AddSingleton<LibraryPublisher>();
+            serviceCollection.AddSingleton<VideoDescriptionStep>();
             serviceCollection.AddSingleton<SyncService>();
             serviceCollection.AddSingleton<LiveProbeService>();
-            serviceCollection.AddSingleton<StreamDescriptionService>();
+            serviceCollection.AddSingleton<ResolutionService>();
+            serviceCollection.AddSingleton<IVodResolutionRunner, ResolutionRunner>();
 
             // Scheduled tasks
             serviceCollection.AddSingleton<IScheduledTask, SyncTask>();
             serviceCollection.AddSingleton<IScheduledTask, LiveProbeTask>();
-            serviceCollection.AddSingleton<IScheduledTask, StreamDescriptionTask>();
+            serviceCollection.AddSingleton<IScheduledTask, ResolutionTask>();
         }
     }
 }

@@ -373,7 +373,8 @@ namespace Jellyfin.Plugin.VOD.Controllers
                 ];
             }
 
-            return Ok(new SourcesStatus(libraries, ProjectSourceStatus(_db.GetAllSources())));
+            return Ok(new SourcesStatus(
+                libraries, ProjectSourceStatus(_db.GetAllSources(), _db.GetResolutionSummaries())));
         }
 
         /// <summary>Resolves one library role live and reduces it to what the page shows.</summary>
@@ -427,14 +428,23 @@ namespace Jellyfin.Plugin.VOD.Controllers
         }
 
         /// <summary>
-        /// Reduces stored source rows to what the configuration table displays.
+        /// Reduces stored source rows and their resolution summaries to what the configuration
+        /// table displays.
         /// </summary>
         /// <param name="records">The sources the database knows about.</param>
+        /// <param name="summaries">Resolution summaries keyed by source URL; a source without rows has none.</param>
         /// <returns>One row per source, in the order the database returned them; never null.</returns>
         internal static IReadOnlyList<SourceStatus> ProjectSourceStatus(
-            IEnumerable<SourceRecord> records)
+            IEnumerable<SourceRecord> records,
+            IReadOnlyDictionary<string, ResolutionSummary> summaries)
             => records
-                .Select(r => new SourceStatus(r.Url, r.Name, r.LastSyncedAt, r.LastError, r.VideoCount))
+                .Select(r =>
+                {
+                    var s = summaries.GetValueOrDefault(r.Url) ?? new ResolutionSummary(0, 0, 0, 0, true, null);
+                    return new SourceStatus(
+                        r.Url, r.Name, r.LastSyncedAt, r.LastError, r.VideoCount,
+                        s.Resolved, s.Pending, s.Failed, s.Unavailable, s.Settled, s.LastError);
+                })
                 .ToList();
 
         /// <summary>

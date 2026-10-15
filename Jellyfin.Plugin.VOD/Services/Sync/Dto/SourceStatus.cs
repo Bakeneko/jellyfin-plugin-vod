@@ -14,12 +14,27 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
     /// recorded this since the sync layer shipped; this is what finally reads it back.
     /// </param>
     /// <param name="VideoCount">How many videos the database currently holds for this source.</param>
+    /// <param name="Resolved">Videos resolved.</param>
+    /// <param name="Pending">Videos enumerated and not yet resolved.</param>
+    /// <param name="Failed">Videos whose last resolution failed.</param>
+    /// <param name="Unavailable">Videos the platform says are gone.</param>
+    /// <param name="Settled">
+    /// Whether the source may number and publish its new videos now; false while a video is
+    /// pending, or failed fewer than three times.
+    /// </param>
+    /// <param name="LastResolutionError">The latest resolution failure, or null.</param>
     public sealed record SourceStatus(
         string Url,
         string? Name,
         DateTimeOffset? LastSyncedAt,
         string? LastError,
-        int VideoCount);
+        int VideoCount,
+        int Resolved,
+        int Pending,
+        int Failed,
+        int Unavailable,
+        bool Settled,
+        string? LastResolutionError);
 
     /// <summary>
     /// What one configured library is worth right now, as the configuration page shows it.

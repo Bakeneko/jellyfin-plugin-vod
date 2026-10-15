@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.VOD.Configuration;
+using Jellyfin.Plugin.VOD.Data.Models;
 using Jellyfin.Plugin.VOD.Services;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.Movies;
@@ -174,16 +176,6 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
             Assert.Null(SavedFor(tier));
             await _encoder.DidNotReceive().GetMediaInfo(
                 Arg.Any<MediaInfoRequest>(), Arg.Any<CancellationToken>());
-        }
-
-        [Fact]
-        public void NeedsDescription_AFullyDescribedGroup_IsFalse()
-        {
-            var tier = Item($"http://localhost:8096/VOD/stream/{Uuid}.m3u8?height=2160&codec=vp9");
-            LibraryHolds(tier);
-            HasStreams(tier, new MediaStream { Type = MediaStreamType.Video, Codec = "vp9" });
-
-            Assert.False(_describer.NeedsDescription(Uuid));
         }
 
         [Fact]
@@ -430,6 +422,137 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
 
             await _encoder.Received(1).GetMediaInfo(
                 Arg.Any<MediaInfoRequest>(), Arg.Any<CancellationToken>());
+        }
+
+        private static VideoRecord VideoWith(params VideoQuality[] qualities)
+            => new()
+            {
+                Id = Uuid,
+                SourceUrl = "https://example.test/s",
+                VideoUrl = "https://example.test/v",
+                SyncedAt = DateTimeOffset.UnixEpoch,
+                Extras = new VideoExtras { Qualities = qualities },
+            };
+
+        [Fact]
+        public async Task DescribeVideoAsync_DescribesThePrimaryAndEachOfferedTier_WithoutTheLibrary()
+        {
+            ProbeAnswers(
+                new MediaStream { Type = MediaStreamType.Audio, Index = 7, Codec = "aac" },
+                new MediaStream { Type = MediaStreamType.Video, Index = 9, Codec = "vp9", Height = 2160 });
+
+            var described = await _describer.DescribeVideoAsync(
+                _config,
+                VideoWith(new VideoQuality(1080, "h264", 30), new VideoQuality(2160, "vp9", 30)),
+                Master,
+                new Uri("https://cdn.test/master.m3u8"),
+                CancellationToken.None);
+
+            Assert.NotNull(described);
+            Assert.Equal(
+                new[] { "1080/h264", "2160/vp9", StoredStreams.PrimaryKey },
+                described!.Keys.Order(StringComparer.Ordinal));
+            Assert.All(described.Values, streams => Assert.Equal([0, 1], streams.Select(s => s.Index)));
+            _library.DidNotReceive().GetItemList(Arg.Any<InternalItemsQuery>());
+        }
+
+        [Fact]
+        public async Task DescribeVideoAsync_ATierServingThePrimarysVariant_IsCopiedNotProbed()
+        {
+            ProbeAnswers(new MediaStream { Type = MediaStreamType.Video, Index = 0, Codec = "h264", Height = 1080 });
+
+            var described = await _describer.DescribeVideoAsync(
+                _config, VideoWith(new VideoQuality(1080, "h264", 30)), AvcOnlyMaster,
+                new Uri("https://cdn.test/master.m3u8"), CancellationToken.None);
+
+            Assert.Equal(2, described!.Count);
+            await _encoder.Received(1).GetMediaInfo(Arg.Any<MediaInfoRequest>(), Arg.Any<CancellationToken>());
+        }
+
+        [Fact]
+        public async Task DescribeVideoAsync_ACopiedTier_DoesNotShareStreamsWithThePrimary()
+        {
+            ProbeAnswers(new MediaStream { Type = MediaStreamType.Video, Index = 0, Codec = "h264", Height = 1080 });
+
+            var described = await _describer.DescribeVideoAsync(
+                _config, VideoWith(new VideoQuality(1080, "h264", 30)), AvcOnlyMaster,
+                new Uri("https://cdn.test/master.m3u8"), CancellationToken.None);
+
+            Assert.NotSame(described![StoredStreams.PrimaryKey][0], described["1080/h264"][0]);
+        }
+
+        [Fact]
+        public async Task DescribeVideoAsync_ATierTheMasterNoLongerCarries_IsSkippedNotAFailure()
+        {
+            ProbeAnswers(new MediaStream { Type = MediaStreamType.Video, Index = 0, Codec = "h264", Height = 1080 });
+
+            var described = await _describer.DescribeVideoAsync(
+                _config,
+                VideoWith(new VideoQuality(1080, "h264", 30), new VideoQuality(2160, "vp9", 30)),
+                AvcOnlyMaster,
+                new Uri("https://cdn.test/master.m3u8"),
+                CancellationToken.None);
+
+            Assert.NotNull(described);
+            Assert.False(described!.ContainsKey("2160/vp9"));
+        }
+
+        [Fact]
+        public async Task DescribeVideoAsync_AProbeThatThrows_FailsTheVideo()
+        {
+            _encoder.GetMediaInfo(Arg.Any<MediaInfoRequest>(), Arg.Any<CancellationToken>())
+                .Returns<Task<MediaInfo>>(_ => throw new InvalidOperationException("ffprobe died"));
+
+            var described = await _describer.DescribeVideoAsync(
+                _config, VideoWith(new VideoQuality(1080, "h264", 30)), AvcOnlyMaster,
+                new Uri("https://cdn.test/master.m3u8"), CancellationToken.None);
+
+            Assert.Null(described);
+        }
+
+        [Fact]
+        public async Task DescribeVideoAsync_AProbeThatReturnsNoStream_FailsTheVideo()
+        {
+            ProbeAnswers();
+
+            var described = await _describer.DescribeVideoAsync(
+                _config, VideoWith(new VideoQuality(1080, "h264", 30)), AvcOnlyMaster,
+                new Uri("https://cdn.test/master.m3u8"), CancellationToken.None);
+
+            Assert.Null(described);
+        }
+
+        [Fact]
+        public void ApplyStored_WritesOnlyMembersWithoutAVideoStream()
+        {
+            var primary = Item($"http://localhost:8096/VOD/stream/{Uuid}.m3u8");
+            var tier = Item($"http://localhost:8096/VOD/stream/{Uuid}.m3u8?height=1080&codec=h264");
+            LibraryHolds(primary, tier);
+            HasStreams(primary, new MediaStream { Type = MediaStreamType.Video, Codec = "h264" });
+            HasNoStreams(tier);
+
+            var json = StoredStreams.Serialize(new Dictionary<string, IReadOnlyList<MediaStream>>
+            {
+                [StoredStreams.PrimaryKey] = [new MediaStream { Type = MediaStreamType.Video, Codec = "stored" }],
+                ["1080/h264"] = [new MediaStream { Type = MediaStreamType.Video, Codec = "h264", Height = 1080 }],
+            });
+
+            var applied = _describer.ApplyStored(Uuid, json, CancellationToken.None);
+
+            Assert.Equal(1, applied);
+            Assert.Null(SavedFor(primary));
+            Assert.Equal(1080, SavedFor(tier)!.Single().Height);
+        }
+
+        [Fact]
+        public void ApplyStored_WritesNothing_ForUnreadableJson()
+        {
+            var tier = Item($"http://localhost:8096/VOD/stream/{Uuid}.m3u8?height=1080&codec=h264");
+            LibraryHolds(tier);
+            HasNoStreams(tier);
+
+            Assert.Equal(0, _describer.ApplyStored(Uuid, "not json", CancellationToken.None));
+            Assert.Null(SavedFor(tier));
         }
     }
 }

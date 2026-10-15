@@ -118,7 +118,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                     .ConfigureAwait(false);
             }
 
-            _syncService.QueueDescriptionIfCreated(created);
+            _syncService.QueueResolutionIfDue(created);
             progress.Report(100);
         }
 

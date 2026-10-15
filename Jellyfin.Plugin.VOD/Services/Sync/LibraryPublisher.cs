@@ -27,7 +27,16 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
     /// What a reconciliation pass changed. <c>Unchanged</c> counts the expected items that were
     /// already correct and therefore never written back, so a no-op sync is legible in the log.
     /// </summary>
-    public sealed record ReconcileReport(int Created, int Updated, int Removed, int Unchanged);
+    /// <param name="Created">How many primary items the pass added.</param>
+    /// <param name="Updated">How many primary items the pass rewrote.</param>
+    /// <param name="Removed">How many items (orphans and empty containers) the pass deleted.</param>
+    /// <param name="Unchanged">How many primary items were already correct.</param>
+    /// <param name="CreatedVideoIds">
+    /// The VOD ids (video uuids) for which the pass created at least one item, primary or tier:
+    /// the only items that may still lack the stream description stored on their row.
+    /// </param>
+    public sealed record ReconcileReport(
+        int Created, int Updated, int Removed, int Unchanged, IReadOnlySet<string> CreatedVideoIds);
 
     /// <summary>
     /// Aligns the Jellyfin library with what the plugin holds in SQLite, publishing items
@@ -256,6 +265,10 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
             var processedVodIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+            // The videos this pass created any item for, primary or tier: the callers apply the
+            // stream descriptions stored at resolution to these only.
+            var createdVideoIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
             foreach (var video in expected)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -275,9 +288,12 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                     var alternates = new List<BaseItem>();
                     for (var i = 1; i < members.Count; i++)
                     {
-                        alternates.Add(await UpsertAlternateAsync<Movie>(
+                        var (alternateCreated, alternate) = await UpsertAlternateAsync<Movie>(
                                 anchor, video, members[i], published, false, cancellationToken)
-                            .ConfigureAwait(false));
+                            .ConfigureAwait(false);
+                        alternates.Add(alternate);
+                        if (alternateCreated)
+                            createdVideoIds.Add(video.Id);
                     }
 
                     await LinkVersionsAsync(committed, alternates, cancellationToken)
@@ -303,9 +319,12 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                     var alternates = new List<BaseItem>();
                     for (var i = 1; i < members.Count; i++)
                     {
-                        alternates.Add(await UpsertAlternateAsync<Episode>(
+                        var (alternateCreated, alternate) = await UpsertAlternateAsync<Episode>(
                                 currentSeason, video, members[i], published, seriesMoved, cancellationToken)
-                            .ConfigureAwait(false));
+                            .ConfigureAwait(false);
+                        alternates.Add(alternate);
+                        if (alternateCreated)
+                            createdVideoIds.Add(video.Id);
                     }
 
                     await LinkVersionsAsync(committed, alternates, cancellationToken)
@@ -316,6 +335,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 {
                     case UpsertOutcome.Created:
                         created++;
+                        createdVideoIds.Add(video.Id);
                         break;
                     case UpsertOutcome.Updated:
                         updated++;
@@ -362,7 +382,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 removed += ReconcileContainers(swept[i], source, [], null);
 
             LogReconciled(source.Url, created, updated, removed, unchanged);
-            return new ReconcileReport(created, updated, removed, unchanged);
+            return new ReconcileReport(created, updated, removed, unchanged, createdVideoIds);
         }
 
         /// <summary>What publishing one video did to the library.</summary>
@@ -739,7 +759,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// listings — so there is nothing to fight here.
         /// </para>
         /// </remarks>
-        private async Task<BaseItem> UpsertAlternateAsync<T>(
+        private async Task<(bool Created, BaseItem Item)> UpsertAlternateAsync<T>(
             Folder parent,
             VideoRecord video,
             VersionMember member,
@@ -823,9 +843,10 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                     .ConfigureAwait(false);
             }
 
-            // The item itself, not an outcome: Task 6's linking step needs the committed instance,
-            // and an unchanged alternate still has to be linked.
-            return item;
+            // The item itself, not only an outcome: Task 6's linking step needs the committed
+            // instance, and an unchanged alternate still has to be linked. Whether it was created
+            // tells the caller the tier still lacks its stored stream description.
+            return (isNew, item);
         }
 
         /// <summary>

@@ -87,15 +87,15 @@ Scheduled tasks added by the plugin, all under the **VOD** category:
 |---|---|---|
 | VOD Sync | hourly | refreshes each source once its own interval has elapsed (12 h by default) |
 | VOD Live Probe | every 5 minutes | finds broadcasts in progress |
-| VOD Stream Description | every 15 minutes | probes quality versions ahead of playback, in small batches |
+| VOD Resolution | every 15 minutes | resolves pending video metadata and pre-describes quality versions ahead of playback |
 
 ## Known limitations
 
 - **Transcoding cost.** Codecs your client cannot play (VP9/AV1 on some TVs, for instance) are
   transcoded by Jellyfin like any other media: hardware acceleration is strongly recommended for
   4K versions.
-- **First playback of a just-published video** may still be transcoded while its streams are
-  being described; the next one is copied.
+- **First playback of a just-published video** may still be transcoded if the resolution wave
+  has not yet run; description happens in the same wave as resolution.
 - **A single-video source that becomes private** stays in the library; the source shows an error.
 - **Live latency.** Lives are served from the live edge with the usual HLS delay.
 - **The stream endpoint is not authenticated**, because ffmpeg calls it without a token. It only

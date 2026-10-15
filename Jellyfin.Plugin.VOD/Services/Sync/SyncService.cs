@@ -21,8 +21,6 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
     /// </summary>
     public sealed partial class SyncService
     {
-        private const int MetadataParallelism = 4;
-
         private readonly IVodDatabase _db;
         private readonly YtDlpService _ytDlp;
         private readonly LibraryPublisher _publisher;
@@ -192,7 +190,6 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             }
 
             var syncStart = DateTimeOffset.UtcNow;
-            var sourceRecord = _db.GetSource(source.Url) ?? new SourceRecord { Url = source.Url };
 
             // Hold the per-source lock for the full write path: SyncCoreAsync writes to the
             // database and then reconciles (which deletes library items). Concurrent passes over
@@ -200,9 +197,15 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             using var hold = await SourceLock.AcquireAsync(source.Url, cancellationToken)
                 .ConfigureAwait(false);
 
+            // Read the source record AFTER acquiring the lock: a resolver wave that runs while
+            // we wait for the lock may stamp last_resolved_at, and a pre-lock read would revert
+            // that stamp when we write the record back at the end of SyncCoreAsync. After C2 that
+            // stamp is load-bearing — it keeps the source out of the never-served selector.
+            var sourceRecord = _db.GetSource(source.Url) ?? new SourceRecord { Url = source.Url };
+
             try
             {
-                return await SyncCoreAsync(source, config, syncStart, sourceRecord, cancellationToken)
+                return await SyncCoreAsync(source, syncStart, sourceRecord, cancellationToken)
                     .ConfigureAwait(false);
             }
             catch (OperationCanceledException)
@@ -220,7 +223,6 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
         private async Task<int> SyncCoreAsync(
             SourceDefinition source,
-            PluginConfiguration config,
             DateTimeOffset syncStart,
             SourceRecord sourceRecord,
             CancellationToken ct)
@@ -250,11 +252,21 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             sourceRecord.Tags = playlist.Tags.Count > 0 ? JsonSerializer.Serialize(playlist.Tags) : null;
             _db.UpsertSource(sourceRecord);
 
-            // Step 4: per-video metadata
-            // Pre-filter: skip entries already in DB — their metadata is already stored.
-            // yt-dlp returns entries newest-first, so iterating in order allows early stop
-            // on RetentionDays: once we hit a video older than the cutoff, everything after
-            // it is also too old.
+            // The administrator flipped this source's mode since it last published. Its videos are
+            // already resolved, so it has no due row, and a stamped last_resolved_at keeps it out
+            // of the selector entirely: without this the library would keep the old shape forever.
+            // Clearing re-enters it in the never-served arm for one free wave — resolve nothing,
+            // reconcile, which reaps the stale items and publishes the new shape. Done after the
+            // row is written, since ClearLastResolvedAt is an UPDATE. PublishedMode itself is only
+            // ever written by the resolver, in ResolutionService.PublishAsync.
+            if (ModeChanged(sourceRecord, source.Mode))
+            {
+                _db.ClearLastResolvedAt(source.Url);
+                LogModeChanged(source.Url, sourceRecord.PublishedMode, source.Mode);
+            }
+
+            // Step 4: build the metadata map — preloaded for single-video sources, empty for others.
+            // Playlist and channel sources enumerate only; the resolver fetches the rest later.
             var metadataMap = new Dictionary<string, VideoMetadata>(
                 StringComparer.OrdinalIgnoreCase);
             foreach (var (k, v) in preloaded)
@@ -264,17 +276,6 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
             var knownNativeIds = existingVideos
                 .Where(v => v.NativeId is not null)
-                .Select(v => v.NativeId!)
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-            // A stored entry's metadata is immutable except while it is live or scheduled: a stream
-            // that has since ended would keep its live_status and broadcast synopsis forever.
-            // Rows that have never been given a payload (written before the extras column existed)
-            // are excluded from the skip set, so they are probed on EVERY pass until a fetch
-            // answers — one yt-dlp process per such row per sync. That recurring cost is accepted
-            // deliberately; see HasPayload for why remembering a failure instead is worse.
-            var skipMetadataIds = existingVideos
-                .Where(v => v.NativeId is not null && !MustRefetch(v.LiveStatus) && HasPayload(v.Extras))
                 .Select(v => v.NativeId!)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
@@ -294,6 +295,13 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 _db.UpsertVideo(row);
             }
 
+            // A verdict change (video gone private, or title re-appeared) must be reflected in
+            // the library. A drained source has no due rows, so the resolver would never select
+            // it again — ClearLastResolvedAt re-enters it in the never-served arm for exactly
+            // one free wave: resolve nothing, publish with the updated rows, stamp.
+            if (verdict.Updated.Count > 0)
+                _db.ClearLastResolvedAt(source.Url);
+
             if (verdict.Unavailable.Count > 0)
                 LogListingDeclaredUnavailable(source.Url, verdict.Unavailable.Count);
 
@@ -304,15 +312,6 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 positions[listing[i].Id] = i;
             _db.SetListingPositions(source.Url, positions);
 
-            // A video the listing just brought back keeps the payload of its earlier life, so the
-            // skip set above would skip it and it would stay pending for ever.
-            foreach (var reopened in verdict.Reopened)
-                skipMetadataIds.Remove(reopened);
-
-            var retentionCutoff = source.RetentionDays > 0
-                ? syncStart.AddDays(-source.RetentionDays)
-                : (DateTimeOffset?)null;
-
             // Touch existing videos that are still in the playlist so CleanupOrphans does not
             // delete them (their synced_at would otherwise remain from the previous sync).
             var seenExistingIds = playlist.Entries
@@ -321,102 +320,25 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 .ToList();
             _db.TouchVideos(source.Url, seenExistingIds, syncStart);
 
-            var newEntries = playlist.Entries
-                .Where(e => !metadataMap.ContainsKey(e.Id)
-                            && !skipMetadataIds.Contains(e.Id)
-                            && !verdict.Unavailable.Contains(e.Id))
-                .ToList();
-
-            if (retentionCutoff.HasValue)
-            {
-                // Sequential fetch with early stop: entries are newest-first, so break as soon
-                // as we find a video published before the retention cutoff.
-                foreach (var entry in newEntries)
-                {
-                    ct.ThrowIfCancellationRequested();
-                    try
-                    {
-                        var meta = await _ytDlp.GetVideoMetadataAsync(entry.VideoUrl, ct)
-                            .ConfigureAwait(false);
-                        if (meta is null) continue;
-
-                        var publishedAt = ParseDate(meta);
-                        if (publishedAt.HasValue && publishedAt.Value < retentionCutoff.Value)
-                            break;
-                        metadataMap[entry.Id] = meta;
-                    }
-                    catch (Exception ex) when (ex is not OperationCanceledException)
-                    {
-                        LogMetadataFailed(entry.VideoUrl, ex);
-                    }
-                }
-            }
-            else
-            {
-                // No retention cutoff: fetch all new entries in parallel.
-                var semaphore = new SemaphoreSlim(MetadataParallelism);
-                var metaTasks = newEntries.Select(async entry =>
-                {
-                    await semaphore.WaitAsync(ct).ConfigureAwait(false);
-                    try
-                    {
-                        var meta = await _ytDlp.GetVideoMetadataAsync(entry.VideoUrl, ct)
-                            .ConfigureAwait(false);
-                        if (meta is not null)
-                            lock (metadataMap)
-                                metadataMap[entry.Id] = meta;
-                    }
-                    catch (Exception ex) when (ex is not OperationCanceledException)
-                    {
-                        LogMetadataFailed(entry.VideoUrl, ex);
-                    }
-                    finally
-                    {
-                        semaphore.Release();
-                    }
-                });
-                await Task.WhenAll(metaTasks).ConfigureAwait(false);
-            }
-
-            // Step 5 + 6 + 7: assign episode numbers, upsert DB
+            // Step 5: upsert DB — pending rows for new entries, updates for known ones.
+            // A single-video source fills its row from the preloaded metadata, but a new one is
+            // still left Pending for the resolver, which describes its streams; playlist/channel
+            // sources write Pending rows from the listing and let the resolver fetch the rest.
             var created = ProcessEntries(
                 source, playlist.Entries, metadataMap, existingVideos,
-                seriesName, syncStart, ct);
+                seriesName, syncStart, verdict.Unavailable, positions, ct);
 
-            // Step 8: cleanup orphans — videos no longer in the playlist (deleted from source)
-            // or older than RetentionDays.
-            // Runs BEFORE publication, not after: the reconciliation reads the database to decide what
-            // the library should hold, so leaving the dead rows in place made every removal take two
-            // passes — one to drop the row, the next to notice the item was unaccounted for. This only
-            // touches the database, so nothing here depends on the library being up to date.
-            CleanupOrphans(source, syncStart, retentionCutoff, playlist.Entries.Count);
+            // Step 6: cleanup orphans — videos no longer in the playlist (deleted from source).
+            // Retention is not enforced here: it is a publication filter in ResolutionService.Publishable,
+            // not an erase rule. This only touches the database; the resolver publishes.
+            CleanupOrphans(source, syncStart, playlist.Entries.Count);
 
-            // Step 7b: publish items to the Jellyfin library.
-            // Resolved per sync: fails loudly when the library is missing or unscanned.
-            var target = _publisher.ResolveTarget(LibraryRouting.NameFor(config, source.Mode));
-            var otherAnchors = _publisher.SweepAnchorsFor(config, source, sourceRecord);
-
-            // Publication is driven by what the database holds, not by what this pass happened
-            // to re-fetch: entries already known are deliberately skipped for metadata, and
-            // would otherwise never reach the library.
-            // Only resolved rows are publishable: a pending one has no date, no season and no
-            // episode number, and an unavailable one is exactly what must leave the library.
-            // BOTH arguments have to agree on that: the orphan sweep spares any item whose video
-            // the database still knows, so handing it every id would leave an excluded row's item
-            // in the library for ever and the retirement would never happen.
-            await _publisher.ReconcileAsync(
-                    target, otherAnchors, sourceRecord, source.Mode, seriesName,
-                    _db.GetPublishableVideosBySource(source.Url),
-                    _db.GetPublishableVideoIds().ToHashSet(StringComparer.OrdinalIgnoreCase),
-                    config.LocalBaseUrl, config.UseReleaseDateAsDateAdded, ct)
-                .ConfigureAwait(false);
-
-            // Step 9: update source record
+            // Step 7: update source record
+            // PublishedAnchorId is written by the resolver in ResolutionService.PublishAsync, not here.
             var videoCount = _db.GetVideosBySource(source.Url).Count;
             sourceRecord.LastSyncedAt = DateTimeOffset.UtcNow;
             sourceRecord.LastError = null;
             sourceRecord.VideoCount = videoCount;
-            sourceRecord.PublishedAnchorId = target.Anchor.Id;
             _db.UpsertSource(sourceRecord);
 
             LogSyncFinished(source.Url, videoCount);
@@ -584,6 +506,16 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// <param name="existingVideos">Every video the database already holds for this source.</param>
         /// <param name="seriesName">The resolved series name, used for Arte episode title selection.</param>
         /// <param name="syncStart">The timestamp recorded as the sync time for new records.</param>
+        /// <param name="unavailableIds">
+        /// Native IDs that <c>ApplyListingVerdict</c> already wrote as Unavailable this pass.
+        /// Entries that carry one of these IDs must be skipped: the row is already in the database
+        /// with the correct state, and a second upsert would violate the native-id UNIQUE index.
+        /// </param>
+        /// <param name="positions">
+        /// Listing rank per native ID, 0 = newest. Built from the flat-playlist order before this
+        /// call and also persisted by <c>SetListingPositions</c>; the new-row branch and the
+        /// existing-row branch both write it so the resolver can order its wave correctly.
+        /// </param>
         /// <param name="ct">A token to cancel the operation.</param>
         /// <returns>The number of video records created (not updated) by this pass.</returns>
         internal int ProcessEntries(
@@ -593,18 +525,21 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             IReadOnlyList<VideoRecord> existingVideos,
             string seriesName,
             DateTimeOffset syncStart,
+            IReadOnlyCollection<string> unavailableIds,
+            IReadOnlyDictionary<string, int> positions,
             CancellationToken ct)
         {
-            // One entry per video, before anything counts, ranks or upserts them.
+            // One entry per video, before anything counts or upserts them.
             var uniqueEntries = DeduplicateEntries(entries, metadataMap);
 
-            // Build a map of existing videos by NativeId for update detection
+            // Build a map of existing videos by NativeId for update detection.
             var existingByNativeId = BuildNativeIdMap(existingVideos);
 
-            // Compute episode numbers for NEW entries grouped by date
-            // Key: nativeId → (season, episode)
-            var assignments = AssignEpisodeNumbers(
-                uniqueEntries, metadataMap, existingByNativeId, existingVideos);
+            // Hoisted above the loop so NextDateBasedNumber's mutation of the tally carries
+            // across iterations: two same-day entries reaching path 2 in one pass need distinct
+            // ranks. (Path 2 is single-video only today, so a multi-entry preload is theoretically
+            // impossible, but the helper already mutates the dict — rely on that invariant.)
+            var numberedPerDay = NumberedPerDay(existingVideos);
 
             var created = 0;
 
@@ -612,13 +547,73 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             {
                 ct.ThrowIfCancellationRequested();
 
+                // Path 1: no metadata available — write a pending row from the listing alone.
+                // This is the normal path for playlist/channel sources: the listing gives us the
+                // native id, URL, title, duration and live status, and the resolver fetches the rest.
                 if (!metadataMap.TryGetValue(entry.Id, out var meta))
+                {
+                    // ApplyListingVerdict already wrote an Unavailable row for this id; skip it.
+                    // A second upsert with a fresh Guid would hit the native-id UNIQUE index and
+                    // fail every subsequent sync of this source.
+                    if (unavailableIds.Contains(entry.Id))
+                        continue;
+
+                    var existing = ExistingFor(existingByNativeId, entry.Id, entry.Id);
+                    if (existing is null)
+                    {
+                        // Brand-new entry: write a pending row carrying what the listing gave us.
+                        // FirstSeenAt is set once and never updated: it is the creation timestamp
+                        // the resolver will use to compute the published date-added.
+                        var row = new VideoRecord
+                        {
+                            Id = Guid.NewGuid().ToString(),
+                            SourceUrl = source.Url,
+                            NativeId = entry.Id,
+                            ExtractorKey = entry.IeKey,
+                            VideoUrl = entry.VideoUrl,
+                            Title = entry.Title,
+                            DurationSeconds = entry.Duration.HasValue ? (int)entry.Duration.Value : null,
+                            LiveStatus = entry.LiveStatus,
+                            ResolutionState = ResolutionState.Pending,
+                            SyncedAt = syncStart,
+                            FirstSeenAt = syncStart,
+                            ListingPosition = positions.GetValueOrDefault(entry.Id),
+                        };
+                        _db.UpsertVideo(row);
+                        created++;
+                    }
+                    else
+                    {
+                        // Known row: the resolver owns the metadata; only the position and the sync
+                        // timestamp are refreshed here. Live / upcoming entries are reset to Pending
+                        // because their metadata changes underneath us on every pass.
+                        var storedLive = existing.LiveStatus;
+                        existing.SyncedAt = syncStart;
+                        existing.ListingPosition = positions.GetValueOrDefault(entry.Id);
+                        if (MustRefetch(entry.LiveStatus) || MustRefetch(storedLive))
+                            existing.ResolutionState = ResolutionState.Pending;
+                        _db.UpsertVideo(existing);
+                    }
+                    continue;
+                }
+
+                // Path 2: preloaded metadata (single-video source only). FetchPlaylistAsync preloads
+                // the metadata for a single-video source, so the row is filled from it. A NEW row is
+                // still written Pending: the resolver is what describes a video's streams, and the
+                // preloaded answer's manifest URL is not kept, so a row written Resolved here would
+                // only be described on its first play. That costs one more -J per added source. A
+                // known row keeps the resolution state the resolver gave it, except an Unavailable
+                // one, which the listing shows available again.
+                // Mirror path 1's C1 guard: a single-video source whose yt-dlp answer yields a
+                // blank title gets an Unavailable row from ApplyListingVerdict; a second write here
+                // would mint a new Guid for the same native_id and fail on the UNIQUE index.
+                if (unavailableIds.Contains(entry.Id))
                     continue;
 
                 var publishedAt = ParseDate(meta);
-                var existing = ExistingFor(existingByNativeId, entry.Id, meta.Id);
+                var knownRow = ExistingFor(existingByNativeId, entry.Id, meta.Id);
 
-                if (existing is null)
+                if (knownRow is null || knownRow.ResolutionState == ResolutionState.Unavailable)
                 {
                     created++;
                 }
@@ -633,12 +628,12 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                     ? (PlatformRules.TitleFor(meta) ?? meta.Id)
                     : ResolveTitle(meta, seriesName);
 
-                // Build or update VideoRecord
+                // Build or update the VideoRecord.
                 // FirstSeenAt is the one property never refreshed below: it must keep the date of the
                 // FIRST sync that saw this video, which is what makes the published date added
                 // recomputable in both directions. UpsertVideo's COALESCE enforces the same invariant
                 // on the database side.
-                var record = existing ?? new VideoRecord
+                var record = knownRow ?? new VideoRecord
                 {
                     Id = Guid.NewGuid().ToString(),
                     SourceUrl = source.Url,
@@ -650,17 +645,40 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
                 FillVideoRecord(record, meta, source.Url, effectiveTitle, syncStart, publishedAt);
 
-                // This pass has the metadata in hand, so the row is resolved. (The plan that
-                // follows is what stops the sync from fetching it at all.)
-                record.ResolutionState = ResolutionState.Resolved;
-                record.ResolutionError = null;
-                record.ResolutionAttempts = 0;
-                record.ResolutionAttemptedAt = syncStart;
-                AssignNumbers(
-                    record,
-                    meta,
-                    effectiveTitle,
-                    assignments.TryGetValue(entry.Id, out var ep) ? ep : null);
+                // A new row, and a known Unavailable one the listing just returned metadata for
+                // (the video is available again: left Unavailable it would stay hidden until the
+                // weekly re-check, written Resolved it would never be described), start over as
+                // Pending with a clean slate.
+                if (knownRow is null || knownRow.ResolutionState == ResolutionState.Unavailable)
+                {
+                    record.ResolutionState = ResolutionState.Pending;
+                    record.ResolutionError = null;
+                    record.ResolutionAttempts = 0;
+                    record.ResolutionAttemptedAt = null;
+                }
+                else if (knownRow.ResolutionState == ResolutionState.Resolved)
+                {
+                    // The metadata is in hand and the row was resolved — and described — before:
+                    // it stays complete.
+                    record.ResolutionState = ResolutionState.Resolved;
+                    record.ResolutionError = null;
+                    record.ResolutionAttempts = 0;
+                    record.ResolutionAttemptedAt = syncStart;
+                }
+
+                // Any other known row (Pending: the resolver has not reached it yet; Failed: its
+                // description retry is waiting) keeps its resolution state, attempts, attempt date
+                // and error, so the resolver still resolves and describes it.
+
+                record.ListingPosition = positions.GetValueOrDefault(entry.Id);
+                // Only advance the per-day tally when the record might actually use the
+                // date-based slot: a record that already carries a season number will not reach
+                // the dateBased branch inside AssignNumbers, so advancing the counter here would
+                // silently skip a rank for every same-day video that follows in the same pass.
+                var dateBased = record.SeasonNumber.HasValue
+                    ? null
+                    : NextDateBasedNumber(numberedPerDay, publishedAt);
+                AssignNumbers(record, meta, effectiveTitle, dateBased);
 
                 _db.UpsertVideo(record);
             }
@@ -669,21 +687,19 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         }
 
         /// <summary>
-        /// Queues the <see cref="StreamDescriptionTask"/> when <paramref name="created"/> is
-        /// positive, and does nothing otherwise.
+        /// Wakes the resolver when an enumeration left work behind, and leaves it alone otherwise.
         /// </summary>
-        /// <param name="created">The number of video records the whole sync created.</param>
+        /// <param name="pending">How many rows this sync left pending.</param>
         /// <remarks>
-        /// Called once per sync, after its last source: queued per source, the task started on the
-        /// first creation, overlapped the remaining sources' yt-dlp work, and the creations made
-        /// while it ran were dropped by <c>QueueIfNotRunning</c>. Queued, not run: the description
-        /// task paces itself, and a sync that created nothing has nothing for it to do.
+        /// <c>QueueIfNotRunning</c> and not <c>QueueScheduledTask</c>: the caller is the sync, not
+        /// the resolver, so "wake it if it is asleep" is exactly right — and a resolver already
+        /// running will see the new rows in its next wave anyway.
         /// </remarks>
-        internal void QueueDescriptionIfCreated(int created)
+        internal void QueueResolutionIfDue(int pending)
         {
-            if (created > 0)
+            if (pending > 0)
             {
-                _tasks.QueueIfNotRunning<StreamDescriptionTask>();
+                _tasks.QueueIfNotRunning<ResolutionTask>();
             }
         }
 
@@ -732,15 +748,79 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         }
 
         /// <summary>
-        /// How many videos of a source already carry a number, per UTC day of publication.
+        /// The highest date-based rank each day already uses, for a source, keyed by the day the
+        /// stored numbers encode.
         /// </summary>
         /// <param name="existingVideos">Every video the database holds for the source.</param>
         /// <returns>A mutable tally, to be advanced by <see cref="NextDateBasedNumber"/>.</returns>
+        /// <remarks>
+        /// The highest rank rather than a count: once a numbered row of a day is deleted (orphan
+        /// cleanup, a live-only source's stale broadcast), a count falls below the ranks still in
+        /// use, and the next number would repeat one — two episodes sharing a watch state.
+        /// <para>
+        /// Only a number that encodes a day holds a rank of it (see <see cref="EncodedDay"/>); a
+        /// platform or title number (S01E05) holds none. The day is read from the number, not from
+        /// the row's PublishedAt: a stored number never moves, because the watch state is keyed
+        /// on it, but its row's date may (an archive's upload date differs from its live start, a
+        /// premiere is rescheduled). Keyed by PublishedAt, such a row would leave its rank looking
+        /// free in the day it encodes, and a later video of that day would repeat it. The row
+        /// therefore needs no PublishedAt at all to count.
+        /// </para>
+        /// </remarks>
         internal static Dictionary<DateOnly, int> NumberedPerDay(IReadOnlyList<VideoRecord> existingVideos)
-            => existingVideos
-                .Where(v => v.EpisodeNumber.HasValue && v.PublishedAt.HasValue)
-                .GroupBy(v => DateOnly.FromDateTime(v.PublishedAt!.Value.UtcDateTime.Date))
-                .ToDictionary(g => g.Key, g => g.Count());
+        {
+            ArgumentNullException.ThrowIfNull(existingVideos);
+
+            var tally = new Dictionary<DateOnly, int>();
+            foreach (var video in existingVideos)
+            {
+                if (video.SeasonNumber is not { } season
+                    || video.EpisodeNumber is not { } episode
+                    || EncodedDay(season, episode) is not { } day)
+                {
+                    continue;
+                }
+
+                var rank = episode % 1000;
+                if (rank > tally.GetValueOrDefault(day))
+                    tally[day] = rank;
+            }
+
+            return tally;
+        }
+
+        /// <summary>
+        /// The day a date-based number encodes, as <see cref="EpisodeNumberCalculator"/> builds it,
+        /// or null when the number has another shape.
+        /// </summary>
+        /// <param name="season">The stored season: the year, for a date-based number.</param>
+        /// <param name="episode">The stored episode: (month * 100 + day) * 1000 + rank.</param>
+        /// <returns>The encoded calendar day, or null.</returns>
+        /// <remarks>
+        /// The season must be a year from 1 to 9999: every year a DateTimeOffset, hence the
+        /// calculator, can produce, and every year a DateOnly can hold. A small platform season
+        /// (S01) is a valid year 1 too, but no video is published in year 1, so a rank counted
+        /// there never meets a new number. The month and day must form a real calendar date in
+        /// that year, and the rank must be 1 to 999, the calculator's own bounds.
+        /// </remarks>
+        private static DateOnly? EncodedDay(int season, int episode)
+        {
+            if (season is < 1 or > 9999 || episode < 0)
+                return null;
+
+            var rank = episode % 1000;
+            var monthDay = episode / 1000;
+            var month = monthDay / 100;
+            var day = monthDay % 100;
+
+            if (rank is < 1 or > 999 || month is < 1 or > 12)
+                return null;
+
+            if (day < 1 || day > DateTime.DaysInMonth(season, month))
+                return null;
+
+            return new DateOnly(season, month, day);
+        }
 
         /// <summary>
         /// The next date-based number for a video published on <paramref name="publishedAt"/>,
@@ -749,6 +829,11 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// </summary>
         /// <param name="numberedPerDay">The tally from <see cref="NumberedPerDay"/>.</param>
         /// <param name="publishedAt">The video's publication date, or null when it has none.</param>
+        /// <remarks>
+        /// A new number is keyed by the candidate's own (UTC) publication day, which is the day the
+        /// number it receives encodes; the tally already holds every stored number under the day
+        /// it encodes.
+        /// </remarks>
         /// <returns>
         /// The number, or null when the video has no date or the day is already full (rank > 999).
         /// </returns>
@@ -769,57 +854,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             return assignment;
         }
 
-        private Dictionary<string, (int season, int episode)> AssignEpisodeNumbers(
-            IReadOnlyList<PlaylistEntry> entries,
-            Dictionary<string, VideoMetadata> metadataMap,
-            Dictionary<string, VideoRecord> existingByNativeId,
-            IReadOnlyList<VideoRecord> existingVideos)
-        {
-            var result = new Dictionary<string, (int, int)>(StringComparer.OrdinalIgnoreCase);
-
-            // Group new entries (no existing episode number) by calendar date
-            var newByDate = new Dictionary<DateOnly, List<(PlaylistEntry entry, DateTimeOffset date)>>();
-            foreach (var entry in entries)
-            {
-                if (!metadataMap.TryGetValue(entry.Id, out var meta))
-                    continue;
-
-                if (ExistingFor(existingByNativeId, entry.Id, meta.Id) is { SeasonNumber: not null })
-                    continue; // Already has a number — skip, and do not spend a rank of its day
-
-                var date = ParseDate(meta);
-                if (!date.HasValue)
-                    continue;
-
-                var key = DateOnly.FromDateTime(date.Value.UtcDateTime.Date);
-                if (!newByDate.TryGetValue(key, out var list))
-                    newByDate[key] = list = [];
-                list.Add((entry, date.Value));
-            }
-
-            // Rank continues after the entries already numbered on that same UTC day.
-            var numberedPerDay = NumberedPerDay(existingVideos);
-
-            foreach (var (date, items) in newByDate)
-            {
-                // Sort new entries for this date by NativeId for determinism
-                foreach (var (entry, date2) in items.OrderBy(x => x.entry.Id, StringComparer.Ordinal))
-                {
-                    var assignment = NextDateBasedNumber(numberedPerDay, date2);
-                    if (assignment is null)
-                    {
-                        LogRankOverflow(entry.VideoUrl, date, numberedPerDay.GetValueOrDefault(date) + 1);
-                        break;
-                    }
-
-                    result[entry.Id] = assignment.Value;
-                }
-            }
-
-            return result;
-        }
-
-        private void CleanupOrphans(SourceDefinition source, DateTimeOffset syncStart, DateTimeOffset? retentionCutoff, int enumeratedCount)
+        internal void CleanupOrphans(SourceDefinition source, DateTimeOffset syncStart, int enumeratedCount)
         {
             if (enumeratedCount == 0)
             {
@@ -827,41 +862,26 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 return;
             }
 
-            var orphans = _db.GetOrphanedVideoUuids(source.Url, syncStart, retentionCutoff);
+            // Retention is a publication filter, not an erase rule — see ResolutionService.Publishable.
+            // Deleting a row that is still in the listing would put it back as Pending on the next
+            // enumeration, driving a yt-dlp call on the next resolution pass for every video that
+            // merely aged out of the retention window — the exact call loop this design exists to
+            // remove. Only the "left the listing" arm is enforced here.
+            var orphans = _db.GetOrphanedVideoUuids(source.Url, syncStart);
             foreach (var uuid in orphans)
             {
                 _db.DeleteVideo(uuid);
                 LogDeletedOrphan(uuid);
             }
-        }
 
-        /// <summary>
-        /// Whether this row has ever been given a payload, whatever that payload turned out to hold.
-        /// </summary>
-        /// <remarks>
-        /// A row that HAS one is never probed again, including when its payload is empty, because empty
-        /// is a real answer: the platform offered no formats, tags, categories, channels or subtitles.
-        /// Deciding this from the payload's content instead made that case indistinguishable from a row
-        /// that was never given a payload at all, so such a video cost one yt-dlp process per sync for
-        /// ever. The column being NULL is what carries the distinction; <c>VodDatabase.ReadExtras</c>
-        /// turns it into <see cref="VideoExtras.NoPayload"/>, and nothing else answers version 0.
-        /// <para>
-        /// A row that has none — written before the extras column existed, or holding a value that no
-        /// longer parses — is probed on every pass until a fetch answers, and that recurring cost is
-        /// accepted deliberately. There is no safe way to remember the failure: a fetch that resolves
-        /// nothing reports it as a null result, and so does every transient failure — a bot check, an
-        /// HTTP 429, expired cookies, a broken extractor, a DNS blip, unparseable output
-        /// (<c>YtDlpService.RunProcessAsync</c> returns null on ANY non-zero exit). Remembering that
-        /// would mark a perfectly good video as having an empty payload, permanently: migration 5 added
-        /// the extras column with no backfill, so every pre-existing row is payload-less, and one
-        /// throttling wave would stamp them all at once. The empty payload published on that pass then
-        /// wipes each item's tags, genres and studios, since <c>ApplyTags</c> and <c>ApplyStudios</c>
-        /// assign unconditionally — and the row is never probed again, so they never come back.
-        /// Probing repeatedly costs CPU and self-corrects; remembering costs the item's metadata and
-        /// does not.
-        /// </para>
-        /// </remarks>
-        internal static bool HasPayload(VideoExtras extras) => extras.Version > 0;
+            // Publication waits for the source to settle, and deleting a blocking row (pending,
+            // or failed with attempts left) can be what settles it. A drained source has no due
+            // rows, so the resolver would never select it again: its resolved rows would stay
+            // unnumbered and unpublished, and a deleted video would stay in the library. The same
+            // one free wave as a listing verdict change: resolve nothing, number, publish, stamp.
+            if (orphans.Count > 0)
+                _db.ClearLastResolvedAt(source.Url);
+        }
 
         /// <summary>
         /// Whether a stored row's metadata must be fetched again even though it is already known.
@@ -871,6 +891,25 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// rescheduled or start, so neither can be trusted from a previous pass.
         /// </remarks>
         internal static bool MustRefetch(LiveStatus status) => status != LiveStatus.NotLive;
+
+        /// <summary>
+        /// Whether the library's shape for this source no longer matches the configured mode.
+        /// </summary>
+        /// <remarks>
+        /// A source that has never published is excluded: there is nothing to re-shape, and its
+        /// first wave publishes in the configured mode regardless. A published source with no
+        /// recorded mode counts as changed — the shape of its items is unknown, and one extra
+        /// reconcile is cheaper than leaving the library wrong.
+        /// </remarks>
+        /// <param name="record">The stored source row.</param>
+        /// <param name="configured">The mode the configuration now asks for.</param>
+        /// <returns><see langword="true"/> when the source must be published again.</returns>
+        internal static bool ModeChanged(SourceRecord record, SourceMode configured)
+        {
+            ArgumentNullException.ThrowIfNull(record);
+
+            return record.PublishedAnchorId is not null && record.PublishedMode != configured;
+        }
 
         /// <summary>What a listing said about the entries it carries, before any call is made.</summary>
         /// <param name="Unavailable">
@@ -949,7 +988,13 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                         var row = stored ?? NewRowFor(entry, now);
                         row.ResolutionState = ResolutionState.Unavailable;
                         row.ResolutionError = ListingAbsenceError;
-                        row.ResolutionAttemptedAt = now;
+                        // Do NOT stamp ResolutionAttemptedAt here. The listing verdict is free —
+                        // no yt-dlp call was made — and DueNowPredicate's Unavailable arm makes
+                        // any Unavailable row with a non-null ResolutionAttemptedAt due after
+                        // seven days. Stamping here would cause 33+ dead entries to each cost
+                        // one yt-dlp call per week, violating §5.1's "sans aucun appel yt-dlp".
+                        // A null stamp is also what keeps the re-check free: every enumeration
+                        // re-visits this entry at zero cost and immediately re-evaluates the title.
                         updated.Add(row);
                     }
 
@@ -1099,14 +1144,8 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         [LoggerMessage(EventId = 3, Level = LogLevel.Error, Message = "Sync failed for {SourceUrl}")]
         private partial void LogSyncFailed(string sourceUrl, Exception exception);
 
-        [LoggerMessage(EventId = 4, Level = LogLevel.Warning, Message = "Failed to fetch metadata for {VideoUrl}")]
-        private partial void LogMetadataFailed(string videoUrl, Exception exception);
-
         [LoggerMessage(EventId = 6, Level = LogLevel.Debug, Message = "Deleted orphan {Uuid}")]
         private partial void LogDeletedOrphan(string uuid);
-
-        [LoggerMessage(EventId = 7, Level = LogLevel.Error, Message = "Too many videos on {Date} for {VideoUrl}: rank {Rank} > 999 — skipping remaining entries for this date")]
-        private partial void LogRankOverflow(string videoUrl, DateOnly date, int rank);
 
         [LoggerMessage(EventId = 8, Level = LogLevel.Warning, Message = "Skipping sync for {SourceUrl}: LibraryName not configured")]
         private partial void LogSkippedNoConfig(string sourceUrl);
@@ -1126,5 +1165,11 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         [LoggerMessage(EventId = 14, Level = LogLevel.Debug,
             Message = "Sync: not sweeping library '{LibraryName}', it does not resolve: {Reason}")]
         private partial void LogSweepAnchorUnavailable(string libraryName, string reason);
+
+        [LoggerMessage(EventId = 31, Level = LogLevel.Information,
+            Message = "Sync: {SourceUrl} published as {PublishedMode} but is now configured as "
+                + "{ConfiguredMode}; it will be published again")]
+        private partial void LogModeChanged(
+            string sourceUrl, SourceMode? publishedMode, SourceMode configuredMode);
     }
 }

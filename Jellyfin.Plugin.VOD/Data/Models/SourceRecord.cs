@@ -1,4 +1,5 @@
 using System;
+using Jellyfin.Plugin.VOD.Configuration;
 
 namespace Jellyfin.Plugin.VOD.Data.Models
 {
@@ -57,6 +58,18 @@ namespace Jellyfin.Plugin.VOD.Data.Models
         /// an error — the sweep then falls back to the configured libraries.
         /// </remarks>
         public Guid? PublishedAnchorId { get; set; }
+
+        /// <summary>
+        /// Gets or sets the mode this source last published in, or null when it has never published.
+        /// </summary>
+        /// <remarks>
+        /// The configuration holds the mode the administrator wants; this holds the one the library
+        /// actually reflects. A sync that finds the two disagree clears
+        /// <see cref="LastResolvedAt"/>, which is what lets the resolver select a source whose videos
+        /// are all resolved and republish them in the new shape. Without it, flipping the mode of a
+        /// settled source changes nothing in the library.
+        /// </remarks>
+        public SourceMode? PublishedMode { get; set; }
 
         /// <summary>Gets or sets when this source's last resolution wave finished.</summary>
         /// <remarks>

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using Jellyfin.Plugin.VOD.Configuration;
 using Jellyfin.Plugin.VOD.Data;
 using Jellyfin.Plugin.VOD.Data.Models;
 using Jellyfin.Plugin.VOD.Services.Sync;
@@ -271,35 +272,38 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
         }
 
         [Fact]
-        public void GetOrphanedVideoUuids_WithRetentionCutoff_ReturnsOldVideos()
+        public void GetOrphanedVideoUuids_DoesNotPrune_ARowStillInTheListing_EvenWhenBeyondRetention()
         {
+            // B-C1: a row whose published_at is far outside the retention window must NOT be deleted
+            // when it is still in the listing (synced_at == syncStart). Deleting it would put it back
+            // as Pending on the next enumeration and drive a yt-dlp call every resolution pass.
+            // Retention is a publication filter (ResolutionService.Publishable), not an erase rule.
             _db.UpsertSource(new SourceRecord { Url = "https://example.com" });
             var syncStart = DateTimeOffset.UtcNow;
-            var retention = syncStart.AddDays(-30);
 
-            // Recent video — within retention, synced now
+            // Still in the listing (synced_at == syncStart) but published two years ago.
             _db.UpsertVideo(new VideoRecord
             {
-                Id = "recent-uuid",
-                SourceUrl = "https://example.com",
-                VideoUrl = "https://example.com/v/recent",
-                PublishedAt = syncStart.AddDays(-10),
-                SyncedAt = syncStart
-            });
-            // Old video — beyond retention, synced now (still on source but too old)
-            _db.UpsertVideo(new VideoRecord
-            {
-                Id = "old-uuid",
+                Id = "old-but-listed-uuid",
                 SourceUrl = "https://example.com",
                 VideoUrl = "https://example.com/v/old",
-                PublishedAt = syncStart.AddDays(-60),
+                PublishedAt = syncStart.AddDays(-730),
                 SyncedAt = syncStart
             });
+            // Left the listing (synced_at is before syncStart) — this one IS an orphan.
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = "gone-uuid",
+                SourceUrl = "https://example.com",
+                VideoUrl = "https://example.com/v/gone",
+                PublishedAt = syncStart.AddDays(-730),
+                SyncedAt = syncStart.AddHours(-2)
+            });
 
-            var orphans = _db.GetOrphanedVideoUuids("https://example.com", syncStart, retention);
+            var orphans = _db.GetOrphanedVideoUuids("https://example.com", syncStart);
 
-            Assert.DoesNotContain("recent-uuid", orphans);
-            Assert.Contains("old-uuid", orphans);
+            Assert.DoesNotContain("old-but-listed-uuid", orphans);
+            Assert.Contains("gone-uuid", orphans);
         }
 
         [Fact]
@@ -914,6 +918,22 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
             });
 
             Assert.Equal(resolved, _db.GetSource("https://example.test/lr")!.LastResolvedAt);
+        }
+
+        [Fact]
+        public void UpsertSource_DoesNotUndoAClear_WhenTheCallerHoldsAStaleRecord()
+        {
+            // The sync loads its SourceRecord before cleanup clears the stamp, then upserts that
+            // record at the end of the pass; writing the stale stamp back would cancel the clear.
+            const string url = "https://example.test/stale";
+            _db.UpsertSource(new SourceRecord { Url = url });
+            _db.SetLastResolvedAt(url, new DateTimeOffset(2026, 10, 12, 9, 0, 0, TimeSpan.Zero));
+            var stale = _db.GetSource(url)!;
+
+            _db.ClearLastResolvedAt(url);
+            _db.UpsertSource(stale);
+
+            Assert.Null(_db.GetSource(url)!.LastResolvedAt);
         }
 
         [Fact]
@@ -1627,6 +1647,47 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
             Assert.Equal(anchor, _db.GetSource("https://example.test/rt")!.PublishedAnchorId);
         }
 
+        [Fact]
+        public void PublishedMode_RoundTripsThroughTheV8Column()
+        {
+            _db.UpsertSource(new SourceRecord
+            {
+                Url = "https://example.test/moded",
+                PublishedMode = SourceMode.Movies
+            });
+
+            Assert.Equal(SourceMode.Movies, _db.GetSource("https://example.test/moded")!.PublishedMode);
+        }
+
+        [Fact]
+        public void PublishedMode_IsNullUntilSomethingHasBeenPublished()
+        {
+            // Null means "the library's shape is unknown", which a sync reads as a mismatch against
+            // any configured mode: the source gets one republication rather than being trusted.
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/unmoded" });
+
+            Assert.Null(_db.GetSource("https://example.test/unmoded")!.PublishedMode);
+        }
+
+        [Fact]
+        public void PublishedMode_SurvivesAnUpsertMadeFromAReadBackRecord()
+        {
+            // Same trap as PublishedAnchorId: the sync reads a record and writes it back at step 7.
+            // A column MapSource did not read would be erased, and every later sync would see a
+            // mismatch and clear last_resolved_at forever.
+            _db.UpsertSource(new SourceRecord
+            {
+                Url = "https://example.test/mode-rt",
+                PublishedMode = SourceMode.Series
+            });
+
+            var readBack = _db.GetSource("https://example.test/mode-rt")!;
+            readBack.LastError = "boom";
+            _db.UpsertSource(readBack);
+
+            Assert.Equal(SourceMode.Series, _db.GetSource("https://example.test/mode-rt")!.PublishedMode);
+        }
+
         /// <summary>
         /// A fresh database and a migrated one must agree on the shape of <c>sources</c>. The v3
         /// review left this untested (finding P7) — a column added to the migration but forgotten in
@@ -1711,6 +1772,496 @@ namespace Jellyfin.Plugin.VOD.Tests.Data
 
             columns.Sort(StringComparer.Ordinal);
             return columns;
+        }
+
+        // --- Deferred resolution queries ---
+
+        /// <summary>Builds a row in a given state, as a pass would have left it.</summary>
+        private void SeedForResolution(
+            string sourceUrl,
+            string id,
+            string nativeId,
+            ResolutionState state,
+            string? extractorKey = "Youtube",
+            DateTimeOffset? attemptedAt = null,
+            int attempts = 0,
+            int? listingPosition = null)
+        {
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = id,
+                SourceUrl = sourceUrl,
+                VideoUrl = "https://example.test/v/" + nativeId,
+                NativeId = nativeId,
+                ExtractorKey = extractorKey,
+                SyncedAt = DateTimeOffset.UnixEpoch,
+                ResolutionState = state,
+                ResolutionAttemptedAt = attemptedAt,
+                ResolutionAttempts = attempts,
+                ListingPosition = listingPosition,
+            });
+        }
+
+        [Fact]
+        public void SelectSourceToResolve_PrefersTheSourceWithTheFewestVideosDue()
+        {
+            // Shortest first (§6.2): serving a source lowers its own count, so it stays at the
+            // front until exhausted — depth is a consequence, not a rule — and a source with two
+            // new videos goes ahead of one with a 300-video backlog.
+            var now = new DateTimeOffset(2026, 10, 13, 12, 0, 0, TimeSpan.Zero);
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/big" });
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/small" });
+            // Both sources have been resolved before, so the never-served branch does not apply.
+            _db.SetLastResolvedAt("https://example.test/big", now.AddDays(-1));
+            _db.SetLastResolvedAt("https://example.test/small", now.AddDays(-1));
+
+            for (var i = 0; i < 5; i++)
+                SeedForResolution("https://example.test/big", $"big-{i}", $"b{i}", ResolutionState.Pending);
+
+            SeedForResolution("https://example.test/small", "small-0", "s0", ResolutionState.Pending);
+
+            Assert.Equal(
+                "https://example.test/small",
+                _db.SelectSourceToResolve("Youtube", now, retryMinutes: 15));
+        }
+
+        [Fact]
+        public void SelectSourceToResolve_ServesNeverServedSourcesWithWorkShortestFirst()
+        {
+            // Seeding after a purge: every source is never-served and has a backlog. Giving each of
+            // them the never-served priority served them round-robin — one wave each, none ever
+            // finished, so with publication waiting for a settled source nothing appeared. A source
+            // with due rows competes on its due count; the shortest is served, and stays first.
+            var now = new DateTimeOffset(2026, 10, 13, 12, 0, 0, TimeSpan.Zero);
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/a-big" });
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/b-small" });
+
+            for (var i = 0; i < 5; i++)
+                SeedForResolution("https://example.test/a-big", $"big-{i}", $"b{i}", ResolutionState.Pending);
+            for (var i = 0; i < 3; i++)
+                SeedForResolution("https://example.test/b-small", $"small-{i}", $"s{i}", ResolutionState.Pending);
+
+            Assert.Equal(
+                "https://example.test/b-small",
+                _db.SelectSourceToResolve("Youtube", now, retryMinutes: 15));
+
+            // One wave later the small source is stamped and still has a row due: it is still first.
+            _db.SetLastResolvedAt("https://example.test/b-small", now);
+            SeedForResolution("https://example.test/b-small", "small-0", "s0", ResolutionState.Resolved);
+            SeedForResolution("https://example.test/b-small", "small-1", "s1", ResolutionState.Resolved);
+
+            Assert.Equal(
+                "https://example.test/b-small",
+                _db.SelectSourceToResolve("Youtube", now, retryMinutes: 15));
+        }
+
+        [Fact]
+        public void SelectSourceToResolve_IgnoresWhatIsNotDueYet()
+        {
+            // A failed video inside its backoff window is not work; a source with nothing due is
+            // not a candidate at all, so the pass can end instead of spinning on it.
+            var now = new DateTimeOffset(2026, 10, 13, 12, 0, 0, TimeSpan.Zero);
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/waiting" });
+            // Mark the source as previously served so it is not picked up by the never-served
+            // branch added for C2 (last_resolved_at IS NULL would otherwise return it).
+            _db.SetLastResolvedAt("https://example.test/waiting", now.AddDays(-1));
+
+            // Failed once a minute ago: the base window is 15 minutes, so not due.
+            SeedForResolution(
+                "https://example.test/waiting", "w-0", "w0", ResolutionState.Failed,
+                attemptedAt: now.AddMinutes(-1), attempts: 1);
+
+            // Resolved rows are never due.
+            SeedForResolution("https://example.test/waiting", "w-1", "w1", ResolutionState.Resolved);
+
+            // The listing's own verdict has no attempt timestamp: it is re-checked by the next
+            // enumeration, for free, and must not cost the resolver a call.
+            SeedForResolution("https://example.test/waiting", "w-2", "w2", ResolutionState.Unavailable);
+
+            Assert.Null(_db.SelectSourceToResolve("Youtube", now, retryMinutes: 15));
+            Assert.Empty(_db.GetPlatformsWithDueVideos(now, retryMinutes: 15));
+        }
+
+        [Fact]
+        public void SelectSourceToResolve_ReleasesAFailedVideoWhenItsWindowHasPassed()
+        {
+            var now = new DateTimeOffset(2026, 10, 13, 12, 0, 0, TimeSpan.Zero);
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/retry" });
+            _db.SetLastResolvedAt("https://example.test/retry", now.AddDays(-1));
+
+            // Two consecutive failures → 15 × 2 = 30 minutes. 29 minutes is too early, 31 is not.
+            SeedForResolution(
+                "https://example.test/retry", "r-0", "r0", ResolutionState.Failed,
+                attemptedAt: now.AddMinutes(-29), attempts: 2);
+            Assert.Null(_db.SelectSourceToResolve("Youtube", now, retryMinutes: 15));
+
+            SeedForResolution(
+                "https://example.test/retry", "r-0", "r0", ResolutionState.Failed,
+                attemptedAt: now.AddMinutes(-31), attempts: 2);
+            Assert.Equal(
+                "https://example.test/retry",
+                _db.SelectSourceToResolve("Youtube", now, retryMinutes: 15));
+        }
+
+        [Fact]
+        public void SelectSourceToResolve_RechecksAnUnavailableVideoAfterSevenDays()
+        {
+            var now = new DateTimeOffset(2026, 10, 13, 12, 0, 0, TimeSpan.Zero);
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/gone" });
+            _db.SetLastResolvedAt("https://example.test/gone", now.AddDays(-1));
+
+            SeedForResolution(
+                "https://example.test/gone", "g-0", "g0", ResolutionState.Unavailable,
+                attemptedAt: now.AddDays(-6));
+            Assert.Null(_db.SelectSourceToResolve("Youtube", now, retryMinutes: 15));
+
+            SeedForResolution(
+                "https://example.test/gone", "g-0", "g0", ResolutionState.Unavailable,
+                attemptedAt: now.AddDays(-8));
+            Assert.Equal(
+                "https://example.test/gone",
+                _db.SelectSourceToResolve("Youtube", now, retryMinutes: 15));
+        }
+
+        [Fact]
+        public void GetPlatformsWithDueVideos_PartitionsByExtractorKey()
+        {
+            var now = new DateTimeOffset(2026, 10, 13, 12, 0, 0, TimeSpan.Zero);
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/yt" });
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/arte" });
+            // Both sources have been resolved before so the never-served arm does not fire;
+            // this test pins that the DUE predicate partitions by extractor key, not the UNION arm.
+            _db.SetLastResolvedAt("https://example.test/yt", now.AddDays(-1));
+            _db.SetLastResolvedAt("https://example.test/arte", now.AddDays(-1));
+
+            SeedForResolution("https://example.test/yt", "y-0", "y0", ResolutionState.Pending);
+            SeedForResolution(
+                "https://example.test/arte", "a-0", "a0", ResolutionState.Pending,
+                extractorKey: "ArteTV");
+
+            Assert.Equal(
+                ["ArteTV", "Youtube"],
+                _db.GetPlatformsWithDueVideos(now, retryMinutes: 15).OrderBy(k => k, StringComparer.Ordinal));
+            Assert.Equal(
+                "https://example.test/arte",
+                _db.SelectSourceToResolve("ArteTV", now, retryMinutes: 15));
+        }
+
+        [Fact]
+        public void GetDueVideos_TakesTheNewestFirst_AndCapsTheWave()
+        {
+            // listing_position 0 is the newest entry, and a row that has never been enumerated
+            // sorts last — there is nothing better to go on, since a pending video has no date.
+            var now = new DateTimeOffset(2026, 10, 13, 12, 0, 0, TimeSpan.Zero);
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/order" });
+
+            SeedForResolution("https://example.test/order", "o-2", "o2", ResolutionState.Pending, listingPosition: 2);
+            SeedForResolution("https://example.test/order", "o-null", "on", ResolutionState.Pending);
+            SeedForResolution("https://example.test/order", "o-0", "o0", ResolutionState.Pending, listingPosition: 0);
+            SeedForResolution("https://example.test/order", "o-1", "o1", ResolutionState.Pending, listingPosition: 1);
+
+            Assert.Equal(
+                ["o-0", "o-1"],
+                _db.GetDueVideos("https://example.test/order", now, retryMinutes: 15, limit: 2)
+                    .Select(v => v.Id));
+            Assert.Equal(
+                ["o-0", "o-1", "o-2", "o-null"],
+                _db.GetDueVideos("https://example.test/order", now, retryMinutes: 15, limit: 10)
+                    .Select(v => v.Id));
+        }
+
+        [Fact]
+        public void SetLastResolvedAt_RecordsWhenTheWaveFinished()
+        {
+            var when = new DateTimeOffset(2026, 10, 13, 12, 30, 0, TimeSpan.Zero);
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/stamp" });
+
+            _db.SetLastResolvedAt("https://example.test/stamp", when);
+
+            Assert.Equal(when, _db.GetSource("https://example.test/stamp")!.LastResolvedAt);
+        }
+
+        [Fact]
+        public void SelectSourceToResolve_CapWindowAtSevenDaysRegardlessOfBase()
+        {
+            // With the old predicate (multiplier cap of 672), a 60-minute base would cap at
+            // 672 × 60 = 40 320 minutes = 28 days, so a 6-day-old attempt with 20 failures
+            // would not be due yet. The spec says seven days unconditionally: this test proves
+            // the cap is a time cap, not a factor cap.
+            var now = new DateTimeOffset(2026, 10, 13, 12, 0, 0, TimeSpan.Zero);
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/cap" });
+            _db.SetLastResolvedAt("https://example.test/cap", now.AddDays(-1));
+
+            // 20 attempts, base 60: window = MIN(60 × 2^19 / 1440, 7.0) = 7.0 days.
+            // 6 days old: not yet due.
+            SeedForResolution(
+                "https://example.test/cap", "cap-0", "c0", ResolutionState.Failed,
+                attemptedAt: now.AddDays(-6), attempts: 20);
+            Assert.Null(_db.SelectSourceToResolve("Youtube", now, retryMinutes: 60));
+
+            // 8 days old: past the seven-day cap, must be due.
+            SeedForResolution(
+                "https://example.test/cap", "cap-0", "c0", ResolutionState.Failed,
+                attemptedAt: now.AddDays(-8), attempts: 20);
+            Assert.Equal(
+                "https://example.test/cap",
+                _db.SelectSourceToResolve("Youtube", now, retryMinutes: 60));
+        }
+
+        [Fact]
+        public void GetDueVideos_ReturnsEmptyForNonPositiveLimit()
+        {
+            // SQLite treats LIMIT -1 as unbounded; a non-positive limit must be caught before
+            // the query runs, so a misconfigured wave size can never trigger an unbounded burst.
+            var now = new DateTimeOffset(2026, 10, 13, 12, 0, 0, TimeSpan.Zero);
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/zerowave" });
+            SeedForResolution("https://example.test/zerowave", "z-0", "z0", ResolutionState.Pending);
+
+            Assert.Empty(_db.GetDueVideos("https://example.test/zerowave", now, retryMinutes: 15, limit: 0));
+            Assert.Empty(_db.GetDueVideos("https://example.test/zerowave", now, retryMinutes: 15, limit: -1));
+        }
+
+        [Fact]
+        public void GetPlatformsWithDueVideos_GroupsNullExtractorKeyUnderEmptyString()
+        {
+            // A row written before extractor keys existed has a NULL extractor_key. COALESCE maps
+            // it to '', so it appears in the empty-string lane rather than being dropped from
+            // every wave. Deleting the COALESCE from either query would make this test fail.
+            var now = new DateTimeOffset(2026, 10, 13, 12, 0, 0, TimeSpan.Zero);
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/nokey" });
+
+            SeedForResolution(
+                "https://example.test/nokey", "nk-0", "nk0", ResolutionState.Pending,
+                extractorKey: null);
+
+            var platforms = _db.GetPlatformsWithDueVideos(now, retryMinutes: 15);
+            Assert.Equal([""], platforms.OrderBy(k => k, StringComparer.Ordinal));
+
+            Assert.Equal(
+                "https://example.test/nokey",
+                _db.SelectSourceToResolve("", now, retryMinutes: 15));
+        }
+
+        [Fact]
+        public void SelectSourceToResolve_SelectsANeverServedSource_EvenWhenItsOnlyRowIsResolved()
+        {
+            // A single-video source writes a Resolved row on its first sync, so it has no Pending
+            // rows. Without the never-served branch the resolver would never publish it.
+            var now = new DateTimeOffset(2026, 10, 13, 12, 0, 0, TimeSpan.Zero);
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/never-served" });
+
+            // last_resolved_at is NULL by default (SourceRecord constructor).
+            SeedForResolution("https://example.test/never-served", "ns-0", "ns0", ResolutionState.Resolved);
+
+            Assert.Equal(
+                "https://example.test/never-served",
+                _db.SelectSourceToResolve("Youtube", now, retryMinutes: 15));
+
+            Assert.Contains(
+                "Youtube",
+                _db.GetPlatformsWithDueVideos(now, retryMinutes: 15));
+        }
+
+        [Fact]
+        public void SelectSourceToResolve_IgnoresNeverServedSource_AfterSetLastResolvedAt()
+        {
+            // Once the resolver has run one wave for a source, last_resolved_at is stamped and the
+            // never-served branch must no longer return that source — resolved rows are never due.
+            var now = new DateTimeOffset(2026, 10, 13, 12, 0, 0, TimeSpan.Zero);
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/now-served" });
+            SeedForResolution("https://example.test/now-served", "ts-0", "ts0", ResolutionState.Resolved);
+
+            _db.SetLastResolvedAt("https://example.test/now-served", now.AddMinutes(-5));
+
+            Assert.Null(_db.SelectSourceToResolve("Youtube", now, retryMinutes: 15));
+            Assert.DoesNotContain(
+                "Youtube",
+                _db.GetPlatformsWithDueVideos(now, retryMinutes: 15));
+        }
+
+        [Fact]
+        public void GetPlatformsWithDueVideos_NeverReturnsListingAbsenceRow_HoweverOldItsResolutionAttempt()
+        {
+            // B-I3: an Unavailable row written by the listing verdict must never cost a yt-dlp call.
+            // The listing-absence verdict does not stamp ResolutionAttemptedAt, so the Unavailable
+            // arm of DueNowPredicate (which requires a non-null ResolutionAttemptedAt) never fires.
+            var now = new DateTimeOffset(2026, 10, 13, 12, 0, 0, TimeSpan.Zero);
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/absent" });
+            _db.SetLastResolvedAt("https://example.test/absent", now.AddDays(-1));
+
+            // Unavailable row with no attempt stamp — exactly what ApplyListingVerdict writes.
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = "absent-0",
+                SourceUrl = "https://example.test/absent",
+                VideoUrl = "https://example.test/v/absent",
+                NativeId = "absent-0",
+                ExtractorKey = "Youtube",
+                SyncedAt = DateTimeOffset.UnixEpoch,
+                ResolutionState = ResolutionState.Unavailable,
+                ResolutionError = SyncService.ListingAbsenceError,
+                ResolutionAttemptedAt = null,  // NOT stamped
+            });
+
+            // Should never appear as due, regardless of how much time passes.
+            Assert.Null(_db.SelectSourceToResolve("Youtube", now.AddDays(30), retryMinutes: 15));
+            Assert.DoesNotContain(
+                "Youtube",
+                _db.GetPlatformsWithDueVideos(now.AddDays(30), retryMinutes: 15));
+        }
+
+        [Fact]
+        public void SelectSourceToResolve_ReturnsDrainedSource_AfterClearLastResolvedAt()
+        {
+            // B-I4: a source whose backlog is drained has no due rows, so the resolver would never
+            // select it again without a nudge. After a verdict change, ClearLastResolvedAt re-enters
+            // it in the never-served arm for exactly one wave that publishes with updated rows.
+            var now = new DateTimeOffset(2026, 10, 13, 12, 0, 0, TimeSpan.Zero);
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/drained" });
+            _db.SetLastResolvedAt("https://example.test/drained", now.AddHours(-1));
+
+            // Only resolved rows — source is fully drained.
+            SeedForResolution("https://example.test/drained", "d-0", "d0", ResolutionState.Resolved);
+
+            // Without ClearLastResolvedAt, the source is not a candidate.
+            Assert.Null(_db.SelectSourceToResolve("Youtube", now, retryMinutes: 15));
+
+            // After clearing, the never-served arm picks it up.
+            _db.ClearLastResolvedAt("https://example.test/drained");
+            Assert.Equal(
+                "https://example.test/drained",
+                _db.SelectSourceToResolve("Youtube", now, retryMinutes: 15));
+            Assert.Contains(
+                "Youtube",
+                _db.GetPlatformsWithDueVideos(now, retryMinutes: 15));
+        }
+
+        [Fact]
+        public void EnsureCreated_MigrationV8_AddsAnEmptyStreamDescriptionsColumn()
+        {
+            var path = Path.GetTempFileName();
+            try
+            {
+                using (var seed = new SqliteConnection($"Data Source={path}"))
+                {
+                    seed.Open();
+                    using var cmd = seed.CreateCommand();
+                    cmd.CommandText = """
+                        CREATE TABLE sources (url TEXT PRIMARY KEY);
+                        CREATE TABLE videos (
+                            id            TEXT PRIMARY KEY,
+                            source_url    TEXT NOT NULL,
+                            extractor_key TEXT,
+                            extras        TEXT
+                        );
+                        INSERT INTO sources (url) VALUES ('https://example.test/a');
+                        INSERT INTO videos (id, source_url) VALUES ('v', 'https://example.test/a');
+                        PRAGMA user_version = 7;
+                        """;
+                    cmd.ExecuteNonQuery();
+                }
+
+                using (var upgraded = new VodDatabase(path, NullLogger<VodDatabase>.Instance))
+                {
+                    upgraded.EnsureCreated();
+                }
+
+                using var conn = new SqliteConnection($"Data Source={path}");
+                conn.Open();
+                using var read = conn.CreateCommand();
+                read.CommandText = "SELECT stream_descriptions FROM videos WHERE id = 'v'";
+                Assert.Equal(DBNull.Value, read.ExecuteScalar());
+            }
+            finally
+            {
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+        }
+
+        [Fact]
+        public void UpsertVideo_RoundTripsStreamDescriptions()
+        {
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/s" });
+            _db.UpsertVideo(new VideoRecord
+            {
+                Id = "v",
+                SourceUrl = "https://example.test/s",
+                VideoUrl = "https://example.test/v/1",
+                SyncedAt = DateTimeOffset.UnixEpoch,
+                StreamDescriptions = """{"primary":[]}""",
+            });
+
+            Assert.Equal("""{"primary":[]}""", _db.GetVideosBySource("https://example.test/s").Single().StreamDescriptions);
+        }
+
+        [Fact]
+        public void UpsertVideo_KeepsStoredStreamDescriptions_WhenTheNewValueIsNull()
+        {
+            // A sync re-upserting a known row, or a re-resolution that skips description (outside
+            // retention), must not erase a description already paid for (spec E2: kept).
+            _db.UpsertSource(new SourceRecord { Url = "https://example.test/s" });
+            var row = new VideoRecord
+            {
+                Id = "v",
+                SourceUrl = "https://example.test/s",
+                VideoUrl = "https://example.test/v/1",
+                SyncedAt = DateTimeOffset.UnixEpoch,
+                StreamDescriptions = """{"primary":[]}""",
+            };
+            _db.UpsertVideo(row);
+
+            row.StreamDescriptions = null;
+            _db.UpsertVideo(row);
+
+            Assert.Equal("""{"primary":[]}""", _db.GetVideosBySource("https://example.test/s").Single().StreamDescriptions);
+        }
+
+        [Fact]
+        public void GetResolutionSummaries_CountsEachStateAndKeepsTheLatestError()
+        {
+            const string url = "https://example.test/s";
+            _db.UpsertSource(new SourceRecord { Url = url });
+            var now = new DateTimeOffset(2026, 10, 14, 12, 0, 0, TimeSpan.Zero);
+            SeedForResolution(url, "r", "r", ResolutionState.Resolved);
+            SeedForResolution(url, "p", "p", ResolutionState.Pending);
+            SeedForResolution(url, "u", "u", ResolutionState.Unavailable);
+            SeedForResolution(url, "f-old", "f-old", ResolutionState.Failed, attemptedAt: now.AddHours(-2), attempts: 1);
+            SeedForResolution(url, "f-new", "f-new", ResolutionState.Failed, attemptedAt: now, attempts: 1);
+            SetError("f-old", "old error");
+            SetError("f-new", "new error");
+
+            var summary = _db.GetResolutionSummaries()[url];
+
+            Assert.Equal(new ResolutionSummary(1, 1, 2, 1, false, "new error"), summary);
+        }
+
+        [Fact]
+        public void GetResolutionSummaries_AgreesWithSourceIsSettled()
+        {
+            // The SQL duplicates ResolutionSettlement.Blocks; this pins the two together.
+            const string url = "https://example.test/s";
+            _db.UpsertSource(new SourceRecord { Url = url });
+            SeedForResolution(url, "r", "r", ResolutionState.Resolved);
+            SeedForResolution(url, "f", "f", ResolutionState.Failed, attempts: ResolutionSettlement.BlockingFailedAttempts - 1);
+            Assert.Equal(
+                ResolutionService.SourceIsSettled(_db.GetVideosBySource(url)),
+                _db.GetResolutionSummaries()[url].Settled);
+
+            SeedForResolution(url, "f", "f", ResolutionState.Failed, attempts: ResolutionSettlement.BlockingFailedAttempts);
+            Assert.Equal(
+                ResolutionService.SourceIsSettled(_db.GetVideosBySource(url)),
+                _db.GetResolutionSummaries()[url].Settled);
+            Assert.True(_db.GetResolutionSummaries()[url].Settled);
+        }
+
+        private void SetError(string id, string error)
+        {
+            var row = _db.GetVideosBySource("https://example.test/s").Single(v => v.Id == id);
+            row.ResolutionError = error;
+            _db.UpsertVideo(row);
         }
     }
 }

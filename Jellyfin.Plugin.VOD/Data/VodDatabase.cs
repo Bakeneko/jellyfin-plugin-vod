@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text.Json;
 using System.Threading;
+using Jellyfin.Plugin.VOD.Configuration;
 using Jellyfin.Plugin.VOD.Data.Models;
 using Jellyfin.Plugin.VOD.Services.Sync;
 using Microsoft.Data.Sqlite;
@@ -265,7 +267,9 @@ namespace Jellyfin.Plugin.VOD.Data
 
                 case 8:
                     // The five columns the deferred-resolution design is built on, plus the
-                    // source-level timestamp the configuration page shows.
+                    // source-level timestamp the configuration page shows, plus the stream
+                    // descriptions stored at resolution time, since publication now waits for the
+                    // whole source while a manifest URL only lives for one wave.
                     // The backfill is the honest reading of what a v7 database holds: a row with
                     // metadata in extras has already been paid for, so it is resolved; one without
                     // has never been resolved, so it is pending and the resolver will take it. No
@@ -277,8 +281,10 @@ namespace Jellyfin.Plugin.VOD.Data
                         ALTER TABLE videos ADD COLUMN resolution_attempts     INTEGER NOT NULL DEFAULT 0;
                         ALTER TABLE videos ADD COLUMN resolution_error        TEXT;
                         ALTER TABLE videos ADD COLUMN listing_position        INTEGER;
+                        ALTER TABLE videos ADD COLUMN stream_descriptions     TEXT;
 
-                        ALTER TABLE sources ADD COLUMN last_resolved_at TEXT;
+                        ALTER TABLE sources ADD COLUMN last_resolved_at  TEXT;
+                        ALTER TABLE sources ADD COLUMN published_mode    INTEGER;
 
                         UPDATE videos SET resolution_state = 'Resolved'
                         WHERE extras IS NOT NULL AND extras <> '';
@@ -311,15 +317,20 @@ namespace Jellyfin.Plugin.VOD.Data
             lock (_sync)
             {
                 using var cmd = Connection.CreateCommand();
+
+                // last_resolved_at belongs to the resolver: it is seeded on insert, but on an
+                // existing row only SetLastResolvedAt and ClearLastResolvedAt change it. A caller
+                // holding a SourceRecord loaded earlier (the sync loads one before cleanup) must
+                // not write a stale stamp back over a clear made in the same pass.
                 cmd.CommandText = """
                     INSERT INTO sources
                         (url, name, series_thumbnail_url, series_banner_url, tags, series_synopsis,
                          last_synced_at, last_error, video_count, published_anchor_id,
-                         last_resolved_at)
+                         last_resolved_at, published_mode)
                     VALUES
                         ($url, $name, $thumbnailUrl, $bannerUrl, $tags, $synopsis,
                          $lastSyncedAt, $lastError, $videoCount, $publishedAnchorId,
-                         $lastResolvedAt)
+                         $lastResolvedAt, $publishedMode)
                     ON CONFLICT(url) DO UPDATE SET
                         name                 = excluded.name,
                         series_thumbnail_url = excluded.series_thumbnail_url,
@@ -327,10 +338,10 @@ namespace Jellyfin.Plugin.VOD.Data
                         tags                 = excluded.tags,
                         series_synopsis      = excluded.series_synopsis,
                         last_synced_at       = excluded.last_synced_at,
-                        last_resolved_at     = excluded.last_resolved_at,
                         last_error           = excluded.last_error,
                         video_count          = excluded.video_count,
-                        published_anchor_id  = excluded.published_anchor_id;
+                        published_anchor_id  = excluded.published_anchor_id,
+                        published_mode       = excluded.published_mode;
                     """;
                 cmd.Parameters.AddWithValue("$url", source.Url);
                 cmd.Parameters.AddWithValue("$name", (object?)source.Name ?? DBNull.Value);
@@ -346,6 +357,9 @@ namespace Jellyfin.Plugin.VOD.Data
                 cmd.Parameters.AddWithValue(
                     "$publishedAnchorId",
                     (object?)source.PublishedAnchorId?.ToString("N") ?? DBNull.Value);
+                cmd.Parameters.AddWithValue(
+                    "$publishedMode",
+                    source.PublishedMode is { } publishedMode ? (int)publishedMode : (object)DBNull.Value);
                 cmd.ExecuteNonQuery();
             }
         }
@@ -382,6 +396,66 @@ namespace Jellyfin.Plugin.VOD.Data
         }
 
         /// <inheritdoc />
+        public IReadOnlyDictionary<string, ResolutionSummary> GetResolutionSummaries()
+        {
+            lock (_sync)
+            {
+                var counts = new Dictionary<string, (int R, int P, int F, int U, int Blocking)>(
+                    StringComparer.OrdinalIgnoreCase);
+
+                using (var cmd = Connection.CreateCommand())
+                {
+                    // "Blocking" restates ResolutionSettlement.Blocks in SQL so the page needs no
+                    // row-by-row read; GetResolutionSummaries_AgreesWithSourceIsSettled pins the two.
+                    cmd.CommandText = """
+                        SELECT source_url,
+                               SUM(resolution_state = 'Resolved'),
+                               SUM(resolution_state = 'Pending'),
+                               SUM(resolution_state = 'Failed'),
+                               SUM(resolution_state = 'Unavailable'),
+                               SUM(resolution_state = 'Pending'
+                                   OR (resolution_state = 'Failed' AND resolution_attempts < $threshold))
+                        FROM videos
+                        GROUP BY source_url
+                        """;
+                    cmd.Parameters.AddWithValue("$threshold", ResolutionSettlement.BlockingFailedAttempts);
+                    using var r = cmd.ExecuteReader();
+                    while (r.Read())
+                    {
+                        counts[r.GetString(0)] =
+                            (r.GetInt32(1), r.GetInt32(2), r.GetInt32(3), r.GetInt32(4), r.GetInt32(5));
+                    }
+                }
+
+                var lastErrors = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                using (var cmd = Connection.CreateCommand())
+                {
+                    // Failed rows are few; the newest attempt per source wins.
+                    cmd.CommandText = """
+                        SELECT source_url, resolution_error
+                        FROM videos
+                        WHERE resolution_state = 'Failed' AND resolution_error IS NOT NULL
+                        ORDER BY resolution_attempted_at DESC
+                        """;
+                    using var r = cmd.ExecuteReader();
+                    while (r.Read())
+                    {
+                        lastErrors.TryAdd(r.GetString(0), r.GetString(1));
+                    }
+                }
+
+                var summaries = new Dictionary<string, ResolutionSummary>(StringComparer.OrdinalIgnoreCase);
+                foreach (var (url, c) in counts)
+                {
+                    summaries[url] = new ResolutionSummary(
+                        c.R, c.P, c.F, c.U, c.Blocking == 0, lastErrors.GetValueOrDefault(url));
+                }
+
+                return summaries;
+            }
+        }
+
+        /// <inheritdoc />
         public void UpsertVideo(VideoRecord video)
         {
             lock (_sync)
@@ -395,7 +469,7 @@ namespace Jellyfin.Plugin.VOD.Data
                          thumbnail_url, extras,
                          description, live_status, first_seen_at,
                          resolution_state, resolution_attempted_at, resolution_attempts,
-                         resolution_error, listing_position)
+                         resolution_error, listing_position, stream_descriptions)
                     VALUES
                         ($id, $sourceUrl, $extractorKey, $nativeId, $videoUrl, $title,
                          $publishedAt, $durationSeconds,
@@ -403,7 +477,7 @@ namespace Jellyfin.Plugin.VOD.Data
                          $thumbnailUrl, $extras,
                          $description, $liveStatus, $firstSeenAt,
                          $resolutionState, $resolutionAttemptedAt, $resolutionAttempts,
-                         $resolutionError, $listingPosition)
+                         $resolutionError, $listingPosition, $streamDescriptions)
                     ON CONFLICT(id) DO UPDATE SET
                         source_url       = excluded.source_url,
                         extractor_key    = excluded.extractor_key,
@@ -424,6 +498,8 @@ namespace Jellyfin.Plugin.VOD.Data
                         resolution_attempts     = excluded.resolution_attempts,
                         resolution_error        = excluded.resolution_error,
                         listing_position        = excluded.listing_position,
+                        -- A null never erases a description already paid for.
+                        stream_descriptions     = COALESCE(excluded.stream_descriptions, videos.stream_descriptions),
                         -- Never overwritten: an existing discovery date always beats the one the new
                         -- upsert proposes. This COALESCE is what enforces "set once, never updated".
                         first_seen_at    = COALESCE(videos.first_seen_at, excluded.first_seen_at);
@@ -683,7 +759,7 @@ namespace Jellyfin.Plugin.VOD.Data
         private static readonly TimeSpan LiveExemptionMaxAge = TimeSpan.FromDays(7);
 
         /// <inheritdoc />
-        public IReadOnlyList<string> GetOrphanedVideoUuids(string sourceUrl, DateTimeOffset syncedBefore, DateTimeOffset? retentionCutoff = null)
+        public IReadOnlyList<string> GetOrphanedVideoUuids(string sourceUrl, DateTimeOffset syncedBefore)
         {
             lock (_sync)
             {
@@ -702,21 +778,175 @@ namespace Jellyfin.Plugin.VOD.Data
                 // exemption left one phantom per broadcast, accumulating. Freshness separates the
                 // two cases: a live row is rewritten on every probe pass, while a stuck row stops
                 // being written the moment its re-fetch starts failing.
-                var sql = retentionCutoff.HasValue
-                    ? "SELECT id FROM videos WHERE source_url = $url AND (live_status = $notLive OR synced_at < $stale) AND (synced_at < $cutoff OR (published_at IS NOT NULL AND published_at < $retention))"
-                    : "SELECT id FROM videos WHERE source_url = $url AND (live_status = $notLive OR synced_at < $stale) AND synced_at < $cutoff";
-                cmd.CommandText = sql;
+                //
+                // Retention is deliberately NOT checked here — see IVodDatabase.GetOrphanedVideoUuids
+                // for the rationale. Retention is a publication filter, not an erase rule.
+                cmd.CommandText =
+                    "SELECT id FROM videos WHERE source_url = $url "
+                    + "AND (live_status = $notLive OR synced_at < $stale) "
+                    + "AND synced_at < $cutoff";
                 cmd.Parameters.AddWithValue("$url", sourceUrl);
                 cmd.Parameters.AddWithValue("$notLive", nameof(LiveStatus.NotLive));
                 cmd.Parameters.AddWithValue("$cutoff", syncedBefore.ToString("O"));
                 cmd.Parameters.AddWithValue("$stale", syncedBefore.Subtract(LiveExemptionMaxAge).ToString("O"));
-                if (retentionCutoff.HasValue)
-                    cmd.Parameters.AddWithValue("$retention", retentionCutoff.Value.ToString("O"));
                 using var r = cmd.ExecuteReader();
                 var list = new List<string>();
                 while (r.Read())
                     list.Add(r.GetString(0));
                 return list;
+            }
+        }
+
+        /// <summary>
+        /// What "this video is due for resolution now" means, in one place.
+        /// </summary>
+        /// <remarks>
+        /// Written once and shared by the three queries that need it, because three copies would
+        /// drift and a wave would then be selected on one definition and filled on another.
+        /// <para>
+        /// A <c>Failed</c> row waits <c>ResolutionRetryMinutes × 2^(attempts−1)</c> minutes,
+        /// capped unconditionally at seven days regardless of the base interval; <c>julianday</c>
+        /// answers in days, hence the division by 1440. The cap lives inside <c>MIN(…, 7.0)</c>
+        /// so it applies to the computed wait in days; <c>POWER(2, 2000)</c> returns <c>Inf</c>
+        /// in SQLite's floating-point arithmetic, and <c>MIN(Inf, 7.0)</c> is <c>7.0</c>, so very
+        /// large attempt counts still clamp correctly. An <c>Unavailable</c> row with no attempt
+        /// timestamp is the listing's own free verdict — the next enumeration re-checks it for
+        /// nothing, so it must not cost a call here.
+        /// </para>
+        /// </remarks>
+        private const string DueNowPredicate = """
+            (
+                resolution_state = 'Pending'
+                OR (resolution_state = 'Failed'
+                    AND (resolution_attempted_at IS NULL
+                         OR julianday($now) - julianday(resolution_attempted_at)
+                            >= MIN($retryMinutes * POWER(2, MAX(resolution_attempts - 1, 0)) / 1440.0, 7.0)))
+                OR (resolution_state = 'Unavailable'
+                    AND resolution_attempted_at IS NOT NULL
+                    AND julianday($now) - julianday(resolution_attempted_at) >= 7.0)
+            )
+            """;
+
+        /// <inheritdoc />
+        public IReadOnlyList<string> GetPlatformsWithDueVideos(DateTimeOffset now, int retryMinutes)
+        {
+            lock (_sync)
+            {
+                using var cmd = Connection.CreateCommand();
+                // Include platforms that have sources never yet resolved (last_resolved_at IS NULL)
+                // so their first resolution pass is triggered even when all rows are already Resolved.
+                cmd.CommandText =
+                    "SELECT DISTINCT COALESCE(extractor_key, '') FROM videos WHERE " + DueNowPredicate
+                    + " UNION "
+                    + "SELECT DISTINCT COALESCE(v.extractor_key, '') FROM videos v "
+                    + "JOIN sources s ON s.url = v.source_url WHERE s.last_resolved_at IS NULL";
+                cmd.Parameters.AddWithValue("$now", now.UtcDateTime.ToString("O"));
+                cmd.Parameters.AddWithValue("$retryMinutes", retryMinutes);
+                using var r = cmd.ExecuteReader();
+                var list = new List<string>();
+                while (r.Read())
+                    list.Add(r.GetString(0));
+                return list;
+            }
+        }
+
+        /// <inheritdoc />
+        public string? SelectSourceToResolve(string ieKey, DateTimeOffset now, int retryMinutes, IReadOnlySet<string>? excluded = null)
+        {
+            lock (_sync)
+            {
+                using var cmd = Connection.CreateCommand();
+                // A never-served source (last_resolved_at IS NULL) with NOTHING due is given a
+                // due_count of 0: it needs one free wave — no yt-dlp call, just a publication — after
+                // a listing verdict, an orphan cleanup or a probe pass changed it. A never-served
+                // source WITH due rows competes on its due count like any other: giving it the 0
+                // served every source of a fresh seeding round-robin, one wave each, so none ever
+                // settled and nothing was published.
+                //
+                // When excluded is non-empty the outer WHERE filters those source URLs out before
+                // ordering, preventing a stamped-but-still-cheapest source from being returned
+                // again after the caller has already skipped it (N2 fix).
+                var exclusionClause = string.Empty;
+                if (excluded is { Count: > 0 })
+                {
+                    var paramNames = excluded.Select((_, i) => $"$ex{i}").ToList();
+                    exclusionClause = " WHERE source_url NOT IN (" + string.Join(", ", paramNames) + ")";
+                    var index = 0;
+                    foreach (var url in excluded)
+                        cmd.Parameters.AddWithValue($"$ex{index++}", url);
+                }
+
+                // The exclusionClause is composed solely of SQLite parameter names ($ex0, $ex1 …),
+                // not from user-supplied strings.  The actual URL values are bound as parameters
+                // above, so this is safe despite the CA2100 flag.
+#pragma warning disable CA2100 // SQL built from parameter names only, not from user data
+                cmd.CommandText =
+                    "SELECT source_url FROM ("
+                    + "SELECT source_url, COUNT(*) AS due_count FROM videos "
+                    + "WHERE COALESCE(extractor_key, '') = $ieKey AND " + DueNowPredicate + " "
+                    + "GROUP BY source_url "
+                    + "UNION ALL "
+                    + "SELECT DISTINCT v.source_url, 0 AS due_count FROM videos v "
+                    + "JOIN sources s ON s.url = v.source_url "
+                    + "WHERE COALESCE(v.extractor_key, '') = $ieKey AND s.last_resolved_at IS NULL "
+                    + "AND NOT EXISTS (SELECT 1 FROM videos d WHERE d.source_url = v.source_url AND "
+                    + DueNowPredicate + ")"
+                    + ")" + exclusionClause + " ORDER BY due_count ASC, source_url ASC LIMIT 1";
+#pragma warning restore CA2100
+                cmd.Parameters.AddWithValue("$ieKey", ieKey);
+                cmd.Parameters.AddWithValue("$now", now.UtcDateTime.ToString("O"));
+                cmd.Parameters.AddWithValue("$retryMinutes", retryMinutes);
+                return cmd.ExecuteScalar() as string;
+            }
+        }
+
+        /// <inheritdoc />
+        public IReadOnlyList<VideoRecord> GetDueVideos(
+            string sourceUrl, DateTimeOffset now, int retryMinutes, int limit)
+        {
+            if (limit <= 0)
+                return [];
+
+            lock (_sync)
+            {
+                using var cmd = Connection.CreateCommand();
+                cmd.CommandText =
+                    "SELECT * FROM videos WHERE source_url = $url AND " + DueNowPredicate + " "
+                    + "ORDER BY listing_position IS NULL, listing_position, id LIMIT $limit";
+                cmd.Parameters.AddWithValue("$url", sourceUrl);
+                cmd.Parameters.AddWithValue("$now", now.UtcDateTime.ToString("O"));
+                cmd.Parameters.AddWithValue("$retryMinutes", retryMinutes);
+                cmd.Parameters.AddWithValue("$limit", limit);
+                using var r = cmd.ExecuteReader();
+                var list = new List<VideoRecord>();
+                while (r.Read())
+                    list.Add(MapVideo(r));
+                return list;
+            }
+        }
+
+        /// <inheritdoc />
+        public void SetLastResolvedAt(string sourceUrl, DateTimeOffset when)
+        {
+            lock (_sync)
+            {
+                using var cmd = Connection.CreateCommand();
+                cmd.CommandText = "UPDATE sources SET last_resolved_at = $when WHERE url = $url";
+                cmd.Parameters.AddWithValue("$url", sourceUrl);
+                cmd.Parameters.AddWithValue("$when", when.ToString("O"));
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        /// <inheritdoc />
+        public void ClearLastResolvedAt(string sourceUrl)
+        {
+            lock (_sync)
+            {
+                using var cmd = Connection.CreateCommand();
+                cmd.CommandText = "UPDATE sources SET last_resolved_at = NULL WHERE url = $url";
+                cmd.Parameters.AddWithValue("$url", sourceUrl);
+                cmd.ExecuteNonQuery();
             }
         }
 
@@ -747,6 +977,7 @@ namespace Jellyfin.Plugin.VOD.Data
             cmd.Parameters.AddWithValue("$resolutionAttempts", v.ResolutionAttempts);
             cmd.Parameters.AddWithValue("$resolutionError", (object?)v.ResolutionError ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$listingPosition", (object?)v.ListingPosition ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$streamDescriptions", (object?)v.StreamDescriptions ?? DBNull.Value);
         }
 
         private static SourceRecord MapSource(SqliteDataReader r)
@@ -769,6 +1000,18 @@ namespace Jellyfin.Plugin.VOD.Data
                 return s is not null && Guid.TryParse(s, out var id) ? id : null;
             }
 
+            // An unknown value is read as null rather than coerced to a mode: a row claiming a
+            // mode the library does not hold would suppress the very republication it needs.
+            SourceMode? M(string col)
+            {
+                var ord = r.GetOrdinal(col);
+                if (r.IsDBNull(ord))
+                    return null;
+
+                var raw = r.GetInt32(ord);
+                return Enum.IsDefined(typeof(SourceMode), raw) ? (SourceMode)raw : null;
+            }
+
             return new SourceRecord
             {
                 Url = r.GetString(r.GetOrdinal("url")),
@@ -783,7 +1026,8 @@ namespace Jellyfin.Plugin.VOD.Data
                 LastError = S("last_error"),
                 VideoCount = r.GetInt32(r.GetOrdinal("video_count")),
                 PublishedAnchorId = G("published_anchor_id"),
-                LastResolvedAt = D("last_resolved_at")
+                LastResolvedAt = D("last_resolved_at"),
+                PublishedMode = M("published_mode")
             };
         }
 
@@ -841,6 +1085,7 @@ namespace Jellyfin.Plugin.VOD.Data
                 ResolutionAttempts = r.GetInt32(r.GetOrdinal("resolution_attempts")),
                 ResolutionError = S("resolution_error"),
                 ListingPosition = I("listing_position"),
+                StreamDescriptions = S("stream_descriptions"),
             };
         }
 

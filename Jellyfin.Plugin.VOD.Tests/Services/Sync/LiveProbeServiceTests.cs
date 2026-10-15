@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Net.Http;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -13,6 +14,8 @@ using Jellyfin.Plugin.VOD.Services;
 using Jellyfin.Plugin.VOD.Services.Sync;
 using Jellyfin.Plugin.VOD.Services.Sync.Dto;
 using MediaBrowser.Controller.Library;
+using MediaBrowser.Controller.MediaEncoding;
+using MediaBrowser.Controller.Persistence;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
 using Xunit;
@@ -441,6 +444,87 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             Assert.Equal(ResolutionState.Resolved, stored!.ResolutionState);
         }
 
+        private static VideoRecord ProbeRow(string sourceUrl, string nativeId, ResolutionState state)
+            => new()
+            {
+                Id = "row-" + nativeId,
+                SourceUrl = sourceUrl,
+                NativeId = nativeId,
+                VideoUrl = sourceUrl + "/" + nativeId,
+                SyncedAt = DateTimeOffset.UnixEpoch,
+                LiveStatus = LiveStatus.Live,
+                ResolutionState = state,
+                PublishedAt = new DateTimeOffset(2026, 10, 13, 20, 0, 0, TimeSpan.Zero),
+                SeasonNumber = 2026,
+                EpisodeNumber = 1013001,
+            };
+
+        [Fact]
+        public async Task ProbeSourceCoreAsync_WakesTheResolver_WhenItSettlesTheSource()
+        {
+            // I2: the broadcast was the source's last pending row. The probe resolves it but never
+            // numbers the source's dated rows; unless last_resolved_at is cleared, the resolver
+            // never serves the now-settled source again and those rows stay unpublished.
+            const string sourceUrl = "https://www.twitch.tv/settles";
+            var db = Substitute.For<IVodDatabase>();
+            db.GetVideosBySource(sourceUrl).Returns(
+                [ProbeRow(sourceUrl, "airing", ResolutionState.Pending)],
+                [ProbeRow(sourceUrl, "airing", ResolutionState.Resolved)]);
+
+            await MakeService(db).ProbeSourceCoreAsync(
+                new PluginConfiguration { SeriesLibraryName = string.Empty },
+                new SourceDefinition { Url = sourceUrl, Mode = SourceMode.Series },
+                SourceType.TwitchChannelLive,
+                new SourceRecord { Url = sourceUrl, Name = "Settles" },
+                new ProbeOutcome(true, [Live("airing")]),
+                CancellationToken.None);
+
+            db.Received(1).ClearLastResolvedAt(sourceUrl);
+        }
+
+        [Fact]
+        public async Task ProbeSourceCoreAsync_LeavesTheResolverAlone_OnAnAlreadySettledSource()
+        {
+            // Settled before the pass: the resolver already had its chance to number it, so a
+            // probe pass must not hand the source a free wave every few minutes.
+            const string sourceUrl = "https://www.twitch.tv/settled";
+            var db = Substitute.For<IVodDatabase>();
+            db.GetVideosBySource(sourceUrl).Returns(
+                [ProbeRow(sourceUrl, "airing", ResolutionState.Resolved)]);
+
+            await MakeService(db).ProbeSourceCoreAsync(
+                new PluginConfiguration { SeriesLibraryName = string.Empty },
+                new SourceDefinition { Url = sourceUrl, Mode = SourceMode.Series },
+                SourceType.TwitchChannelLive,
+                new SourceRecord { Url = sourceUrl, Name = "Settled" },
+                new ProbeOutcome(true, [Live("airing")]),
+                CancellationToken.None);
+
+            db.DidNotReceive().ClearLastResolvedAt(Arg.Any<string>());
+        }
+
+        [Fact]
+        public async Task ProbeSourceCoreAsync_LeavesTheResolverAlone_WhileTheSourceIsStillUnsettled()
+        {
+            const string sourceUrl = "https://www.twitch.tv/unsettled";
+            var other = ProbeRow(sourceUrl, "other", ResolutionState.Pending);
+            other.LiveStatus = LiveStatus.NotLive;
+            var db = Substitute.For<IVodDatabase>();
+            db.GetVideosBySource(sourceUrl).Returns(
+                [ProbeRow(sourceUrl, "airing", ResolutionState.Pending), other],
+                [ProbeRow(sourceUrl, "airing", ResolutionState.Resolved), other]);
+
+            await MakeService(db).ProbeSourceCoreAsync(
+                new PluginConfiguration { SeriesLibraryName = string.Empty },
+                new SourceDefinition { Url = sourceUrl, Mode = SourceMode.Series },
+                SourceType.TwitchVideos,
+                new SourceRecord { Url = sourceUrl, Name = "Unsettled" },
+                new ProbeOutcome(true, [Live("airing")]),
+                CancellationToken.None);
+
+            db.DidNotReceive().ClearLastResolvedAt(Arg.Any<string>());
+        }
+
         [Fact]
         public async Task ProbeSourceCoreAsync_DoesNotSpendADayRank_OnABroadcastItAlreadyNumbered()
         {
@@ -671,6 +755,15 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 Substitute.For<IVodLocalizer>(),
                 NullLogger<LibraryPublisher>.Instance);
 
+            var cache = new PlaylistCache();
+            var describer = new StreamDescriber(
+                Substitute.For<ILibraryManager>(),
+                Substitute.For<IMediaStreamRepository>(),
+                Substitute.For<IMediaEncoder>(),
+                cache,
+                new SubtitleTokens(cache),
+                NullLogger<StreamDescriber>.Instance);
+
             return new LiveProbeService(
                 new YtDlpService(
                     new CookieJar(NullLogger<CookieJar>.Instance),
@@ -678,7 +771,79 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                     NullLogger<YtDlpService>.Instance),
                 db,
                 publisher,
+                describer,
+                new VideoDescriptionStep(Substitute.For<IHttpClientFactory>(), describer),
                 NullLogger<LiveProbeService>.Instance);
+        }
+
+        [Fact]
+        public async Task ProbeSourceCoreAsync_ReReadsSourceRecord_UnderTheLock()
+        {
+            // B-I8: the source record is read before the lock in ProbeSourceAsync, so a
+            // concurrent ResolutionService write (e.g. PublishedAnchorId) between the pre-probe
+            // read and the lock acquisition would be silently clobbered by UpsertSource. The fix
+            // re-reads the record under the lock. This test verifies that the re-read happens:
+            // the caller passes a stale record (no name, no anchor), but GetSource returns a
+            // fresher one (with name and anchor). UpsertSource must receive the fresh record.
+            const string sourceUrl = "https://www.twitch.tv/testchan-reread";
+            var freshAnchorId = Guid.NewGuid();
+
+            var db = Substitute.For<IVodDatabase>();
+            db.GetVideosBySource(sourceUrl).Returns([]);
+
+            // GetSource returns a record that a concurrent resolver wrote (with PublishedAnchorId).
+            db.GetSource(sourceUrl)
+              .Returns(new SourceRecord
+              {
+                  Url = sourceUrl,
+                  Name = "Test Channel",
+                  PublishedAnchorId = freshAnchorId,
+              });
+
+            // The stale record the probe read before the lock: no name, no anchor.
+            var staleRecord = new SourceRecord { Url = sourceUrl };
+
+            await MakeService(db).ProbeSourceCoreAsync(
+                new PluginConfiguration { SeriesLibraryName = string.Empty },
+                new SourceDefinition { Url = sourceUrl, Mode = SourceMode.Series },
+                SourceType.TwitchChannelLive,
+                staleRecord,
+                ProbeOutcome.Nothing,
+                CancellationToken.None);
+
+            // UpsertSource must have been called with the FRESH record (anchor id present),
+            // not the stale one the caller passed in.
+            db.Received().UpsertSource(Arg.Is<SourceRecord>(r => r.PublishedAnchorId == freshAnchorId));
+            db.DidNotReceive().UpsertSource(Arg.Is<SourceRecord>(r => r.PublishedAnchorId == null));
+        }
+
+        [Fact]
+        public async Task ProbeSourceCoreAsync_KeepsDerivedName_WhenDatabaseHasNone()
+        {
+            // B-I8 complement: the caller may have derived a name from the URL for a source
+            // that was never synced. The re-read must keep that name when the DB record has none.
+            const string sourceUrl = "https://www.twitch.tv/testchan-noname";
+
+            var db = Substitute.For<IVodDatabase>();
+            db.GetVideosBySource(sourceUrl).Returns([]);
+
+            // DB has the source but with no name yet.
+            db.GetSource(sourceUrl)
+              .Returns(new SourceRecord { Url = sourceUrl, Name = string.Empty });
+
+            // The caller derived a name from the URL.
+            var staleRecord = new SourceRecord { Url = sourceUrl, Name = "testchan-noname" };
+
+            await MakeService(db).ProbeSourceCoreAsync(
+                new PluginConfiguration { SeriesLibraryName = string.Empty },
+                new SourceDefinition { Url = sourceUrl, Mode = SourceMode.Series },
+                SourceType.TwitchChannelLive,
+                staleRecord,
+                ProbeOutcome.Nothing,
+                CancellationToken.None);
+
+            // The derived name must have been carried into UpsertSource.
+            db.Received().UpsertSource(Arg.Is<SourceRecord>(r => r.Name == "testchan-noname"));
         }
     }
 }

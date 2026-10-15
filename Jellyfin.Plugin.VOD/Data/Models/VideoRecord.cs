@@ -103,5 +103,17 @@ namespace Jellyfin.Plugin.VOD.Data.Models
         /// publication date yet, so the listing's own order is all there is to go on.
         /// </remarks>
         public int? ListingPosition { get; set; }
+
+        /// <summary>
+        /// Gets or sets the stream descriptions of this video's version-group members, as JSON
+        /// (see <c>StoredStreams</c>), or null when the video was never described.
+        /// </summary>
+        /// <remarks>
+        /// Written when the video is resolved and applied to its library items at publication, so
+        /// a tier is described before anyone plays it even though publication now waits for the
+        /// whole source. Kept after it is applied: an item recreated later is described again
+        /// without a second probe.
+        /// </remarks>
+        public string? StreamDescriptions { get; set; }
     }
 }

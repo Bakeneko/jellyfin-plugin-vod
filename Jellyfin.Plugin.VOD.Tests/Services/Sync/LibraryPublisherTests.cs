@@ -26,6 +26,7 @@ using Xunit;
 
 namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
 {
+    [Collection(BaseItemStaticsCollection.Name)]
     public sealed class LibraryPublisherTests
     {
         private readonly ILibraryManager _library = Substitute.For<ILibraryManager>();
@@ -2365,6 +2366,84 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
 
             var primary = Assert.IsType<Movie>(Assert.Single(created));
             Assert.Empty(primary.LinkedAlternateVersions);
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_ReportsOnlyTheVideosItCreatedAnItemFor()
+        {
+            // N2: the callers apply stored stream descriptions only to items this pass created.
+            // A video whose items were all there already must not be reported.
+            const string newId = "3f9a2b1c-0000-0000-0000-000000000090";
+            const string knownId = "3f9a2b1c-0000-0000-0000-000000000091";
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+            var created = new List<BaseItem>();
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created.Add(call.ArgAt<BaseItem>(0)));
+            ResolveCreatedItems(created);
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            var anchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+            var source = new SourceRecord { Url = "https://example.com/source" };
+            var known = TieredVideo(knownId, qualities: []);
+            var fresh = TieredVideo(newId, qualities: []);
+
+            var first = await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                [known],
+                new HashSet<string> { knownId, newId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+            Assert.Equal([knownId], first.CreatedVideoIds);
+
+            // Second pass: the library holds the known video's item; the new one appears.
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(created.ToList());
+
+            var second = await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                [known, fresh],
+                new HashSet<string> { knownId, newId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            Assert.Equal([newId], second.CreatedVideoIds);
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_ReportsAVideo_WhenOnlyANewTierWasCreatedForIt()
+        {
+            // N2: a tier added upstream is a new item with no stream description of its own, so
+            // its video is reported although its primary already existed.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000092";
+            _library.GetNewItemId(Arg.Any<string>(), Arg.Any<Type>())
+                .Returns(call => DeterministicId(call.ArgAt<string>(0) + "|" + call.ArgAt<Type>(1).Name));
+            var created = new List<BaseItem>();
+            _library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => created.Add(call.ArgAt<BaseItem>(0)));
+            ResolveCreatedItems(created);
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(new List<BaseItem>());
+
+            var anchor = new Folder { Id = Guid.NewGuid(), Path = "/media/Vods" };
+            var source = new SourceRecord { Url = "https://example.com/source" };
+
+            await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                [TieredVideo(vodId, qualities: [new VideoQuality(1080, "h264", 30)])],
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns(created.ToList());
+
+            var report = await _publisher.ReconcileAsync(
+                new LibraryTarget("Vods", anchor, null), [], source, SourceMode.Movies, "Test",
+                [TieredVideo(vodId)],
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            Assert.Equal(0, report.Created);
+            Assert.Equal([vodId], report.CreatedVideoIds);
         }
 
         [Fact]

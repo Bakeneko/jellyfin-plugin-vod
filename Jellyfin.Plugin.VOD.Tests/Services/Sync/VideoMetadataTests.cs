@@ -1,3 +1,4 @@
+using System;
 using System.IO;
 using System.Linq;
 using Jellyfin.Plugin.VOD.Services.Sync;
@@ -13,10 +14,12 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
     /// </summary>
     public sealed class VideoMetadataTests
     {
+        private static string LoadFixture(string fixture)
+            => File.ReadAllText(Path.Combine("Fixtures", fixture));
+
         private static VideoMetadata Parse(string fixture)
         {
-            var json = File.ReadAllText(Path.Combine("Fixtures", fixture));
-            var meta = VideoMetadata.ParseJson(json);
+            var meta = VideoMetadata.ParseJson(LoadFixture(fixture));
             Assert.NotNull(meta);
             return meta;
         }
@@ -245,6 +248,30 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 """;
 
             Assert.False(VideoMetadata.ParseJson(json)!.IsUnavailable);
+        }
+
+        [Fact]
+        public void ParseJson_ReadsTheHlsMasterUrl_FromTheFormats()
+        {
+            // Measured: a YouTube -J response carries the same HLS master on every m3u8_native
+            // format. Reading it here is what makes resolution cost ONE call instead of two.
+            var meta = VideoMetadata.ParseJson(LoadFixture("youtube-video.json"));
+
+            Assert.NotNull(meta);
+            Assert.NotNull(meta!.ManifestUrl);
+            Assert.Contains(".m3u8", meta.ManifestUrl, StringComparison.Ordinal);
+        }
+
+        [Fact]
+        public void ParseJson_LeavesTheManifestUrlNull_WhenNoFormatCarriesOne()
+        {
+            // An Arte video is served as DASH, so there is no HLS master to describe. The
+            // metadata is still complete and the row is still resolved; only the stream
+            // description is skipped.
+            var meta = VideoMetadata.ParseJson(LoadFixture("arte-video.json"));
+
+            Assert.NotNull(meta);
+            Assert.Null(meta!.ManifestUrl);
         }
     }
 }
