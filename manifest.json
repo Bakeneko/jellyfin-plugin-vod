@@ -8,6 +8,14 @@
         "category": "General",
         "versions": [
             {
+                "version": "2.0.0.0",
+                "changelog": "- Picking a quality no longer forces a software transcode: the tier is streamed as a direct copy.\n- A source appears complete, its episodes in chronological order, once all of its videos resolve.\n- Switching a source between series and movies now takes effect.\n- The configuration page shows how far each source has got.\n- Enumeration no longer fetches metadata video by video: it runs in bounded waves, one source at a time.\n- First fill is gradual, and a source stays hidden until every one of its videos has resolved.",
+                "targetAbi": "12.1.0.0",
+                "sourceUrl": "https://github.com/Bakeneko/jellyfin-plugin-vod/releases/download/v2/vod_2.0.0.0.zip",
+                "checksum": "28ba0d27dfd15121d71f34e77781722a",
+                "timestamp": "2026-10-15T12:52:59Z"
+            },
+            {
                 "version": "1.0.0.0",
                 "changelog": "- First release.\n- Follow YouTube, Twitch and Arte channels, tabs, playlists and single videos as series or movies.\n- Stream on demand through yt-dlp, with nothing stored on disk.\n- Quality versions, described ahead of playback so Jellyfin copies instead of transcoding.\n- Multiple audio and subtitle tracks, named and filtered by preferred language.\n- Live broadcasts detected within minutes, turned into replays when they end.",
                 "targetAbi": "12.1.0.0",
