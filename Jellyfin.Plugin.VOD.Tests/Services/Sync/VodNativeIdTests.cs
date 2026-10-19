@@ -67,6 +67,50 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             string url, string expected)
             => Assert.Equal(expected, VodNativeId.ForSource(url));
 
+        /// <summary>
+        /// Whatever the quality of the derivation, two sources resolving to one key must be
+        /// reported rather than silently overwrite each other's series. The silence is what made
+        /// the Arte incident expensive, not the regex.
+        /// </summary>
+        [Fact]
+        public void FindCollisions_ReportsTwoSourcesSharingOneKey()
+        {
+            var collisions = VodNativeId.FindCollisions(
+            [
+                "https://www.youtube.com/@arte/videos",
+                "https://youtube.com/@arte",
+                "https://www.youtube.com/@terrapodia/videos",
+            ]);
+
+            var only = Assert.Single(collisions);
+            Assert.Equal("youtube_ch_arte", only.Key);
+            Assert.Equal(2, only.Urls.Count);
+        }
+
+        [Fact]
+        public void FindCollisions_IsEmpty_WhenEveryKeyIsDistinct()
+        {
+            var collisions = VodNativeId.FindCollisions(
+            [
+                "https://www.youtube.com/@arte/videos",
+                "https://www.youtube.com/@arte%C3%A9vasion/videos",
+                "https://www.youtube.com/playlist?list=PLabc",
+            ]);
+
+            Assert.Empty(collisions);
+        }
+
+        [Fact]
+        public void FindCollisions_IgnoresUrlsThatDeriveNoKey()
+        {
+            // Two unrecognised URLs both derive null; that is not a collision, it is two sources
+            // the publisher will key on their URL instead.
+            var collisions = VodNativeId.FindCollisions(
+                ["https://example.com/a", "https://example.com/b"]);
+
+            Assert.Empty(collisions);
+        }
+
         [Fact]
         public void ForSource_TwoHandlesSharingAnAsciiPrefix_DeriveDistinctKeys()
         {

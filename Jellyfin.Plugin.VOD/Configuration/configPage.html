@@ -415,6 +415,15 @@
                 var warnings = libraries
                     .filter(function (l) { return l.Warning; })
                     .map(function (l) { return l.Warning; });
+
+                // A key collision is invisible otherwise: the sources share one series, rename it
+                // and un-claim each other's episodes on every publication, with no error anywhere.
+                (status.Collisions || []).forEach(function (c) {
+                    warnings.push(
+                        'These sources resolve to the same series and will overwrite each other: '
+                        + c.Urls.join(' , ') + '. Give them distinct URLs.');
+                });
+
                 warning.textContent = warnings.join(' ');
                 warning.style.display = warnings.length ? '' : 'none';
 

@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.Text;
 using System.Text.RegularExpressions;
+using Jellyfin.Plugin.VOD.Services.Sync.Dto;
 
 namespace Jellyfin.Plugin.VOD.Services.Sync
 {
@@ -93,6 +95,45 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                 return $"twitch_ch_{twitchChannel}";
 
             return null;
+        }
+
+        /// <summary>
+        /// Finds sets of source URLs that derive the same key, and are therefore the same series.
+        /// </summary>
+        /// <remarks>
+        /// The key computes the series GUID, so two sources sharing one key share one series: each
+        /// publication renames it and un-claims the other's episodes, indefinitely and without an
+        /// error anywhere. That silence, not the derivation itself, is what made the Arte incident
+        /// costly — so a collision is reported even though the derivation is now correct.
+        /// URLs deriving no key are skipped: the publisher falls back to keying them on their URL,
+        /// which cannot collide.
+        /// </remarks>
+        /// <param name="sourceUrls">The configured source URLs.</param>
+        /// <returns>One entry per colliding key; empty when every key is distinct.</returns>
+        public static IReadOnlyList<SourceKeyCollision> FindCollisions(IEnumerable<string?> sourceUrls)
+        {
+            ArgumentNullException.ThrowIfNull(sourceUrls);
+
+            var byKey = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+            foreach (var url in sourceUrls)
+            {
+                if (ForSource(url) is not { } key)
+                    continue;
+
+                if (!byKey.TryGetValue(key, out var urls))
+                    byKey[key] = urls = [];
+
+                urls.Add(url!);
+            }
+
+            var collisions = new List<SourceKeyCollision>();
+            foreach (var (key, urls) in byKey)
+            {
+                if (urls.Count > 1)
+                    collisions.Add(new SourceKeyCollision(key, urls));
+            }
+
+            return collisions;
         }
 
         /// <summary>

@@ -65,9 +65,14 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
     /// </summary>
     /// <param name="Libraries">One row per library role, so the page can say WHICH one is broken.</param>
     /// <param name="Sources">One row per source the database knows about.</param>
+    /// <param name="Collisions">
+    /// Sets of configured sources deriving one key, which would silently share a series. Empty in
+    /// a healthy configuration.
+    /// </param>
     public sealed record SourcesStatus(
         IReadOnlyList<LibraryStatus> Libraries,
-        IReadOnlyList<SourceStatus> Sources);
+        IReadOnlyList<SourceStatus> Sources,
+        IReadOnlyList<SourceKeyCollision> Collisions);
 
     /// <summary>
     /// One library the configuration page may offer, with what it is allowed to hold.
@@ -84,4 +89,17 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
         string? CollectionType,
         bool AcceptsMovies,
         bool AcceptsSeries);
+
+    /// <summary>
+    /// Several configured sources that derive the same key, and therefore share one series.
+    /// </summary>
+    /// <remarks>
+    /// Reported to the configuration page because the failure is otherwise invisible: the sources
+    /// rename the shared series and un-claim each other's episodes on every publication, without
+    /// an error anywhere. Diagnosed in production on 2026-10-19 after 597 episodes were found
+    /// filed under the wrong series.
+    /// </remarks>
+    /// <param name="Key">The derived key the sources share.</param>
+    /// <param name="Urls">The configured URLs that derive it, in configuration order.</param>
+    public sealed record SourceKeyCollision(string Key, IReadOnlyList<string> Urls);
 }

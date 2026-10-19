@@ -373,8 +373,16 @@ namespace Jellyfin.Plugin.VOD.Controllers
                 ];
             }
 
+            // Read from the configuration, not the database: a collision is a configuration
+            // mistake, and both colliding sources may be perfectly healthy rows on their own.
+            var collisions = config is null
+                ? []
+                : VodNativeId.FindCollisions(config.Sources.Select(s => s.Url));
+
             return Ok(new SourcesStatus(
-                libraries, ProjectSourceStatus(_db.GetAllSources(), _db.GetResolutionSummaries())));
+                libraries,
+                ProjectSourceStatus(_db.GetAllSources(), _db.GetResolutionSummaries()),
+                collisions));
         }
 
         /// <summary>Resolves one library role live and reduces it to what the page shows.</summary>
