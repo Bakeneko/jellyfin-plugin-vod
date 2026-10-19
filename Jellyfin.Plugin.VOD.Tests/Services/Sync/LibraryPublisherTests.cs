@@ -987,28 +987,72 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         }
 
         /// <summary>
-        /// The Backdrop follows the series image, not the Thumb's banner: a YouTube channel banner is
-        /// about 6.2:1, so the 16:9 collage tile would crop it to an unrecognisable strip.
+        /// The Backdrop never takes the channel banner: a YouTube banner is about 6.2:1, so the
+        /// 16:9 collage tile would crop it to an unrecognisable strip. It follows the series image,
+        /// which is now the newest video's still rather than the channel avatar.
         /// </summary>
         [Fact]
         public async Task ReconcileAsync_PublishesTheSeriesImageAsBackdrop_NotTheBanner()
         {
             const string vodId = "3f9a2b1c-0000-0000-0000-000000000061";
-            const string avatar = "https://example.test/avatar.jpg";
+            const string still = "https://example.test/still.jpg";
 
             var video = VideoWith(vodId, "Youtube", null);
-            video.ThumbnailUrl = "https://example.test/still.jpg";
+            video.ThumbnailUrl = still;
 
             var series = await PublishSeriesWithSourceAsync(
                 new SourceRecord
                 {
                     Url = "https://example.com/source",
-                    SeriesThumbnailUrl = avatar,
+                    SeriesThumbnailUrl = "https://example.test/avatar.jpg",
                     SeriesBannerUrl = "https://example.test/banner.jpg"
                 },
                 video);
 
-            Assert.Equal(avatar, series.GetImageInfo(ImageType.Backdrop, 0)?.Path);
+            Assert.Equal(still, series.GetImageInfo(ImageType.Backdrop, 0)?.Path);
+        }
+
+        /// <summary>
+        /// The series wears the still of its MOST RECENT video, on all three slots, in preference
+        /// to the channel avatar and banner.
+        /// </summary>
+        /// <remarks>
+        /// Decided on the user's production observation: a 16:9 landscape still reads better in
+        /// Jellyfin's interface than a near-square avatar stretched into a 2:3 poster. Compared
+        /// side by side between channel sources (which posted the avatar) and playlist sources
+        /// (which already fell back to a still).
+        /// <para>
+        /// "Most recent" is computed on PublishedAt, not taken from the list order: the oldest
+        /// video is deliberately placed first here, so an implementation that returns the first
+        /// available still fails this test.
+        /// </para>
+        /// </remarks>
+        [Fact]
+        public async Task ReconcileAsync_DressesTheSeriesWithTheNewestVideoStill_OnEverySlot()
+        {
+            const string newest = "https://example.test/newest.jpg";
+
+            var older = VideoWith("3f9a2b1c-0000-0000-0000-000000000071", "Youtube", null);
+            older.ThumbnailUrl = "https://example.test/older.jpg";
+            older.PublishedAt = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+
+            var newer = VideoWith("3f9a2b1c-0000-0000-0000-000000000072", "Youtube", null);
+            newer.ThumbnailUrl = newest;
+            newer.PublishedAt = new DateTimeOffset(2026, 10, 1, 0, 0, 0, TimeSpan.Zero);
+
+            var series = await PublishSeriesWithSourceAsync(
+                new SourceRecord
+                {
+                    Url = "https://example.com/source",
+                    SeriesThumbnailUrl = "https://example.test/avatar.jpg",
+                    SeriesBannerUrl = "https://example.test/banner.jpg"
+                },
+                older,
+                newer);
+
+            Assert.Equal(newest, series.GetImageInfo(ImageType.Primary, 0)?.Path);
+            Assert.Equal(newest, series.GetImageInfo(ImageType.Thumb, 0)?.Path);
+            Assert.Equal(newest, series.GetImageInfo(ImageType.Backdrop, 0)?.Path);
         }
 
         /// <summary>

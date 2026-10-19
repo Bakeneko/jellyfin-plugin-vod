@@ -304,7 +304,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                     bool seriesMoved = false;
                     if (series is null)
                         (series, seriesMoved) = await EnsureSeriesAsync(
-                            anchor, source, seriesName, FirstAvailableThumbnail(expected),
+                            anchor, source, seriesName, NewestThumbnail(expected),
                             OldestPublishedAt(expected), studios,
                             SeriesDates(expected, useReleaseDate), cancellationToken)
                             .ConfigureAwait(false);
@@ -980,13 +980,16 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             // arte exposes no image at collection level, so the first episode's still is the only
             // candidate. Verified against yt-dlp: an arte collection has neither "thumbnail" nor
             // "thumbnails", in flat and full extraction alike.
-            var seriesImage = string.IsNullOrEmpty(source.SeriesThumbnailUrl)
-                ? fallbackImageUrl
-                : source.SeriesThumbnailUrl;
+            // The newest video's still, in preference to the channel avatar and banner, on every
+            // slot. Decided on the user's production observation: a 16:9 landscape still reads
+            // better in Jellyfin's interface than a near-square avatar stretched into a 2:3
+            // poster — compared side by side between channel sources, which posted the avatar,
+            // and playlist sources, which already fell back to a still.
+            var seriesImage = fallbackImageUrl;
 
             changed |= ApplyImage(series, ImageType.Primary, seriesImage, source.PublishedImageUrl,
                 url => _db.SetSourcePublishedImageUrl(source.Url, url), out var primaryWrite);
-            changed |= ApplyImage(series, ImageType.Thumb, source.SeriesBannerUrl ?? seriesImage,
+            changed |= ApplyImage(series, ImageType.Thumb, seriesImage,
                 source.PublishedBannerUrl,
                 url => _db.SetSourcePublishedBannerUrl(source.Url, url), out var bannerWrite);
             // Gives a series library a generated tile, for the reason given on the movie Backdrop
@@ -1112,15 +1115,31 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
         /// <summary>The first still available among a source's videos, used when the source itself
         /// exposes no image.</summary>
-        private static string? FirstAvailableThumbnail(IReadOnlyList<VideoRecord> videos)
+        /// <summary>The still of the most recently published video that has one.</summary>
+        /// <remarks>
+        /// Computed on <see cref="VideoRecord.PublishedAt"/> rather than taken from the list order:
+        /// the order is whatever the publication pass happened to produce, so keying on it made the
+        /// series image depend on an implementation detail. A row with no date loses to any dated
+        /// row, and only wins if nothing else has a still.
+        /// </remarks>
+        private static string? NewestThumbnail(IReadOnlyList<VideoRecord> videos)
         {
+            string? best = null;
+            DateTimeOffset? bestDate = null;
+
             foreach (var v in videos)
             {
-                if (!string.IsNullOrEmpty(v.ThumbnailUrl))
-                    return v.ThumbnailUrl;
+                if (string.IsNullOrEmpty(v.ThumbnailUrl))
+                    continue;
+
+                if (best is null || (v.PublishedAt is { } d && (bestDate is null || d > bestDate)))
+                {
+                    best = v.ThumbnailUrl;
+                    bestDate = v.PublishedAt;
+                }
             }
 
-            return null;
+            return best;
         }
 
         /// <summary>
