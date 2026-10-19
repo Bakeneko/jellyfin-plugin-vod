@@ -8,6 +8,14 @@
         "category": "General",
         "versions": [
             {
+                "version": "3.0.0.0",
+                "changelog": "- A channel whose handle carries an accent no longer shares its series with another channel: its videos move to a series of their own on the next sync.\n- The configuration page warns when two sources would publish into the same series instead of letting them overwrite each other silently.\n- A series now wears the thumbnail of its most recent video rather than the channel avatar, which reads better in Jellyfin's interface.",
+                "targetAbi": "12.1.0.0",
+                "sourceUrl": "https://github.com/Bakeneko/jellyfin-plugin-vod/releases/download/v3/vod_3.0.0.0.zip",
+                "checksum": "8352996df99876496bc00c1eaaabb1a6",
+                "timestamp": "2026-10-19T18:45:51Z"
+            },
+            {
                 "version": "2.0.0.0",
                 "changelog": "- Picking a quality no longer forces a software transcode: the tier is streamed as a direct copy.\n- A source appears complete, its episodes in chronological order, once all of its videos resolve.\n- Switching a source between series and movies now takes effect.\n- The configuration page shows how far each source has got.\n- Enumeration no longer fetches metadata video by video: it runs in bounded waves, one source at a time.\n- First fill is gradual, and a source stays hidden until every one of its videos has resolved.",
                 "targetAbi": "12.1.0.0",
