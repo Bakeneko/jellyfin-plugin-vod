@@ -1,7 +1,7 @@
 ---
 name: "VOD"
 guid: "16bb0693-4248-478b-a1e5-a4508326245c"
-version: 2
+version: 3
 targetAbi: "12.1.0.0"
 framework: "net10.0"
 owner: "bakeneko"
@@ -13,9 +13,6 @@ category: "General"
 artifacts:
   - "Jellyfin.Plugin.VOD.dll"
 changelog: |-
-  - Picking a quality no longer forces a software transcode: the tier is streamed as a direct copy.
-  - A source appears complete, its episodes in chronological order, once all of its videos resolve.
-  - Switching a source between series and movies now takes effect.
-  - The configuration page shows how far each source has got.
-  - Enumeration no longer fetches metadata video by video: it runs in bounded waves, one source at a time.
-  - First fill is gradual, and a source stays hidden until every one of its videos has resolved.
+  - A channel whose handle carries an accent no longer shares its series with another channel: its videos move to a series of their own on the next sync.
+  - The configuration page warns when two sources would publish into the same series instead of letting them overwrite each other silently.
+  - A series now wears the thumbnail of its most recent video rather than the channel avatar, which reads better in Jellyfin's interface.
