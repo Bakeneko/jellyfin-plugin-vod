@@ -53,6 +53,29 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         public void ForSource_KnownUrl_ReturnsCorrectId(string url, string expected)
             => Assert.Equal(expected, VodNativeId.ForSource(url));
 
+        /// <summary>
+        /// A percent-encoded handle must not be truncated at the escape. The production incident:
+        /// "@arte%C3%A9vasion" derived "youtube_ch_arte" — the same key as "@arte" — so both
+        /// sources computed the same series GUID and 597 episodes were filed under the wrong
+        /// series, each pass renaming it and un-claiming the other's episodes.
+        /// </summary>
+        [Theory]
+        [InlineData("https://www.youtube.com/@arte%C3%A9vasion/videos", "youtube_ch_arteévasion")]
+        [InlineData("https://www.youtube.com/@arte/videos",             "youtube_ch_arte")]
+        [InlineData("https://www.youtube.com/@caf%C3%A9/videos",        "youtube_ch_café")]
+        public void ForSource_PercentEncodedHandle_IsDecodedWhole_NotTruncated(
+            string url, string expected)
+            => Assert.Equal(expected, VodNativeId.ForSource(url));
+
+        [Fact]
+        public void ForSource_TwoHandlesSharingAnAsciiPrefix_DeriveDistinctKeys()
+        {
+            var a = VodNativeId.ForSource("https://www.youtube.com/@arte/videos");
+            var b = VodNativeId.ForSource("https://www.youtube.com/@arte%C3%A9vasion/videos");
+
+            Assert.NotEqual(a, b);
+        }
+
         // ── IsChannel ─────────────────────────────────────────────────────────
 
         [Theory]

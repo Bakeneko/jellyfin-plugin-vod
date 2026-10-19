@@ -1,4 +1,5 @@
 using System;
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace Jellyfin.Plugin.VOD.Services.Sync
@@ -59,7 +60,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
             // YouTube @handle: https://www.youtube.com/@deadwattsofficiel/videos
             var m = YoutubeHandleRegex().Match(sourceUrl);
-            if (m.Success) return $"youtube_ch_{m.Groups[1].Value}";
+            if (m.Success) return $"youtube_ch_{DecodeSegment(m.Groups[1].Value)}";
 
             // YouTube channel ID: https://www.youtube.com/channel/UCxxxxxxxx
             m = YoutubeChannelIdRegex().Match(sourceUrl);
@@ -94,8 +95,28 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             return null;
         }
 
-        // YouTube @handle — strips the leading @ so the ID is filename-safe
-        [GeneratedRegex(@"youtube\.com/@([A-Za-z0-9._-]+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+        /// <summary>
+        /// Percent-decodes a captured URL segment and normalises it to composed form.
+        /// </summary>
+        /// <remarks>
+        /// A handle may be any non-ASCII text, which reaches us percent-encoded. Decoding has to
+        /// happen here because the key identifies a series: "@arte%C3%A9vasion" truncated at the
+        /// escape yielded "arte", collided with the "@arte" source, and filed 597 episodes under
+        /// the wrong series. Composed form matters because "é" and "e"+combining-accent are
+        /// different strings for the same handle.
+        /// <para>
+        /// Case is deliberately NOT folded, although YouTube resolves handles case-insensitively:
+        /// folding it would change the derived key of every source whose handle carries a capital,
+        /// and the key computes the series GUID — 2143 videos would be re-created and lose their
+        /// watch state. That normalisation waits for the rework, where the data is rebuilt anyway.
+        /// </para>
+        /// </remarks>
+        private static string DecodeSegment(string segment)
+            => Uri.UnescapeDataString(segment).Normalize(NormalizationForm.FormC);
+
+        // YouTube @handle — the whole path segment, not a character class: a class stops at the
+        // first character it does not list, and "%" is how every non-ASCII handle arrives.
+        [GeneratedRegex(@"youtube\.com/@([^/?#]+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
         private static partial Regex YoutubeHandleRegex();
 
         [GeneratedRegex(@"youtube\.com/channel/([A-Za-z0-9_-]+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
