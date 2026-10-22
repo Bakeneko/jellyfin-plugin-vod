@@ -1,7 +1,7 @@
 ---
 name: "VOD"
 guid: "16bb0693-4248-478b-a1e5-a4508326245c"
-version: 3
+version: 4
 targetAbi: "12.1.0.0"
 framework: "net10.0"
 owner: "bakeneko"
@@ -13,6 +13,9 @@ category: "General"
 artifacts:
   - "Jellyfin.Plugin.VOD.dll"
 changelog: |-
-  - A channel whose handle carries an accent no longer shares its series with another channel: its videos move to a series of their own on the next sync.
-  - The configuration page warns when two sources would publish into the same series instead of letting them overwrite each other silently.
-  - A series now wears the thumbnail of its most recent video rather than the channel avatar, which reads better in Jellyfin's interface.
+  - The database is rebuilt on first start: every video is re-fetched from its platform, so expect a long first run. Your watch history reattaches as each video comes back.
+  - A run now finishes one source before moving to the next, instead of leaving every source half-resolved.
+  - Failures carry the platform's own explanation instead of the word "Failed".
+  - A video that keeps failing is retried further and further apart, so one broken video can no longer get you rate-limited.
+  - Each source gets a detail panel: its five stages, what happened to each video, and buttons to retry one or all of them.
+  - The page warns you when your cookie session has expired, or when a setting would silently stop all listing.
