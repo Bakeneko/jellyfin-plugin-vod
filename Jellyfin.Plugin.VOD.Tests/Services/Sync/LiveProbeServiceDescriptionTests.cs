@@ -12,6 +12,7 @@ using Jellyfin.Plugin.VOD.Data.Models;
 using Jellyfin.Plugin.VOD.Imaging;
 using Jellyfin.Plugin.VOD.Localization;
 using Jellyfin.Plugin.VOD.Services;
+using Jellyfin.Plugin.VOD.Services.Publication;
 using Jellyfin.Plugin.VOD.Services.Sync;
 using Jellyfin.Plugin.VOD.Services.Sync.Dto;
 using MediaBrowser.Controller.Entities;
@@ -70,12 +71,16 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             SourceUrl = SourceUrl,
             NativeId = "ended",
             VideoUrl = "https://www.youtube.com/watch?v=ended",
-            SyncedAt = DateTimeOffset.UnixEpoch,
             LiveStatus = LiveStatus.Live,
-            ResolutionState = ResolutionState.Resolved,
+            MetadataAt = DateTimeOffset.UtcNow.AddDays(-1),
+            MetadataResult = CallOutcome.Ok,
             PublishedAt = DateTimeOffset.UtcNow.AddDays(-1),
             SeasonNumber = 2026,
             EpisodeNumber = 1013001,
+
+            // A tier, so the row is publishable: publishability is computed now, and a row with no
+            // offered tier is not published at all.
+            Extras = new VideoExtras { Qualities = [new VideoQuality(1080, "h264", 30)] },
         };
 
         // What the re-fetch says once the stream is over: an archive served over HLS, with a tier.
@@ -95,7 +100,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         public LiveProbeServiceDescriptionTests()
         {
             _db.GetVideosBySource(SourceUrl).Returns(_ => [_row]);
-            _db.GetPublishableVideoIds().Returns([]);
+            _db.GetVideoIdsWithMetadata().Returns([]);
         }
 
         public void Dispose()
@@ -157,7 +162,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 _db,
                 publisher,
                 describer,
-                new VideoDescriptionStep(factory, describer),
+                new StreamDescriptionStep(factory, describer),
                 NullLogger<LiveProbeService>.Instance);
         }
 
@@ -188,38 +193,40 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
 
             await RunPassAsync(libraryName: string.Empty);
 
-            var stored = StoredStreams.Deserialize(_row.StreamDescriptions);
-            Assert.NotNull(stored);
-            Assert.True(stored!.ContainsKey("1080/h264"));
-            Assert.Equal(ResolutionState.Resolved, _row.ResolutionState);
-            _db.Received().UpsertVideo(Arg.Is<VideoRecord>(v => v.StreamDescriptions != null));
+            // The description is no longer written onto the row — there is no column for it — so
+            // what proves it happened is the outcome recorded against the video, and the ffprobe
+            // call behind it.
+            _db.Received().SetDescribeOutcome(
+                VideoId, CallOutcome.Ok, null, Arg.Any<DateTimeOffset>());
+            Assert.Equal(CallOutcome.Ok, _row.MetadataResult);
         }
 
         [Fact]
-        public async Task AFailedDescription_LeavesTheEndedBroadcastResolved()
+        public async Task AFailedDescription_LeavesTheMetadataAlone()
         {
-            // The probe has no retry of its own, and the playback failsafe describes the archive
-            // on first play: a failure must not take a playable video out of the library.
+            // The two clocks are independent on purpose: a failing ffprobe must not make the next
+            // pass spend another yt-dlp call, and it must not take a playable video out of the
+            // library either — the playback failsafe describes the archive on first play.
             _encoder.GetMediaInfo(Arg.Any<MediaInfoRequest>(), Arg.Any<CancellationToken>())
                 .Returns<Task<MediaInfo>>(_ => throw new InvalidOperationException("ffprobe died"));
 
             await RunPassAsync(libraryName: string.Empty);
 
-            Assert.Null(_row.StreamDescriptions);
-            Assert.Equal(ResolutionState.Resolved, _row.ResolutionState);
-            Assert.Equal(0, _row.ResolutionAttempts);
-            Assert.Null(_row.ResolutionError);
-            _db.DidNotReceive().UpsertVideo(Arg.Is<VideoRecord>(v => v.ResolutionState == ResolutionState.Failed));
+            _db.Received().SetDescribeOutcome(
+                VideoId, CallOutcome.ProbeFailed, Arg.Any<string>(), Arg.Any<DateTimeOffset>());
+            Assert.Equal(CallOutcome.Ok, _row.MetadataResult);
+            Assert.Equal(0, _row.MetadataAttempts);
+            Assert.Null(_row.MetadataDetail);
         }
 
         [Fact]
-        public async Task TheProbesPublication_AppliesTheStoredDescription()
+        public async Task TheProbesPublication_AppliesTheDescriptionItJustMade()
         {
             ProbeAnswers();
 
             await RunPassAsync(LibraryName);
 
-            // ApplyStored looks the video's members up by its VOD provider id; the describe step
+            // ApplyDescribed looks the video's members up by its VOD provider id; the describe step
             // itself never does, so this query is the application.
             _describerLibrary.Received().GetItemList(Arg.Is<InternalItemsQuery>(
                 q => q.HasAnyProviderId != null
@@ -228,14 +235,13 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         }
 
         [Fact]
-        public async Task TheProbesPublication_DoesNotApplyTheStoredDescriptionAgain_ToAnUnchangedRow()
+        public async Task TheProbesPublication_DoesNotApplyTheDescriptionAgain_ToAnUnchangedRow()
         {
             // N2: the probe publishes every few minutes. A row whose items were all published by
             // an earlier pass has nothing left to receive, so its description is not applied again.
             ProbeAnswers();
             await RunPassAsync(LibraryName);
             Assert.NotEmpty(_published);
-            Assert.NotNull(_row.StreamDescriptions);
             _describerLibrary.ClearReceivedCalls();
 
             await RunPassAsync(LibraryName);

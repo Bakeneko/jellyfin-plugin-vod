@@ -42,6 +42,19 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
         public IReadOnlyList<PlaylistEntry> Entries { get; init; } = [];
 
         /// <summary>
+        /// How many entries the platform says the playlist holds, or null when it does not say.
+        /// </summary>
+        /// <remarks>
+        /// Measured on 2026-10-19: only PLAYLISTS report it — a channel listing does not. It is a
+        /// better change detector than a title, because a drop in the count reveals a DELETION,
+        /// which looking at the head of the list cannot.
+        /// Null is not zero: "the platform did not say" must stay distinguishable from "it says
+        /// there are none", since an empty listing is treated as a platform outage rather than as
+        /// an emptied source.
+        /// </remarks>
+        public int? PlaylistCount { get; init; }
+
+        /// <summary>
         /// Parses the JSON output of <c>yt-dlp --flat-playlist -J</c>.
         /// Returns <see langword="null"/> on parse failure.
         /// </summary>
@@ -88,7 +101,12 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
                     ThumbnailUrl = thumb,
                     BannerUrl = banner,
                     Description = root.TryGetProperty("description", out var desc) ? desc.GetString() : null,
-                    Entries = entries
+                    Entries = entries,
+                    PlaylistCount = root.TryGetProperty("playlist_count", out var pc)
+                        && pc.ValueKind == JsonValueKind.Number
+                        && pc.TryGetInt32(out var count)
+                            ? count
+                            : null
                 };
             }
             catch (JsonException)

@@ -1,3 +1,5 @@
+using System.Xml.Serialization;
+
 namespace Jellyfin.Plugin.VOD.Configuration
 {
     /// <summary>A user-configured sync source, persisted as XML inside PluginConfiguration.</summary>
@@ -31,12 +33,45 @@ namespace Jellyfin.Plugin.VOD.Configuration
         public int MaxVideosPerSource { get; set; }
 
         /// <summary>
-        /// Gets or sets the minimum number of minutes between two syncs for this source.
-        /// Defaults to 12 hours, which keeps yt-dlp well clear of platform rate limits.
-        /// 0 disables the throttle and syncs on every SyncTask run — only safe for sources
-        /// you control, since it enumerates the playlist as often as the task fires.
+        /// Gets or sets the minimum number of minutes between two SHORT listings of this source.
+        /// Defaults to 12 hours, which keeps yt-dlp well clear of platform rate limits. Zero
+        /// lists on every pass — only safe for a source you control, since it enumerates as often
+        /// as the task fires.
         /// </summary>
-        public int SyncIntervalMinutes { get; set; } = 720;
+        /// <remarks>
+        /// Same meaning as the setting it replaces, under a name that still describes the work:
+        /// there is no "sync" any more, only a listing. A short listing asks for 30 entries, which
+        /// is exactly one YouTube page and therefore one request, so a low value here is far
+        /// cheaper than it was.
+        /// <para>
+        /// The FULL listing has its own, global interval
+        /// (<see cref="PluginConfiguration.FullListingIntervalDays"/>): this one cannot catch a
+        /// deletion or a retitle below the head of the listing.
+        /// </para>
+        /// </remarks>
+        public int ListingIntervalMinutes { get; set; } = 720;
+
+        /// <summary>
+        /// Gets or sets <see cref="ListingIntervalMinutes"/> under the element name a file written
+        /// before the orchestration rework stored it as.
+        /// </summary>
+        /// <remarks>
+        /// Jellyfin reads a plugin's settings with a plain <c>XmlSerializer</c>, which discards an
+        /// element it does not recognise without raising anything. Without this, a two-day interval
+        /// an administrator set after a rate limit silently becomes the 720-minute default and the
+        /// source is listed four times more often than configured. <c>ShouldSerialize…</c> returns
+        /// false, so a save writes only the current name.
+        /// </remarks>
+        [XmlElement("SyncIntervalMinutes")]
+        public int LegacySyncIntervalMinutes
+        {
+            get => ListingIntervalMinutes;
+            set => ListingIntervalMinutes = value;
+        }
+
+        /// <summary>Keeps the legacy element out of a saved file.</summary>
+        /// <returns>Always false.</returns>
+        public bool ShouldSerializeLegacySyncIntervalMinutes() => false;
 
         /// <summary>Gets or sets a free-form description shown in the UI.</summary>
         public string Description { get; set; } = string.Empty;

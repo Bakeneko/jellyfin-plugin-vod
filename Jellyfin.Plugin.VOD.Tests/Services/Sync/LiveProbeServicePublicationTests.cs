@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net.Http;
 using System.Threading;
@@ -9,6 +10,7 @@ using Jellyfin.Plugin.VOD.Data.Models;
 using Jellyfin.Plugin.VOD.Imaging;
 using Jellyfin.Plugin.VOD.Localization;
 using Jellyfin.Plugin.VOD.Services;
+using Jellyfin.Plugin.VOD.Services.Publication;
 using Jellyfin.Plugin.VOD.Services.Sync;
 using MediaBrowser.Controller.Entities;
 using VodSourceType = Jellyfin.Plugin.VOD.Services.Sync.SourceType;
@@ -36,7 +38,8 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         /// Creates a service backed by a real temp-directory library so the publication path
         /// (ResolveTarget → ReconcileAsync) does not throw.
         /// </summary>
-        private static (LiveProbeService Service, string TempRoot) MakeWithLibrary(IVodDatabase db)
+        private static (LiveProbeService Service, string TempRoot, List<BaseItem> Published)
+            MakeWithLibrary(IVodDatabase db)
         {
             var tempRoot = Path.Combine(Path.GetTempPath(), "vod-tests-probe-pub-" + Guid.NewGuid().ToString("N"));
             var location = Path.Combine(tempRoot, LibraryName);
@@ -49,6 +52,12 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 .Returns(new Folder { Id = Guid.NewGuid(), Path = location });
             library.GetItemList(Arg.Any<InternalItemsQuery>())
                 .Returns([]);
+
+            // CreateItem is what a publication actually does, so capturing it is how a test can
+            // tell "published" from "considered and refused".
+            var published = new List<BaseItem>();
+            library.When(l => l.CreateItem(Arg.Any<BaseItem>(), Arg.Any<BaseItem>()))
+                .Do(call => published.Add(call.ArgAt<BaseItem>(0)));
 
             var publisher = new LibraryPublisher(
                 library,
@@ -74,97 +83,56 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 db,
                 publisher,
                 describer,
-                new VideoDescriptionStep(Substitute.For<IHttpClientFactory>(), describer),
+                new StreamDescriptionStep(Substitute.For<IHttpClientFactory>(), describer),
                 NullLogger<LiveProbeService>.Instance);
 
-            return (service, tempRoot);
+            return (service, tempRoot, published);
         }
 
         [Fact]
-        public async Task ProbeSourceCoreAsync_DoesNotCall_GetPublishableVideosBySource()
+        public async Task ProbeSourceCoreAsync_PublishesNothing_ForARowOutsideRetention()
         {
-            // B-I7: the probe must use ResolutionService.Publishable (which applies retention and
-            // day-complete filters) rather than GetPublishableVideosBySource (which returns every
-            // resolved row without those filters). This test verifies the old call is gone.
-            const string sourceUrl = "https://www.twitch.tv/testchan";
-            var db = Substitute.For<IVodDatabase>();
-            db.GetVideosBySource(sourceUrl).Returns([]);
-            db.GetPublishableVideoIds().Returns([]);
-
-            var config = new PluginConfiguration { SeriesLibraryName = LibraryName };
-            var source = new SourceDefinition
-            {
-                Url = sourceUrl,
-                Enabled = true,
-                Mode = SourceMode.Series,
-                RetentionDays = 30,
-            };
-            var sourceRecord = new SourceRecord { Url = sourceUrl, Name = "Test Chan" };
-
-            var (service, tempRoot) = MakeWithLibrary(db);
-            try
-            {
-                await service.ProbeSourceCoreAsync(
-                    config,
-                    source,
-                    VodSourceType.TwitchChannelLive,
-                    sourceRecord,
-                    ProbeOutcome.Nothing,
-                    CancellationToken.None);
-            }
-            finally
-            {
-                Directory.Delete(tempRoot, recursive: true);
-            }
-
-            // After B-I7: GetPublishableVideosBySource must never be called.
-            db.DidNotReceive().GetPublishableVideosBySource(Arg.Any<string>());
-        }
-
-        [Fact]
-        public async Task ProbeSourceCoreAsync_UsesPublishableFilter_ExcludesRowsBeyondRetention()
-        {
-            // B-I7: a resolved row beyond the retention window must not be published by the probe.
-            // Before the fix, GetPublishableVideosBySource would have included it.
+            // Publishability is computed, and retention is one of its three conditions. The old
+            // probe asked the database for "every resolved row", which had no retention check in
+            // it, so a video the administrator had retired by shortening the window came back.
+            //
+            // Asserting on what reaches the library rather than on which query was made: the query
+            // this replaced no longer exists, so an assertion about it could not fail.
             const string sourceUrl = "https://www.twitch.tv/testchan2";
             var now = DateTimeOffset.UtcNow;
 
-            // A resolved row that is 60 days old — beyond the 30-day retention window.
             var oldRow = new VideoRecord
             {
                 Id = Guid.NewGuid().ToString("N"),
                 SourceUrl = sourceUrl,
                 VideoUrl = sourceUrl + "/v/1",
                 NativeId = "1",
-                SyncedAt = now.AddDays(-60),
-                ResolutionState = ResolutionState.Resolved,
                 PublishedAt = now.AddDays(-60),
+                MetadataAt = now.AddDays(-60),
+                MetadataResult = CallOutcome.Ok,
                 SeasonNumber = 1,
                 EpisodeNumber = 1,
+                Extras = new VideoExtras { Qualities = [new VideoQuality(1080, "h264", 30)] },
             };
 
             var db = Substitute.For<IVodDatabase>();
             db.GetVideosBySource(sourceUrl).Returns([oldRow]);
-            db.GetPublishableVideoIds().Returns([]);
+            db.GetVideoIdsWithMetadata().Returns([]);
 
-            var config = new PluginConfiguration { SeriesLibraryName = LibraryName };
-            var source = new SourceDefinition
-            {
-                Url = sourceUrl,
-                Enabled = true,
-                Mode = SourceMode.Series,
-                RetentionDays = 30,
-            };
-            var sourceRecord = new SourceRecord { Url = sourceUrl, Name = "Test Chan 2" };
-
-            var (service, tempRoot) = MakeWithLibrary(db);
+            var (service, tempRoot, published) = MakeWithLibrary(db);
             try
             {
                 await service.ProbeSourceCoreAsync(
-                    config,
-                    source,
+                    new PluginConfiguration { SeriesLibraryName = LibraryName },
+                    new SourceDefinition
+                    {
+                        Url = sourceUrl,
+                        Enabled = true,
+                        Mode = SourceMode.Series,
+                        RetentionDays = 30,
+                    },
                     VodSourceType.TwitchChannelLive,
-                    sourceRecord,
+                    new SourceRecord { Url = sourceUrl, Name = "Test Chan 2" },
                     ProbeOutcome.Nothing,
                     CancellationToken.None);
             }
@@ -173,9 +141,13 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 Directory.Delete(tempRoot, recursive: true);
             }
 
-            // The old row must not have been queried via GetPublishableVideosBySource — that would
-            // have returned it without the retention check.
-            db.DidNotReceive().GetPublishableVideosBySource(Arg.Any<string>());
+            // Not vacuous: the call below proves the probe reached the reconcile — it is the
+            // argument the reconcile takes — so "published nothing" is a refusal, not an early
+            // return. The positive counterpart needs BaseItem.LibraryManager installed and lives
+            // in LiveProbeServiceDescriptionTests, which joins that collection.
+            db.Received().GetVideoIdsWithMetadata();
+            Assert.DoesNotContain(published, i => i.GetProviderId("VOD") == oldRow.Id);
         }
+
     }
 }

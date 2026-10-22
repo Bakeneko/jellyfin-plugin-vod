@@ -3,117 +3,146 @@ using Jellyfin.Plugin.VOD.Services.Sync;
 
 namespace Jellyfin.Plugin.VOD.Data.Models
 {
-    /// <summary>A persisted video entry.</summary>
+    /// <summary>A video one source knows about.</summary>
+    /// <remarks>
+    /// There is no state field. Whether a video may be published is COMPUTED from this row — see
+    /// <see cref="Services.Publication.Publishability"/> — on the rows of a single source the
+    /// checkup has already loaded, so the computation costs nothing.
+    /// </remarks>
     public sealed class VideoRecord
     {
-        /// <summary>Gets or sets the opaque UUID (primary key, used in stream URLs to avoid SSRF).</summary>
+        /// <summary>
+        /// Internal uuid. Primary key, this video's provider id in Jellyfin, and what appears in
+        /// its streaming URLs — the platform's own id never does, which is what keeps the stream
+        /// route from being an SSRF primitive.
+        /// </summary>
         public string Id { get; set; } = string.Empty;
 
-        /// <summary>Gets or sets the parent source URL (FK → sources.url).</summary>
+        /// <summary>The owning source's URL. Foreign key.</summary>
         public string SourceUrl { get; set; } = string.Empty;
 
-        /// <summary>Gets or sets the yt-dlp extractor key (e.g. "Youtube", "ArteTV").</summary>
-        public string? ExtractorKey { get; set; }
-
-        /// <summary>Gets or sets the native video ID from the source platform.</summary>
+        /// <summary>The platform's own id. Unique together with <see cref="SourceUrl"/>.</summary>
         public string? NativeId { get; set; }
 
-        /// <summary>Gets or sets the video page URL as given by the flat-playlist listing.</summary>
-        /// <remarks>Never store webpage_url for france.tv — it is rewritten to a smuggled form by yt-dlp.</remarks>
+        /// <summary>The yt-dlp extractor that serves this video ("Youtube", "ArteTV").</summary>
+        public string? ExtractorKey { get; set; }
+
+        /// <summary>The video page's URL.</summary>
+        /// <remarks>Never store france.tv's <c>webpage_url</c>: yt-dlp rewrites it to a smuggled form.</remarks>
         public string VideoUrl { get; set; } = string.Empty;
 
-        /// <summary>Gets or sets the video title.</summary>
+        /// <summary>
+        /// The title that is PUBLISHED: the listing's localized title where there is one, otherwise
+        /// the original from the metadata answer.
+        /// </summary>
         public string? Title { get; set; }
 
-        /// <summary>Gets or sets the UTC publication date (frozen at first sync).</summary>
-        public DateTimeOffset? PublishedAt { get; set; }
+        /// <summary>
+        /// The title as the LISTING saw it, at the pinned language.
+        /// </summary>
+        /// <remarks>
+        /// Serves ONLY as the comparison point for the retitle detector, and is never published.
+        /// The comparison has to be listing-to-listing: a listing serves the localized title and
+        /// obeys <c>youtube:lang</c>, while a metadata call always serves the original and ignores
+        /// it, so comparing against the published title would mark every video as changed on every
+        /// pass.
+        /// </remarks>
+        public string? ListingTitle { get; set; }
 
-        /// <summary>Gets or sets the duration in seconds.</summary>
+        /// <summary>The description. Published.</summary>
+        public string? Description { get; set; }
+
+        /// <summary>The duration in seconds. Published.</summary>
         public int? DurationSeconds { get; set; }
 
-        /// <summary>Gets or sets the season number (calendar year for non-native Arte; real season for native Arte).</summary>
-        public int? SeasonNumber { get; set; }
-
-        /// <summary>Gets or sets the episode number within the season.</summary>
-        public int? EpisodeNumber { get; set; }
-
-        /// <summary>Gets or sets the UTC timestamp of the last sync of this entry.</summary>
-        public DateTimeOffset SyncedAt { get; set; }
-
-        /// <summary>Gets or sets the thumbnail URL.</summary>
+        /// <summary>The video's still. Published, and the newest one dresses the series.</summary>
         public string? ThumbnailUrl { get; set; }
 
         /// <summary>
-        /// The fields that need no column of their own. Never null: an absent or unreadable payload
-        /// reads back as an empty record, so a consumer never has to null-check it.
-        /// </summary>
-        public VideoExtras Extras { get; set; } = new();
-
-        /// <summary>
-        /// When the plugin first discovered this video. Set once, at the initial insert, and never
-        /// updated afterwards — that is what distinguishes it from <see cref="SyncedAt"/>, which
-        /// carries the latest sync.
-        /// </summary>
-        /// <remarks>
-        /// Holding the discovery date separately is what makes the "use the release date as the date
-        /// added" option reversible: neither date is ever the only copy of itself, so the published
-        /// DateCreated can be recomputed from either one, in both directions.
-        /// </remarks>
-        public DateTimeOffset? FirstSeenAt { get; set; }
-
-        /// <summary>
-        /// The remote URL for the video thumbnail that was last published to Jellyfin. Compared against the
-        /// current URL to decide whether the artwork must be re-pointed; Jellyfin caches the image
-        /// locally and keeps no record of its origin.
+        /// The still actually posted on the item, so an unchanged image is not re-pointed.
         /// </summary>
         public string? PublishedImageUrl { get; set; }
 
-        /// <summary>Gets or sets the description / synopsis.</summary>
-        public string? Description { get; set; }
+        /// <summary>
+        /// The publication date. Published, and it also drives the numbering and the choice of the
+        /// series image.
+        /// </summary>
+        public DateTimeOffset? PublishedAt { get; set; }
 
-        /// <summary>Whether this video is broadcasting now, scheduled, or neither.</summary>
+        /// <summary>
+        /// Quality tiers, tracks and chapters — what publication needs to know about the streams.
+        /// Never null: an absent or unreadable payload reads back as an empty record.
+        /// </summary>
+        public VideoExtras Extras { get; set; } = new();
+
+        /// <summary>Broadcasting, scheduled, or neither.</summary>
+        /// <remarks>Excludes the video from describing, and changes the shape it is published in.</remarks>
         public LiveStatus LiveStatus { get; set; }
 
-        /// <summary>Gets or sets where this video is in the resolution business.</summary>
-        /// <remarks>Only <see cref="Data.Models.ResolutionState.Resolved"/> is publishable.</remarks>
-        public ResolutionState ResolutionState { get; set; } = ResolutionState.Pending;
+        /// <summary>The published season number. RECOMPUTED at every checkup, never frozen.</summary>
+        public int? SeasonNumber { get; set; }
 
-        /// <summary>Gets or sets when resolution was last attempted; null when never.</summary>
-        /// <remarks>
-        /// Carries both retry windows: the growing per-video backoff after a failure, and the
-        /// seven-day re-check of a video a platform called gone.
-        /// </remarks>
-        public DateTimeOffset? ResolutionAttemptedAt { get; set; }
+        /// <summary>The published episode number. RECOMPUTED at every checkup, never frozen.</summary>
+        public int? EpisodeNumber { get; set; }
 
-        /// <summary>Gets or sets how many times in a row resolution has failed for this video.</summary>
-        /// <remarks>
-        /// Consecutive, and reset by a success. It drives the growing backoff, and it is
-        /// deliberately NOT incremented by a failure the platform caused — one rate-limit window
-        /// must not push every video of a source a step further out.
-        /// </remarks>
-        public int ResolutionAttempts { get; set; }
-
-        /// <summary>Gets or sets the last resolution error, truncated to 500 characters.</summary>
-        /// <remarks>Diagnostic only: it is what the configuration page shows about a stuck video.</remarks>
-        public string? ResolutionError { get; set; }
-
-        /// <summary>Gets or sets this video's rank in the last listing — 0 is the newest.</summary>
-        /// <remarks>
-        /// The only priority order available: a video that has never been resolved has no
-        /// publication date yet, so the listing's own order is all there is to go on.
-        /// </remarks>
+        /// <summary>
+        /// This video's rank in the last listing, 0 being the newest. Orders the waves, and is the
+        /// only order available for a video that has never been fetched and so has no date.
+        /// </summary>
         public int? ListingPosition { get; set; }
 
         /// <summary>
-        /// Gets or sets the stream descriptions of this video's version-group members, as JSON
-        /// (see <c>StoredStreams</c>), or null when the video was never described.
+        /// When the source first saw this video. NEVER updated — it is the date added that gets
+        /// published.
+        /// </summary>
+        public DateTimeOffset? FirstSeenAt { get; set; }
+
+        /// <summary>
+        /// The last time a listing carried this video. Its absence from the last FULL listing means
+        /// it has left the source.
         /// </summary>
         /// <remarks>
-        /// Written when the video is resolved and applied to its library items at publication, so
-        /// a tier is described before anyone plays it even though publication now waits for the
-        /// whole source. Kept after it is applied: an item recreated later is described again
-        /// without a second probe.
+        /// A short listing refreshes this for its 30 entries only, which is precisely why the
+        /// cleanup never runs on one: everything past position 30 would look gone.
         /// </remarks>
-        public string? StreamDescriptions { get; set; }
+        public DateTimeOffset? ListedAt { get; set; }
+
+        /// <summary>
+        /// When the metadata fetch last ran. Null, or older than the configured maximum age, means
+        /// the video is due a fetch.
+        /// </summary>
+        public DateTimeOffset? MetadataAt { get; set; }
+
+        /// <summary>How the last metadata fetch ended.</summary>
+        public CallOutcome MetadataResult { get; set; }
+
+        /// <summary>Why it ended that way, in plain text.</summary>
+        public string? MetadataDetail { get; set; }
+
+        /// <summary>Consecutive metadata failures. Drives the backoff; reset to zero by a success.</summary>
+        /// <remarks>
+        /// A failure the PLATFORM caused — a rate-limit window — must not advance this: one such
+        /// window would otherwise push every video of a source a step further out.
+        /// </remarks>
+        public int MetadataAttempts { get; set; }
+
+        /// <summary>
+        /// When the stream description last ran. Null on a non-live video inside retention means it
+        /// is due a description.
+        /// </summary>
+        /// <remarks>
+        /// Deliberately a separate clock from <see cref="MetadataAt"/>: a failing ffprobe must not
+        /// make the pass spend another yt-dlp call.
+        /// </remarks>
+        public DateTimeOffset? DescribedAt { get; set; }
+
+        /// <summary>How the last description ended.</summary>
+        public CallOutcome DescribeResult { get; set; }
+
+        /// <summary>Why it ended that way, in plain text.</summary>
+        public string? DescribeDetail { get; set; }
+
+        /// <summary>Consecutive description failures. Reset to zero by a success.</summary>
+        public int DescribeAttempts { get; set; }
     }
 }

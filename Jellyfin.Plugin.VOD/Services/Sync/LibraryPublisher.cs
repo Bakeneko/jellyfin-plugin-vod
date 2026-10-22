@@ -917,15 +917,28 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// AddChild raises ItemAdded every time it is called, so it is reserved for an item genuinely
         /// arriving under this parent: a creation, or a move from another library. Updating an
         /// existing item in place through it would re-fire the event on every sync.
+        /// <para>
+        /// An arriving item also reclaims its user data. Jellyfin does not delete the played state,
+        /// the resume position or the favourite mark when an item goes away: it detaches those rows
+        /// and keeps them ninety days, to be re-attached to an item that comes back with the same
+        /// user-data key. That re-attachment is normally triggered by the first metadata refresh,
+        /// and nothing refreshes these items — they are virtual and this plugin is the authority on
+        /// their metadata — so it is asked for here. Harmless on a move: the call only ever pulls in
+        /// rows that are already detached and already match this item's own keys.
+        /// </para>
         /// </remarks>
-        private static async Task CommitAsync(
+        private async Task CommitAsync(
             BaseItem item, Folder parent, bool arriving, CancellationToken cancellationToken)
         {
-            if (arriving)
-                parent.AddChild(item);
-            else
+            if (!arriving)
+            {
                 await item.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, cancellationToken)
                     .ConfigureAwait(false);
+                return;
+            }
+
+            parent.AddChild(item);
+            await _libraryManager.ReattachUserDataAsync(item, cancellationToken).ConfigureAwait(false);
         }
 
         private async Task<(Series Series, bool Moved)> EnsureSeriesAsync(
@@ -1195,10 +1208,15 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         internal static DateTime? PremiereDateFor(VideoRecord video)
         {
             ArgumentNullException.ThrowIfNull(video);
+            // MetadataAt is the successor of the old per-pass sync stamp: it is when we last got
+            // an answer ABOUT this video, and the probe rewrites it on every pass for as long as a
+            // row stays live. FirstSeenAt backs it up for the one case it is null — a row the
+            // listing created that no fetch has reached yet.
+            var lastAnswer = video.MetadataAt ?? video.FirstSeenAt;
             return video.LiveStatus switch
             {
-                LiveStatus.Live => video.SyncedAt.UtcDateTime,
-                LiveStatus.Upcoming => video.PublishedAt?.UtcDateTime ?? video.SyncedAt.UtcDateTime,
+                LiveStatus.Live => lastAnswer?.UtcDateTime,
+                LiveStatus.Upcoming => video.PublishedAt?.UtcDateTime ?? lastAnswer?.UtcDateTime,
                 _ => video.PublishedAt?.UtcDateTime
             };
         }
@@ -1375,14 +1393,14 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// sources survive in the database, so flipping the setting either way just republishes with
         /// the other value.
         /// <para>
-        /// For a live or scheduled broadcast, <see cref="VideoRecord.SyncedAt"/> is returned
+        /// For a live or scheduled broadcast, <see cref="VideoRecord.MetadataAt"/> is returned
         /// unconditionally: a broadcast keeps living, so it must stay first in "recently added" as
         /// new videos arrive after it started. This is a deliberate exception to the rule below.
         /// </para>
         /// <para>
         /// For an ordinary video (<c>NotLive</c>), only fields that are set once are read.
-        /// <see cref="VideoRecord.SyncedAt"/> is deliberately NOT consulted as a fallback, however
-        /// tempting: it is rewritten on every pass, so a date derived from it would move every pass
+        /// <see cref="VideoRecord.MetadataAt"/> is deliberately NOT consulted as a fallback, however
+        /// tempting: it is rewritten on every fetch, so a date derived from it would move and
         /// and rewrite the item for ever. A row with neither a discovery nor a release date therefore
         /// yields null, and the item keeps whatever date it already carries — stable, and honest about
         /// having nothing to say.
@@ -1395,7 +1413,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             // rule that the date added derives only from fields set once, and it outranks the
             // release-date option, which would otherwise put a scheduled item in the future.
             if (video.LiveStatus != LiveStatus.NotLive)
-                return video.SyncedAt.UtcDateTime;
+                return (video.MetadataAt ?? video.FirstSeenAt)?.UtcDateTime;
 
             var released = video.PublishedAt?.UtcDateTime;
             var discovered = video.FirstSeenAt?.UtcDateTime;

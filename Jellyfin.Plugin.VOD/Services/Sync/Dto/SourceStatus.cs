@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using Jellyfin.Plugin.VOD.Data.Models;
 
 namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
 {
@@ -7,34 +8,103 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
     /// What one configured source last did, as the configuration table shows it.
     /// </summary>
     /// <param name="Url">The source URL, which is also its key in the database.</param>
-    /// <param name="Name">The name the series was published under, when a sync got that far.</param>
-    /// <param name="LastSyncedAt">When the source last completed a sync, or null if it never has.</param>
-    /// <param name="LastError">
-    /// Why the last attempt failed, or null when the last attempt succeeded. The database has
-    /// recorded this since the sync layer shipped; this is what finally reads it back.
+    /// <param name="Name">The name the series was published under, when a listing got that far.</param>
+    /// <param name="ShortListedAt">When the last short listing succeeded, or null.</param>
+    /// <param name="FullListedAt">
+    /// When the last full listing succeeded, or null. Null means no listing has ever run.
     /// </param>
     /// <param name="VideoCount">How many videos the database currently holds for this source.</param>
-    /// <param name="Resolved">Videos resolved.</param>
-    /// <param name="Pending">Videos enumerated and not yet resolved.</param>
-    /// <param name="Failed">Videos whose last resolution failed.</param>
-    /// <param name="Unavailable">Videos the platform says are gone.</param>
-    /// <param name="Settled">
-    /// Whether the source may number and publish its new videos now; false while a video is
-    /// pending, or failed fewer than three times.
+    /// <param name="ListingCount">
+    /// The last <c>playlist_count</c> the platform reported, where it reports one at all.
     /// </param>
-    /// <param name="LastResolutionError">The latest resolution failure, or null.</param>
+    /// <param name="ShortListingResult">The result of the last short listing.</param>
+    /// <param name="ShortListingDetail">Why the last short listing ended as it did.</param>
+    /// <param name="ShortListingFailures">Consecutive short-listing failures.</param>
+    /// <param name="FullListingResult">The result of the last full listing.</param>
+    /// <param name="FullListingDetail">Why the last full listing ended as it did.</param>
+    /// <param name="FullListingFailures">Consecutive full-listing failures.</param>
+    /// <param name="CleanupResult">The result of the last cleanup.</param>
+    /// <param name="CleanupDetail">Why the last cleanup ended as it did.</param>
+    /// <param name="CleanupFailures">Consecutive cleanup failures.</param>
+    /// <param name="WaveResult">The result of the last wave.</param>
+    /// <param name="WaveDetail">Why the last wave ended as it did.</param>
+    /// <param name="WaveFailures">Consecutive wave failures.</param>
+    /// <param name="CheckupResult">The result of the last checkup.</param>
+    /// <param name="CheckupDetail">Why the last checkup ended as it did.</param>
+    /// <param name="CheckupFailures">Consecutive checkup failures.</param>
     public sealed record SourceStatus(
         string Url,
         string? Name,
-        DateTimeOffset? LastSyncedAt,
-        string? LastError,
+        DateTimeOffset? ShortListedAt,
+        DateTimeOffset? FullListedAt,
         int VideoCount,
-        int Resolved,
-        int Pending,
-        int Failed,
-        int Unavailable,
-        bool Settled,
-        string? LastResolutionError);
+        int? ListingCount,
+        CallOutcome ShortListingResult,
+        string? ShortListingDetail,
+        int ShortListingFailures,
+        CallOutcome FullListingResult,
+        string? FullListingDetail,
+        int FullListingFailures,
+        CallOutcome CleanupResult,
+        string? CleanupDetail,
+        int CleanupFailures,
+        CallOutcome WaveResult,
+        string? WaveDetail,
+        int WaveFailures,
+        CallOutcome CheckupResult,
+        string? CheckupDetail,
+        int CheckupFailures);
+
+    /// <summary>
+    /// What happened to one video, as the source detail page shows it.
+    /// </summary>
+    /// <param name="Id">The internal uuid (primary key and Jellyfin provider id).</param>
+    /// <param name="Title">The published title, or the raw title when not yet published.</param>
+    /// <param name="VideoUrl">The video page URL.</param>
+    /// <param name="LiveStatus">Broadcasting, scheduled, or neither.</param>
+    /// <param name="PublishedAt">The publication date, or null when not yet known.</param>
+    /// <param name="SeasonNumber">The published season number, when set.</param>
+    /// <param name="EpisodeNumber">The published episode number, when set.</param>
+    /// <param name="MetadataResult">How the last metadata fetch ended.</param>
+    /// <param name="MetadataDetail">Why it ended that way, in plain text.</param>
+    /// <param name="MetadataAttempts">Consecutive metadata failures.</param>
+    /// <param name="MetadataAt">When the metadata fetch last ran.</param>
+    /// <param name="DescribeResult">How the last stream description ended.</param>
+    /// <param name="DescribeDetail">Why it ended that way, in plain text.</param>
+    /// <param name="DescribeAttempts">Consecutive description failures.</param>
+    /// <param name="DescribedAt">When the stream description last ran.</param>
+    public sealed record VideoStatus(
+        string Id,
+        string? Title,
+        string VideoUrl,
+        LiveStatus LiveStatus,
+        DateTimeOffset? PublishedAt,
+        int? SeasonNumber,
+        int? EpisodeNumber,
+        CallOutcome MetadataResult,
+        string? MetadataDetail,
+        int MetadataAttempts,
+        DateTimeOffset? MetadataAt,
+        CallOutcome DescribeResult,
+        string? DescribeDetail,
+        int DescribeAttempts,
+        DateTimeOffset? DescribedAt);
+
+    /// <summary>
+    /// One source's videos, ordered and capped for the detail panel.
+    /// </summary>
+    /// <param name="TotalVideos">
+    /// How many videos the source has in all, so the page can say what it is not showing.
+    /// </param>
+    /// <param name="Videos">
+    /// The videos that need attention first, then the most recent. The panel answers "why did
+    /// today's video not appear", and the database's own order — oldest publication date first,
+    /// nulls ahead of those — buries the answer at the bottom of a channel. Capped, because a
+    /// source here can hold several thousand videos and the panel renders every row it is given.
+    /// </param>
+    public sealed record SourceDetail(
+        int TotalVideos,
+        IReadOnlyList<VideoStatus> Videos);
 
     /// <summary>
     /// What one configured library is worth right now, as the configuration page shows it.
@@ -69,10 +139,16 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
     /// Sets of configured sources deriving one key, which would silently share a series. Empty in
     /// a healthy configuration.
     /// </param>
+    /// <param name="Warnings">
+    /// Configuration warnings that are silent by construction — situations where the plugin
+    /// runs without complaint but nothing useful happens. Each entry is a human-readable message
+    /// the configuration page should surface prominently.
+    /// </param>
     public sealed record SourcesStatus(
         IReadOnlyList<LibraryStatus> Libraries,
         IReadOnlyList<SourceStatus> Sources,
-        IReadOnlyList<SourceKeyCollision> Collisions);
+        IReadOnlyList<SourceKeyCollision> Collisions,
+        IReadOnlyList<string> Warnings);
 
     /// <summary>
     /// One library the configuration page may offer, with what it is allowed to hold.

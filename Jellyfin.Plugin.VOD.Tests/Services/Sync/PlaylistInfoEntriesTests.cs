@@ -122,5 +122,42 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         [InlineData("https://www.arte.tv/fr/videos/130515-005-A/slug/", "Youtube")]
         public void DeriveIdFromUrl_ReturnsNullWhenItCannotRecover(string url, string ieKey)
             => Assert.Null(PlaylistInfo.DeriveIdFromUrl(url, ieKey));
+
+        /// <summary>
+        /// Mesuré le 2026-10-19 : seules les PLAYLISTS renvoient <c>playlist_count</c>. Une chaîne
+        /// n'en donne pas. C'est un meilleur détecteur qu'un titre, parce qu'une baisse du compte
+        /// révèle une SUPPRESSION, qu'un coup d'œil en tête de liste ne voit pas.
+        /// </summary>
+        [Fact]
+        public void ParseJson_ReadsThePlaylistCount()
+        {
+            // `_type` est obligatoire : sans lui, ParseJson prend la branche « vidéo unique ».
+            var info = PlaylistInfo.ParseJson(
+                @"{""_type"":""playlist"",""playlist_count"":111,""entries"":[]}");
+
+            Assert.NotNull(info);
+            Assert.Equal(111, info!.PlaylistCount);
+        }
+
+        [Fact]
+        public void ParseJson_LeavesThePlaylistCountNull_WhenThePlatformDoesNotSay()
+        {
+            // Une chaîne YouTube. Null doit rester null et non devenir zéro : le nettoyage traite
+            // « zéro entrée » comme une panne de plateforme, pas comme une source vidée.
+            var info = PlaylistInfo.ParseJson(@"{""_type"":""playlist"",""entries"":[]}");
+
+            Assert.NotNull(info);
+            Assert.Null(info!.PlaylistCount);
+        }
+
+        [Fact]
+        public void ParseJson_IgnoresANonNumericPlaylistCount()
+        {
+            var info = PlaylistInfo.ParseJson(
+                @"{""_type"":""playlist"",""playlist_count"":""beaucoup"",""entries"":[]}");
+
+            Assert.NotNull(info);
+            Assert.Null(info!.PlaylistCount);
+        }
     }
 }

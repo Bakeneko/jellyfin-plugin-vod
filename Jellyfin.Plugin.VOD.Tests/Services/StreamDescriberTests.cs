@@ -430,7 +430,6 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
                 Id = Uuid,
                 SourceUrl = "https://example.test/s",
                 VideoUrl = "https://example.test/v",
-                SyncedAt = DateTimeOffset.UnixEpoch,
                 Extras = new VideoExtras { Qualities = qualities },
             };
 
@@ -450,7 +449,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
 
             Assert.NotNull(described);
             Assert.Equal(
-                new[] { "1080/h264", "2160/vp9", StoredStreams.PrimaryKey },
+                new[] { "1080/h264", "2160/vp9", DescribedStreams.PrimaryKey },
                 described!.Keys.Order(StringComparer.Ordinal));
             Assert.All(described.Values, streams => Assert.Equal([0, 1], streams.Select(s => s.Index)));
             _library.DidNotReceive().GetItemList(Arg.Any<InternalItemsQuery>());
@@ -478,7 +477,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
                 _config, VideoWith(new VideoQuality(1080, "h264", 30)), AvcOnlyMaster,
                 new Uri("https://cdn.test/master.m3u8"), CancellationToken.None);
 
-            Assert.NotSame(described![StoredStreams.PrimaryKey][0], described["1080/h264"][0]);
+            Assert.NotSame(described![DescribedStreams.PrimaryKey][0], described["1080/h264"][0]);
         }
 
         [Fact]
@@ -523,21 +522,26 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
         }
 
         [Fact]
-        public void ApplyStored_WritesOnlyMembersWithoutAVideoStream()
+        public void ApplyDescribed_WritesOnlyMembersWithoutAVideoStream()
         {
+            // A member that already has a video stream was described by Jellyfin or by the playback
+            // failsafe, and that description is at least as fresh as ours.
             var primary = Item($"http://localhost:8096/VOD/stream/{Uuid}.m3u8");
             var tier = Item($"http://localhost:8096/VOD/stream/{Uuid}.m3u8?height=1080&codec=h264");
             LibraryHolds(primary, tier);
             HasStreams(primary, new MediaStream { Type = MediaStreamType.Video, Codec = "h264" });
             HasNoStreams(tier);
 
-            var json = StoredStreams.Serialize(new Dictionary<string, IReadOnlyList<MediaStream>>
-            {
-                [StoredStreams.PrimaryKey] = [new MediaStream { Type = MediaStreamType.Video, Codec = "stored" }],
-                ["1080/h264"] = [new MediaStream { Type = MediaStreamType.Video, Codec = "h264", Height = 1080 }],
-            });
-
-            var applied = _describer.ApplyStored(Uuid, json, CancellationToken.None);
+            var applied = _describer.ApplyDescribed(
+                Uuid,
+                new Dictionary<string, IReadOnlyList<MediaStream>>
+                {
+                    [DescribedStreams.PrimaryKey] =
+                        [new MediaStream { Type = MediaStreamType.Video, Codec = "described" }],
+                    ["1080/h264"] =
+                        [new MediaStream { Type = MediaStreamType.Video, Codec = "h264", Height = 1080 }],
+                },
+                CancellationToken.None);
 
             Assert.Equal(1, applied);
             Assert.Null(SavedFor(primary));
@@ -545,13 +549,41 @@ namespace Jellyfin.Plugin.VOD.Tests.Services
         }
 
         [Fact]
-        public void ApplyStored_WritesNothing_ForUnreadableJson()
+        public void ApplyDescribed_WritesNothing_WhenThereIsNoDescription()
         {
+            // The caller passes what the wave produced, and a wave that described nothing passes an
+            // empty map rather than skipping the call.
             var tier = Item($"http://localhost:8096/VOD/stream/{Uuid}.m3u8?height=1080&codec=h264");
             LibraryHolds(tier);
             HasNoStreams(tier);
 
-            Assert.Equal(0, _describer.ApplyStored(Uuid, "not json", CancellationToken.None));
+            Assert.Equal(
+                0,
+                _describer.ApplyDescribed(
+                    Uuid,
+                    new Dictionary<string, IReadOnlyList<MediaStream>>(),
+                    CancellationToken.None));
+            Assert.Null(SavedFor(tier));
+        }
+
+        [Fact]
+        public void ApplyDescribed_WritesNothing_ForAMemberTheDescriptionDoesNotCover()
+        {
+            // A tier the master no longer carries is absent from the description. Nothing to write,
+            // and nothing to repair here: the next listing rebuilds the ladder.
+            var tier = Item($"http://localhost:8096/VOD/stream/{Uuid}.m3u8?height=1080&codec=h264");
+            LibraryHolds(tier);
+            HasNoStreams(tier);
+
+            Assert.Equal(
+                0,
+                _describer.ApplyDescribed(
+                    Uuid,
+                    new Dictionary<string, IReadOnlyList<MediaStream>>
+                    {
+                        ["2160/vp9"] = [new MediaStream { Type = MediaStreamType.Video, Height = 2160 }],
+                    },
+                    CancellationToken.None));
             Assert.Null(SavedFor(tier));
         }
     }

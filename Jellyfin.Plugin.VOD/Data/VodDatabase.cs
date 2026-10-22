@@ -47,7 +47,7 @@ namespace Jellyfin.Plugin.VOD.Data
         /// Schema version this build expects, tracked in SQLite's <c>user_version</c>.
         /// Bump it and add the matching case to <see cref="Migrate"/> whenever the schema changes.
         /// </summary>
-        private const int SchemaVersion = 8;
+        private const int SchemaVersion = 9;
 
         /// <inheritdoc />
         public void EnsureCreated()
@@ -55,6 +55,16 @@ namespace Jellyfin.Plugin.VOD.Data
             lock (_sync)
             {
                 var from = ReadSchemaVersion();
+
+                // A version from the future means an older build is reading a database a newer one
+                // wrote. Nothing here can migrate backwards, and the readers assume every column
+                // they name exists, so the next MapVideo would throw on a column that version
+                // renamed. Said out loud rather than guarded: downgrading is the administrator's
+                // decision, and a silent start followed by an unexplained crash is worse than a
+                // line that names the cause.
+                if (from > SchemaVersion)
+                    LogSchemaFromTheFuture(from, SchemaVersion);
+
                 if (from < SchemaVersion)
                 {
                     using var txn = Connection.BeginTransaction();
@@ -98,201 +108,97 @@ namespace Jellyfin.Plugin.VOD.Data
 
             switch (version)
             {
-                case 1:
+                case <= 8:
+                    // Nothing to do. Steps 1 to 8 built the schema the orchestration rework
+                    // replaces, and step 9 drops both of its tables unconditionally — so on a fresh
+                    // database they would create tables only for step 9 to destroy, and on an
+                    // existing one step 9 destroys what they built. Keeping ~200 lines of SQL to
+                    // reach a state that is thrown away in the same transaction would be dead
+                    // weight that still has to be read and maintained.
+                    //
+                    // The counter is NOT restarted at 1 instead: 1 < 8 would make step 9 replay on
+                    // every launch of an upgraded instance and destroy its data each time.
+                    return;
+
+                case 9:
+                    // The orchestration rework. Breaking by design: the two tables are dropped and
+                    // rebuilt, with no migration from version 8 — every column the old model needed
+                    // is gone, and the data it held is re-derivable by one full listing per source.
+                    //
+                    // The counter stays monotonic even though this is a new lineage. Restarting it
+                    // at 1 would make the next start ambiguous: 1 < 8 would replay this step and
+                    // destroy the data on EVERY launch.
                     cmd.CommandText = """
-                        CREATE TABLE IF NOT EXISTS sources (
-                            url                  TEXT PRIMARY KEY,
-                            name                 TEXT,
-                            series_thumbnail_url TEXT,
-                            series_banner_url    TEXT,
-                            tags                 TEXT,
-                            published_image_url  TEXT,
-                            published_banner_url TEXT,
-                            series_synopsis      TEXT,
-                            last_synced_at       TEXT,
-                            last_error           TEXT,
-                            video_count          INTEGER NOT NULL DEFAULT 0
+                        DROP TABLE IF EXISTS videos;
+                        DROP TABLE IF EXISTS sources;
+
+                        CREATE TABLE sources (
+                            url                    TEXT PRIMARY KEY,
+                            source_key             TEXT,
+                            name                   TEXT,
+                            series_synopsis        TEXT,
+                            series_thumbnail_url   TEXT,
+                            series_banner_url      TEXT,
+                            tags                   TEXT,
+                            published_image_url    TEXT,
+                            published_banner_url   TEXT,
+                            published_anchor_id    TEXT,
+                            config_fingerprint     TEXT,
+                            video_count            INTEGER NOT NULL DEFAULT 0,
+                            short_listed_at        TEXT,
+                            full_listed_at         TEXT,
+                            listing_count          INTEGER,
+                            short_listing_result   TEXT,
+                            short_listing_detail   TEXT,
+                            short_listing_failures INTEGER NOT NULL DEFAULT 0,
+                            full_listing_result    TEXT,
+                            full_listing_detail    TEXT,
+                            full_listing_failures  INTEGER NOT NULL DEFAULT 0,
+                            cleanup_result         TEXT,
+                            cleanup_detail         TEXT,
+                            cleanup_failures       INTEGER NOT NULL DEFAULT 0,
+                            wave_result            TEXT,
+                            wave_detail            TEXT,
+                            wave_failures          INTEGER NOT NULL DEFAULT 0,
+                            checkup_result         TEXT,
+                            checkup_detail         TEXT,
+                            checkup_failures       INTEGER NOT NULL DEFAULT 0
                         );
 
-                        CREATE TABLE IF NOT EXISTS videos (
-                            id               TEXT PRIMARY KEY,
-                            source_url       TEXT NOT NULL REFERENCES sources(url),
-                            extractor_key    TEXT,
-                            native_id        TEXT,
-                            video_url        TEXT NOT NULL,
-                            title            TEXT,
-                            published_at     TEXT,
-                            duration_seconds INTEGER,
-                            season_number    INTEGER,
-                            episode_number   INTEGER,
-                            synced_at        TEXT NOT NULL,
-                            audio_langs      TEXT,
-                            subtitle_langs   TEXT,
-                            thumbnail_url    TEXT,
+                        CREATE TABLE videos (
+                            id                  TEXT PRIMARY KEY,
+                            source_url          TEXT NOT NULL REFERENCES sources(url),
+                            native_id           TEXT,
+                            extractor_key       TEXT,
+                            video_url           TEXT NOT NULL,
+                            title               TEXT,
+                            listing_title       TEXT,
+                            description         TEXT,
+                            duration_seconds    INTEGER,
+                            thumbnail_url       TEXT,
                             published_image_url TEXT,
-                            tags             TEXT,
-                            categories       TEXT,
-                            description      TEXT,
-                            is_live          INTEGER NOT NULL DEFAULT 0
+                            published_at        TEXT,
+                            extras              TEXT,
+                            live_status         TEXT NOT NULL DEFAULT 'NotLive',
+                            season_number       INTEGER,
+                            episode_number      INTEGER,
+                            listing_position    INTEGER,
+                            first_seen_at       TEXT,
+                            listed_at           TEXT,
+                            metadata_at         TEXT,
+                            metadata_result     TEXT,
+                            metadata_detail     TEXT,
+                            metadata_attempts   INTEGER NOT NULL DEFAULT 0,
+                            described_at        TEXT,
+                            describe_result     TEXT,
+                            describe_detail     TEXT,
+                            describe_attempts   INTEGER NOT NULL DEFAULT 0
                         );
 
-                        CREATE INDEX IF NOT EXISTS idx_videos_source_url ON videos(source_url);
-                        CREATE INDEX IF NOT EXISTS idx_videos_synced_at  ON videos(synced_at);
-                        CREATE INDEX IF NOT EXISTS idx_videos_native_id  ON videos(source_url, native_id);
+                        CREATE UNIQUE INDEX idx_videos_source_native ON videos(source_url, native_id);
+                        CREATE INDEX idx_videos_source ON videos(source_url);
 
-                        INSERT OR IGNORE INTO sources (url, name) VALUES ('__debug__', 'Debug (internal)');
-
-                        PRAGMA user_version = 1;
-                        """;
-                    break;
-
-                case 2:
-                    cmd.CommandText = """
-                        ALTER TABLE videos ADD COLUMN channels TEXT;
-
-                        PRAGMA user_version = 2;
-                        """;
-                    break;
-
-                case 3:
-                    // Backfilled from synced_at, which is the LATEST sync rather than the first: an
-                    // approximation, and the only one available for a row that predates this column.
-                    // Far better than null, which would leave the published date added undefined.
-                    cmd.CommandText = """
-                        ALTER TABLE videos ADD COLUMN first_seen_at TEXT;
-
-                        UPDATE videos SET first_seen_at = synced_at WHERE first_seen_at IS NULL;
-
-                        PRAGMA user_version = 3;
-                        """;
-                    break;
-
-                case 4:
-                    // No backfill: there is no honest value to invent for a row that predates the
-                    // column. Null means "unknown", and the sweep falls back to the configured
-                    // libraries, which is the best effort that existed before it.
-                    cmd.CommandText = """
-                        ALTER TABLE sources ADD COLUMN published_anchor_id TEXT;
-
-                        PRAGMA user_version = 4;
-                        """;
-                    break;
-
-                case 5:
-                    // The five JSON columns collapse into one typed payload; none of them was ever
-                    // used in a predicate, an ORDER BY or a targeted UPDATE, so none needs a column.
-                    // No backfill: a resync repopulates, and the project is not released.
-                    // The '__debug__' source row was inserted by v1 and filtered out of every
-                    // listing ever since — it existed only to be excluded.
-                    // videos.source_url is a foreign key onto sources.url (PRAGMA foreign_keys=ON),
-                    // so the children must be deleted before the parent — same order as DeleteSource.
-                    // Reversing the order raises SQLITE_CONSTRAINT and strands the database at v4.
-                    cmd.CommandText = """
-                        ALTER TABLE videos ADD COLUMN extras TEXT;
-
-                        DELETE FROM videos  WHERE source_url = '__debug__';
-                        DELETE FROM sources WHERE url        = '__debug__';
-
-                        ALTER TABLE videos DROP COLUMN audio_langs;
-                        ALTER TABLE videos DROP COLUMN subtitle_langs;
-                        ALTER TABLE videos DROP COLUMN tags;
-                        ALTER TABLE videos DROP COLUMN categories;
-                        ALTER TABLE videos DROP COLUMN channels;
-
-                        PRAGMA user_version = 5;
-                        """;
-                    break;
-
-                case 6:
-                    // is_live could not tell a scheduled stream from a finished one. The replacement
-                    // is stored as text rather than an int because it is read back as an enum name,
-                    // and it is a column rather than an extras field because it is a predicate: the
-                    // sync's skip-set and the live probe both select on it.
-                    // No backfill: the project is not released, and the next pass over a row sets it.
-                    cmd.CommandText = """
-                        ALTER TABLE videos ADD COLUMN live_status TEXT NOT NULL DEFAULT 'NotLive';
-                        ALTER TABLE videos DROP COLUMN is_live;
-
-                        PRAGMA user_version = 6;
-                        """;
-                    break;
-
-                case 7:
-                    // ProcessEntries built its native-id map before its loop and never updated it,
-                    // so a listing that returned the same video twice created two rows, one Guid
-                    // each — observed in production with identical first_seen_at values. Every
-                    // later sync of that source then threw on the map build, permanently.
-                    // The rows are deleted oldest-wins (rowid breaks a tie, which the observed
-                    // case needs), then the v1 index is rebuilt as UNIQUE under the same name, so
-                    // the defect can no longer be silent. NULL native ids are left alone: SQLite
-                    // treats NULLs as distinct in a UNIQUE index, and they are not duplicates of
-                    // one another.
-                    // The DELETE runs on its own command rather than in the script below, for its
-                    // affected-row count: this is the first migration of a released build that
-                    // destroys rows, and a user upgrading has no other way to learn what it took.
-                    using (var dedupe = Connection.CreateCommand())
-                    {
-                        dedupe.Transaction = txn;
-                        dedupe.CommandText = """
-                            DELETE FROM videos
-                            WHERE native_id IS NOT NULL
-                              AND rowid NOT IN (
-                                  SELECT rowid FROM (
-                                      SELECT rowid,
-                                             ROW_NUMBER() OVER (
-                                                 PARTITION BY source_url, native_id
-                                                 ORDER BY COALESCE(first_seen_at, '9999') ASC, rowid ASC
-                                             ) AS rank
-                                      FROM videos
-                                      WHERE native_id IS NOT NULL
-                                  )
-                                  WHERE rank = 1
-                              );
-                            """;
-
-                        var dropped = dedupe.ExecuteNonQuery();
-                        if (dropped > 0)
-                        {
-                            LogDroppedDuplicateVideos(dropped);
-                        }
-                    }
-
-                    cmd.CommandText = """
-                        DROP INDEX IF EXISTS idx_videos_native_id;
-                        CREATE UNIQUE INDEX idx_videos_native_id ON videos(source_url, native_id);
-
-                        PRAGMA user_version = 7;
-                        """;
-                    break;
-
-                case 8:
-                    // The five columns the deferred-resolution design is built on, plus the
-                    // source-level timestamp the configuration page shows, plus the stream
-                    // descriptions stored at resolution time, since publication now waits for the
-                    // whole source while a manifest URL only lives for one wave.
-                    // The backfill is the honest reading of what a v7 database holds: a row with
-                    // metadata in extras has already been paid for, so it is resolved; one without
-                    // has never been resolved, so it is pending and the resolver will take it. No
-                    // re-download, nothing lost. listing_position stays NULL until the next
-                    // enumeration, which costs nothing — those rows are already resolved.
-                    cmd.CommandText = """
-                        ALTER TABLE videos ADD COLUMN resolution_state        TEXT NOT NULL DEFAULT 'Pending';
-                        ALTER TABLE videos ADD COLUMN resolution_attempted_at TEXT;
-                        ALTER TABLE videos ADD COLUMN resolution_attempts     INTEGER NOT NULL DEFAULT 0;
-                        ALTER TABLE videos ADD COLUMN resolution_error        TEXT;
-                        ALTER TABLE videos ADD COLUMN listing_position        INTEGER;
-                        ALTER TABLE videos ADD COLUMN stream_descriptions     TEXT;
-
-                        ALTER TABLE sources ADD COLUMN last_resolved_at  TEXT;
-                        ALTER TABLE sources ADD COLUMN published_mode    INTEGER;
-
-                        UPDATE videos SET resolution_state = 'Resolved'
-                        WHERE extras IS NOT NULL AND extras <> '';
-
-                        CREATE INDEX IF NOT EXISTS idx_videos_resolution
-                            ON videos(extractor_key, resolution_state);
-
-                        PRAGMA user_version = 8;
+                        PRAGMA user_version = 9;
                         """;
                     break;
 
@@ -314,52 +220,40 @@ namespace Jellyfin.Plugin.VOD.Data
         /// <inheritdoc />
         public void UpsertSource(SourceRecord source)
         {
+            ArgumentNullException.ThrowIfNull(source);
+
             lock (_sync)
             {
                 using var cmd = Connection.CreateCommand();
 
-                // last_resolved_at belongs to the resolver: it is seeded on insert, but on an
-                // existing row only SetLastResolvedAt and ClearLastResolvedAt change it. A caller
-                // holding a SourceRecord loaded earlier (the sync loads one before cleanup) must
-                // not write a stale stamp back over a clear made in the same pass.
+                // Only the fields a listing owns. Every clock, every stage triplet, the fingerprint
+                // and the anchor have a setter of their own, because a caller holding a record
+                // loaded earlier in the pass would otherwise write a stale value back over one
+                // written since — which is how the old model lost clears mid-pass.
                 cmd.CommandText = """
                     INSERT INTO sources
-                        (url, name, series_thumbnail_url, series_banner_url, tags, series_synopsis,
-                         last_synced_at, last_error, video_count, published_anchor_id,
-                         last_resolved_at, published_mode)
+                        (url, source_key, name, series_synopsis, series_thumbnail_url,
+                         series_banner_url, tags, video_count)
                     VALUES
-                        ($url, $name, $thumbnailUrl, $bannerUrl, $tags, $synopsis,
-                         $lastSyncedAt, $lastError, $videoCount, $publishedAnchorId,
-                         $lastResolvedAt, $publishedMode)
+                        ($url, $key, $name, $synopsis, $thumbnailUrl,
+                         $bannerUrl, $tags, $videoCount)
                     ON CONFLICT(url) DO UPDATE SET
+                        source_key           = excluded.source_key,
                         name                 = excluded.name,
+                        series_synopsis      = excluded.series_synopsis,
                         series_thumbnail_url = excluded.series_thumbnail_url,
                         series_banner_url    = excluded.series_banner_url,
                         tags                 = excluded.tags,
-                        series_synopsis      = excluded.series_synopsis,
-                        last_synced_at       = excluded.last_synced_at,
-                        last_error           = excluded.last_error,
-                        video_count          = excluded.video_count,
-                        published_anchor_id  = excluded.published_anchor_id,
-                        published_mode       = excluded.published_mode;
+                        video_count          = excluded.video_count;
                     """;
                 cmd.Parameters.AddWithValue("$url", source.Url);
+                cmd.Parameters.AddWithValue("$key", (object?)source.Key ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$name", (object?)source.Name ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$synopsis", (object?)source.SeriesSynopsis ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$thumbnailUrl", (object?)source.SeriesThumbnailUrl ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$bannerUrl", (object?)source.SeriesBannerUrl ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$tags", (object?)source.Tags ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("$synopsis", (object?)source.SeriesSynopsis ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("$lastSyncedAt", (object?)source.LastSyncedAt?.ToString("O") ?? DBNull.Value);
-                cmd.Parameters.AddWithValue(
-                    "$lastResolvedAt", (object?)source.LastResolvedAt?.ToString("O") ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("$lastError", (object?)source.LastError ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$videoCount", source.VideoCount);
-                cmd.Parameters.AddWithValue(
-                    "$publishedAnchorId",
-                    (object?)source.PublishedAnchorId?.ToString("N") ?? DBNull.Value);
-                cmd.Parameters.AddWithValue(
-                    "$publishedMode",
-                    source.PublishedMode is { } publishedMode ? (int)publishedMode : (object)DBNull.Value);
                 cmd.ExecuteNonQuery();
             }
         }
@@ -396,113 +290,59 @@ namespace Jellyfin.Plugin.VOD.Data
         }
 
         /// <inheritdoc />
-        public IReadOnlyDictionary<string, ResolutionSummary> GetResolutionSummaries()
-        {
-            lock (_sync)
-            {
-                var counts = new Dictionary<string, (int R, int P, int F, int U, int Blocking)>(
-                    StringComparer.OrdinalIgnoreCase);
-
-                using (var cmd = Connection.CreateCommand())
-                {
-                    // "Blocking" restates ResolutionSettlement.Blocks in SQL so the page needs no
-                    // row-by-row read; GetResolutionSummaries_AgreesWithSourceIsSettled pins the two.
-                    cmd.CommandText = """
-                        SELECT source_url,
-                               SUM(resolution_state = 'Resolved'),
-                               SUM(resolution_state = 'Pending'),
-                               SUM(resolution_state = 'Failed'),
-                               SUM(resolution_state = 'Unavailable'),
-                               SUM(resolution_state = 'Pending'
-                                   OR (resolution_state = 'Failed' AND resolution_attempts < $threshold))
-                        FROM videos
-                        GROUP BY source_url
-                        """;
-                    cmd.Parameters.AddWithValue("$threshold", ResolutionSettlement.BlockingFailedAttempts);
-                    using var r = cmd.ExecuteReader();
-                    while (r.Read())
-                    {
-                        counts[r.GetString(0)] =
-                            (r.GetInt32(1), r.GetInt32(2), r.GetInt32(3), r.GetInt32(4), r.GetInt32(5));
-                    }
-                }
-
-                var lastErrors = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                using (var cmd = Connection.CreateCommand())
-                {
-                    // Failed rows are few; the newest attempt per source wins.
-                    cmd.CommandText = """
-                        SELECT source_url, resolution_error
-                        FROM videos
-                        WHERE resolution_state = 'Failed' AND resolution_error IS NOT NULL
-                        ORDER BY resolution_attempted_at DESC
-                        """;
-                    using var r = cmd.ExecuteReader();
-                    while (r.Read())
-                    {
-                        lastErrors.TryAdd(r.GetString(0), r.GetString(1));
-                    }
-                }
-
-                var summaries = new Dictionary<string, ResolutionSummary>(StringComparer.OrdinalIgnoreCase);
-                foreach (var (url, c) in counts)
-                {
-                    summaries[url] = new ResolutionSummary(
-                        c.R, c.P, c.F, c.U, c.Blocking == 0, lastErrors.GetValueOrDefault(url));
-                }
-
-                return summaries;
-            }
-        }
-
-        /// <inheritdoc />
         public void UpsertVideo(VideoRecord video)
         {
+            ArgumentNullException.ThrowIfNull(video);
+
             lock (_sync)
             {
                 using var cmd = Connection.CreateCommand();
                 cmd.CommandText = """
                     INSERT INTO videos
-                        (id, source_url, extractor_key, native_id, video_url, title,
-                         published_at, duration_seconds,
-                         season_number, episode_number, synced_at,
-                         thumbnail_url, extras,
-                         description, live_status, first_seen_at,
-                         resolution_state, resolution_attempted_at, resolution_attempts,
-                         resolution_error, listing_position, stream_descriptions)
+                        (id, source_url, native_id, extractor_key, video_url,
+                         title, listing_title, description, duration_seconds,
+                         thumbnail_url, published_at, extras, live_status,
+                         season_number, episode_number, listing_position,
+                         first_seen_at, listed_at,
+                         metadata_at, metadata_result, metadata_detail, metadata_attempts,
+                         described_at, describe_result, describe_detail, describe_attempts)
                     VALUES
-                        ($id, $sourceUrl, $extractorKey, $nativeId, $videoUrl, $title,
-                         $publishedAt, $durationSeconds,
-                         $seasonNumber, $episodeNumber, $syncedAt,
-                         $thumbnailUrl, $extras,
-                         $description, $liveStatus, $firstSeenAt,
-                         $resolutionState, $resolutionAttemptedAt, $resolutionAttempts,
-                         $resolutionError, $listingPosition, $streamDescriptions)
+                        ($id, $sourceUrl, $nativeId, $extractorKey, $videoUrl,
+                         $title, $listingTitle, $description, $durationSeconds,
+                         $thumbnailUrl, $publishedAt, $extras, $liveStatus,
+                         $seasonNumber, $episodeNumber, $listingPosition,
+                         $firstSeenAt, $listedAt,
+                         $metadataAt, $metadataResult, $metadataDetail, $metadataAttempts,
+                         $describedAt, $describeResult, $describeDetail, $describeAttempts)
                     ON CONFLICT(id) DO UPDATE SET
-                        source_url       = excluded.source_url,
-                        extractor_key    = excluded.extractor_key,
-                        native_id        = excluded.native_id,
-                        video_url        = excluded.video_url,
-                        title            = excluded.title,
-                        published_at     = excluded.published_at,
-                        duration_seconds = excluded.duration_seconds,
-                        season_number    = excluded.season_number,
-                        episode_number   = excluded.episode_number,
-                        synced_at        = excluded.synced_at,
-                        thumbnail_url    = excluded.thumbnail_url,
-                        extras           = excluded.extras,
-                        description      = excluded.description,
-                        live_status      = excluded.live_status,
-                        resolution_state        = excluded.resolution_state,
-                        resolution_attempted_at = excluded.resolution_attempted_at,
-                        resolution_attempts     = excluded.resolution_attempts,
-                        resolution_error        = excluded.resolution_error,
-                        listing_position        = excluded.listing_position,
-                        -- A null never erases a description already paid for.
-                        stream_descriptions     = COALESCE(excluded.stream_descriptions, videos.stream_descriptions),
-                        -- Never overwritten: an existing discovery date always beats the one the new
-                        -- upsert proposes. This COALESCE is what enforces "set once, never updated".
-                        first_seen_at    = COALESCE(videos.first_seen_at, excluded.first_seen_at);
+                        source_url        = excluded.source_url,
+                        native_id         = excluded.native_id,
+                        extractor_key     = excluded.extractor_key,
+                        video_url         = excluded.video_url,
+                        title             = excluded.title,
+                        listing_title     = excluded.listing_title,
+                        description       = excluded.description,
+                        duration_seconds  = excluded.duration_seconds,
+                        thumbnail_url     = excluded.thumbnail_url,
+                        published_at      = excluded.published_at,
+                        extras            = excluded.extras,
+                        live_status       = excluded.live_status,
+                        season_number     = excluded.season_number,
+                        episode_number    = excluded.episode_number,
+                        listing_position  = excluded.listing_position,
+                        listed_at         = excluded.listed_at,
+                        metadata_at       = excluded.metadata_at,
+                        metadata_result   = excluded.metadata_result,
+                        metadata_detail   = excluded.metadata_detail,
+                        metadata_attempts = excluded.metadata_attempts,
+                        described_at      = excluded.described_at,
+                        describe_result   = excluded.describe_result,
+                        describe_detail   = excluded.describe_detail,
+                        describe_attempts = excluded.describe_attempts,
+                        -- Never overwritten: the discovery date already on the row always beats the
+                        -- one a later upsert proposes. This COALESCE is what enforces
+                        -- "set once, never updated", and it is the published date added.
+                        first_seen_at     = COALESCE(videos.first_seen_at, excluded.first_seen_at);
                     """;
                 BindVideo(cmd, video);
                 cmd.ExecuteNonQuery();
@@ -555,35 +395,14 @@ namespace Jellyfin.Plugin.VOD.Data
         }
 
         /// <inheritdoc />
-        public IReadOnlyList<VideoRecord> GetPublishableVideosBySource(string sourceUrl)
+        public IReadOnlyList<string> GetVideoIdsWithMetadata()
         {
             lock (_sync)
             {
                 using var cmd = Connection.CreateCommand();
                 cmd.CommandText =
-                    "SELECT * FROM videos WHERE source_url = $url AND resolution_state = $resolved "
-                    + "ORDER BY published_at, id";
-                cmd.Parameters.AddWithValue("$url", sourceUrl);
-                cmd.Parameters.AddWithValue("$resolved", nameof(ResolutionState.Resolved));
-                using var r = cmd.ExecuteReader();
-                var list = new List<VideoRecord>();
-                while (r.Read())
-                {
-                    list.Add(MapVideo(r));
-                }
-
-                return list;
-            }
-        }
-
-        /// <inheritdoc />
-        public IReadOnlyList<string> GetPublishableVideoIds()
-        {
-            lock (_sync)
-            {
-                using var cmd = Connection.CreateCommand();
-                cmd.CommandText = "SELECT id FROM videos WHERE resolution_state = $resolved";
-                cmd.Parameters.AddWithValue("$resolved", nameof(ResolutionState.Resolved));
+                    "SELECT id FROM videos WHERE metadata_at IS NOT NULL AND metadata_result = $ok";
+                cmd.Parameters.AddWithValue("$ok", nameof(CallOutcome.Ok));
                 using var r = cmd.ExecuteReader();
                 var list = new List<string>();
                 while (r.Read())
@@ -613,18 +432,104 @@ namespace Jellyfin.Plugin.VOD.Data
         }
 
         /// <inheritdoc />
-        public VideoRecord? GetVideoByNativeId(string sourceUrl, string nativeId)
+        public IReadOnlyList<VideoRecord> GetDueVideos(
+            string sourceUrl,
+            DateTimeOffset now,
+            int retryMinutes,
+            int metadataMaxAgeDays,
+            int retentionDays,
+            int limit)
         {
             lock (_sync)
             {
                 using var cmd = Connection.CreateCommand();
-                cmd.CommandText = "SELECT * FROM videos WHERE source_url = $url AND native_id = $id LIMIT 1";
+
+                // Metadata is stale when metadata_at is older than this cutoff.
+                var metadataCutoff = now.AddDays(-metadataMaxAgeDays).ToString("O");
+
+                // Condition 3 retention gate: any published_at before this cutoff is outside
+                // retention. Zero or less means unlimited — use MinValue so every date passes,
+                // matching the "zero means unlimited" convention throughout this project.
+                var retentionCutoff = retentionDays > 0
+                    ? now.AddDays(-retentionDays).ToString("O")
+                    : DateTimeOffset.MinValue.ToString("O");
+
+                // A non-positive retry base means no backoff: clamp to zero so that the SQL
+                // expression retryMinutes * POWER(2, n) = 0 for all n, and the backoff deadline
+                // is always in the past.
+                var retryBase = Math.Max(0, retryMinutes);
+
+                // ONE query serves both the wave (limit = WaveSize) and the loop's stop test
+                // (limit = 1). A second "has work" predicate that could diverge from this
+                // selection would risk reporting work for a video this query never surfaces —
+                // making the pass loop forever. See WaveSelector.IsInBackoff for the C# mirror of
+                // the backoff rule; WaveSelectorTests.IsInBackoff_SqlConcordance_AgreesWithDatabase
+                // checks that the two cannot drift.
+                //
+                // Only the metadata pair (metadata_attempts / metadata_at) drives the backoff.
+                // describe_attempts cannot drive a backoff at all, for an architectural reason:
+                // describing a video requires the stream-manifest URLs that the metadata step
+                // fetches via yt-dlp; those URLs are not stored on the row. A describe retry is
+                // therefore always a metadata retry — there is no standalone describe retry path.
+                // Concretely, when a description fails, SetDescribeOutcome stamps described_at,
+                // which removes the video from condition 3 entirely. The video waits until the
+                // metadata clock goes stale (bounded by metadataMaxAgeDays), at which point the
+                // next wave re-fetches the metadata and re-describes the video in the same breath.
+                // Playback's own failsafe describes it sooner if someone plays it in the meantime.
+                cmd.CommandText = """
+                    SELECT * FROM videos
+                    WHERE source_url = $url
+                      AND (
+                          -- Condition 1: metadata has never been fetched.
+                          metadata_at IS NULL
+                          -- Condition 2: metadata is stale.
+                          OR metadata_at < $metadataCutoff
+                          -- Condition 3: description is absent on a video that can and should
+                          -- have one. Gated on live_status and retention HERE — selecting a
+                          -- live video or one outside retention only to skip it in the
+                          -- execution step would fire a yt-dlp call on every wave, which is the
+                          -- exact call loop this rework was built to remove.
+                          OR (
+                              described_at IS NULL
+                              AND live_status = $notLive
+                              AND (published_at IS NULL OR published_at >= $retentionCutoff)
+                          )
+                      )
+                      AND (
+                          -- Not in backoff: no prior failures to back off from, no clock to start
+                          -- from, or the computed wait has already elapsed.
+                          metadata_attempts = 0
+                          OR metadata_at IS NULL
+                          OR unixepoch(metadata_at)
+                             + CAST(MIN(
+                                   CAST($retryMinutes AS REAL) * POWER(2.0, metadata_attempts - 1),
+                                   7.0 * 24.0 * 60.0
+                               ) AS INTEGER) * 60
+                             <= unixepoch($now)
+                      )
+                    ORDER BY
+                        listing_position IS NULL,  -- 0 for a known position, 1 for null: nulls last
+                        listing_position,
+                        id
+                    LIMIT $limit
+                    """;
+
                 cmd.Parameters.AddWithValue("$url", sourceUrl);
-                cmd.Parameters.AddWithValue("$id", nativeId);
+                cmd.Parameters.AddWithValue("$now", now.ToString("O"));
+                cmd.Parameters.AddWithValue("$metadataCutoff", metadataCutoff);
+                cmd.Parameters.AddWithValue("$retentionCutoff", retentionCutoff);
+                cmd.Parameters.AddWithValue("$notLive", nameof(LiveStatus.NotLive));
+                cmd.Parameters.AddWithValue("$retryMinutes", retryBase);
+                cmd.Parameters.AddWithValue("$limit", limit);
+
                 using var r = cmd.ExecuteReader();
-                return r.Read() ? MapVideo(r) : null;
+                var list = new List<VideoRecord>();
+                while (r.Read())
+                    list.Add(MapVideo(r));
+                return list;
             }
         }
+
 
         /// <inheritdoc />
         public void SetPublishedImageUrl(string videoId, string? url)
@@ -712,136 +617,85 @@ namespace Jellyfin.Plugin.VOD.Data
         }
 
         /// <inheritdoc />
-        public void TouchVideos(string sourceUrl, IReadOnlyCollection<string> nativeIds, DateTimeOffset syncedAt)
+        public void TouchListedAt(
+            string sourceUrl, IReadOnlyCollection<string> nativeIds, DateTimeOffset when)
         {
-            if (nativeIds.Count == 0) return;
+            ArgumentNullException.ThrowIfNull(nativeIds);
+
+            if (nativeIds.Count == 0)
+                return;
+
             lock (_sync)
             {
                 using var txn = Connection.BeginTransaction();
                 using var cmd = Connection.CreateCommand();
                 cmd.Transaction = txn;
                 cmd.CommandText =
-                    "UPDATE videos SET synced_at = $syncedAt WHERE source_url = $url AND native_id = $nativeId";
-                var pSyncedAt = cmd.CreateParameter();
-                pSyncedAt.ParameterName = "$syncedAt";
-                pSyncedAt.Value = syncedAt.ToString("O");
-                cmd.Parameters.Add(pSyncedAt);
-                var pUrl = cmd.CreateParameter();
-                pUrl.ParameterName = "$url";
-                pUrl.Value = sourceUrl;
-                cmd.Parameters.Add(pUrl);
-                var pNativeId = cmd.CreateParameter();
-                pNativeId.ParameterName = "$nativeId";
-                cmd.Parameters.Add(pNativeId);
+                    "UPDATE videos SET listed_at = $when WHERE source_url = $url AND native_id = $nativeId";
+                var url = cmd.Parameters.Add("$url", SqliteType.Text);
+                var nativeId = cmd.Parameters.Add("$nativeId", SqliteType.Text);
+                var stamp = cmd.Parameters.Add("$when", SqliteType.Text);
+                url.Value = sourceUrl;
+                stamp.Value = when.ToString("O");
+
                 foreach (var id in nativeIds)
                 {
-                    pNativeId.Value = id;
+                    nativeId.Value = id;
                     cmd.ExecuteNonQuery();
                 }
+
                 txn.Commit();
             }
         }
 
         /// <summary>
-        /// How long a row may claim to be broadcasting or scheduled without being written again
-        /// before the orphan sweep stops sparing it.
+        /// How long a broadcasting or scheduled row is spared the cleanup after it stops being
+        /// written.
         /// </summary>
         /// <remarks>
-        /// The quantity this has to clear is not a broadcast's length — every probe pass rewrites a
-        /// live row's <c>synced_at</c>, so a week-long stream stays fresh throughout — but the
-        /// longest plausible gap between two successful writes of a row that is still live. A week
-        /// clears the longest broadcasts anyone runs (multi-day charity marathons), any sane probe
-        /// interval, and a long run of yt-dlp failures on top, while bounding a stuck row's life to
-        /// days rather than for ever. Sparing a live row wrongly removes something the user is
-        /// watching; sweeping a stale one wrongly costs one re-publication on the next pass, so the
-        /// bound is deliberately generous.
+        /// Not a broadcast's length — every probe pass rewrites a live row's <c>listed_at</c>, so a
+        /// week-long stream stays fresh throughout — but the longest plausible gap between two
+        /// successful writes of a row that is still live. A week clears the longest broadcasts
+        /// anyone runs, any sane probe interval, and a long run of yt-dlp failures on top, while
+        /// bounding a stuck row's life to days rather than for ever. Sparing a live row wrongly
+        /// removes something someone is watching; sweeping a stale one wrongly costs one
+        /// re-publication, so the bound is deliberately generous.
         /// </remarks>
         private static readonly TimeSpan LiveExemptionMaxAge = TimeSpan.FromDays(7);
 
         /// <inheritdoc />
-        public IReadOnlyList<string> GetOrphanedVideoUuids(string sourceUrl, DateTimeOffset syncedBefore)
+        public IReadOnlyList<string> GetVideosGoneFromLastFullListing(
+            string sourceUrl, DateTimeOffset fullListedAt)
         {
             lock (_sync)
             {
                 using var cmd = Connection.CreateCommand();
+
                 // A row that is broadcasting or scheduled is spared, but only while it is FRESH.
                 //
-                // Spared, because the probe publishes ids the sync's listing does not carry — the
-                // stream id on a subscriber-only channel, a different id per pass for a live-only
-                // source — so synced_at alone deleted the row, and with it the library item, in the
+                // Spared, because the probe publishes ids no listing carries — the stream id on a
+                // subscriber-only channel, a different id per pass for a live-only source — so a
+                // sweep on listed_at alone deleted the row, and with it the library item, in the
                 // middle of the broadcast.
                 //
                 // Only while fresh, because one such row can never return to NotLive: the fallback
                 // row's URL is the channel root, which yt-dlp answers for only while the channel is
                 // live, so once the broadcast ends its re-fetch fails for ever; and its stream id is
-                // absent from the /videos listing, so no sync touches it either. An unbounded
-                // exemption left one phantom per broadcast, accumulating. Freshness separates the
-                // two cases: a live row is rewritten on every probe pass, while a stuck row stops
-                // being written the moment its re-fetch starts failing.
+                // absent from the /videos listing, so no listing touches it either. An unbounded
+                // exemption left one phantom per broadcast, accumulating.
                 //
-                // Retention is deliberately NOT checked here — see IVodDatabase.GetOrphanedVideoUuids
-                // for the rationale. Retention is a publication filter, not an erase rule.
+                // Retention is deliberately NOT checked here. It is a publication filter, not an
+                // erase rule: deleting a row that is still in the listing would have it
+                // rediscovered and refetched on the next pass, which is the exact call loop this
+                // design exists to remove.
                 cmd.CommandText =
                     "SELECT id FROM videos WHERE source_url = $url "
-                    + "AND (live_status = $notLive OR synced_at < $stale) "
-                    + "AND synced_at < $cutoff";
+                    + "AND (live_status = $notLive OR listed_at IS NULL OR listed_at < $stale) "
+                    + "AND (listed_at IS NULL OR listed_at < $cutoff)";
                 cmd.Parameters.AddWithValue("$url", sourceUrl);
                 cmd.Parameters.AddWithValue("$notLive", nameof(LiveStatus.NotLive));
-                cmd.Parameters.AddWithValue("$cutoff", syncedBefore.ToString("O"));
-                cmd.Parameters.AddWithValue("$stale", syncedBefore.Subtract(LiveExemptionMaxAge).ToString("O"));
-                using var r = cmd.ExecuteReader();
-                var list = new List<string>();
-                while (r.Read())
-                    list.Add(r.GetString(0));
-                return list;
-            }
-        }
-
-        /// <summary>
-        /// What "this video is due for resolution now" means, in one place.
-        /// </summary>
-        /// <remarks>
-        /// Written once and shared by the three queries that need it, because three copies would
-        /// drift and a wave would then be selected on one definition and filled on another.
-        /// <para>
-        /// A <c>Failed</c> row waits <c>ResolutionRetryMinutes × 2^(attempts−1)</c> minutes,
-        /// capped unconditionally at seven days regardless of the base interval; <c>julianday</c>
-        /// answers in days, hence the division by 1440. The cap lives inside <c>MIN(…, 7.0)</c>
-        /// so it applies to the computed wait in days; <c>POWER(2, 2000)</c> returns <c>Inf</c>
-        /// in SQLite's floating-point arithmetic, and <c>MIN(Inf, 7.0)</c> is <c>7.0</c>, so very
-        /// large attempt counts still clamp correctly. An <c>Unavailable</c> row with no attempt
-        /// timestamp is the listing's own free verdict — the next enumeration re-checks it for
-        /// nothing, so it must not cost a call here.
-        /// </para>
-        /// </remarks>
-        private const string DueNowPredicate = """
-            (
-                resolution_state = 'Pending'
-                OR (resolution_state = 'Failed'
-                    AND (resolution_attempted_at IS NULL
-                         OR julianday($now) - julianday(resolution_attempted_at)
-                            >= MIN($retryMinutes * POWER(2, MAX(resolution_attempts - 1, 0)) / 1440.0, 7.0)))
-                OR (resolution_state = 'Unavailable'
-                    AND resolution_attempted_at IS NOT NULL
-                    AND julianday($now) - julianday(resolution_attempted_at) >= 7.0)
-            )
-            """;
-
-        /// <inheritdoc />
-        public IReadOnlyList<string> GetPlatformsWithDueVideos(DateTimeOffset now, int retryMinutes)
-        {
-            lock (_sync)
-            {
-                using var cmd = Connection.CreateCommand();
-                // Include platforms that have sources never yet resolved (last_resolved_at IS NULL)
-                // so their first resolution pass is triggered even when all rows are already Resolved.
-                cmd.CommandText =
-                    "SELECT DISTINCT COALESCE(extractor_key, '') FROM videos WHERE " + DueNowPredicate
-                    + " UNION "
-                    + "SELECT DISTINCT COALESCE(v.extractor_key, '') FROM videos v "
-                    + "JOIN sources s ON s.url = v.source_url WHERE s.last_resolved_at IS NULL";
-                cmd.Parameters.AddWithValue("$now", now.UtcDateTime.ToString("O"));
-                cmd.Parameters.AddWithValue("$retryMinutes", retryMinutes);
+                cmd.Parameters.AddWithValue("$cutoff", fullListedAt.ToString("O"));
+                cmd.Parameters.AddWithValue("$stale", fullListedAt.Subtract(LiveExemptionMaxAge).ToString("O"));
                 using var r = cmd.ExecuteReader();
                 var list = new List<string>();
                 while (r.Read())
@@ -851,87 +705,111 @@ namespace Jellyfin.Plugin.VOD.Data
         }
 
         /// <inheritdoc />
-        public string? SelectSourceToResolve(string ieKey, DateTimeOffset now, int retryMinutes, IReadOnlySet<string>? excluded = null)
+        public void EnsureSource(string sourceUrl)
         {
             lock (_sync)
             {
+                EnsureSourceRow(sourceUrl);
+            }
+        }
+
+        /// <summary>Creates the source's row if absent. The caller holds the lock.</summary>
+        private void EnsureSourceRow(string sourceUrl)
+        {
+            using var cmd = Connection.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO sources (url) VALUES ($url) ON CONFLICT(url) DO NOTHING";
+            cmd.Parameters.AddWithValue("$url", sourceUrl);
+            cmd.ExecuteNonQuery();
+        }
+
+        /// <inheritdoc />
+        public void SetStageResult(
+            string sourceUrl, SourceStage stage, CallOutcome outcome, string? detail)
+        {
+            lock (_sync)
+            {
+                // The row is created by a listing that SUCCEEDS, and the first thing a source with
+                // a mistyped URL ever produces is a failure. Without this the UPDATE below matches
+                // nothing, the failure is dropped, and the configuration page stays blank about
+                // the one source the administrator needs explained — the silence this rework
+                // exists to end.
+                EnsureSourceRow(sourceUrl);
+
                 using var cmd = Connection.CreateCommand();
-                // A never-served source (last_resolved_at IS NULL) with NOTHING due is given a
-                // due_count of 0: it needs one free wave — no yt-dlp call, just a publication — after
-                // a listing verdict, an orphan cleanup or a probe pass changed it. A never-served
-                // source WITH due rows competes on its due count like any other: giving it the 0
-                // served every source of a fresh seeding round-robin, one wave each, so none ever
-                // settled and nothing was published.
+
+                // Five literal statements rather than one with the column prefix interpolated. The
+                // prefix would come from a switch over an enum, so interpolating it is safe by
+                // construction — but CA2100 cannot see that, and a suppression is a claim a reader
+                // has to trust where this is a claim the compiler checks.
                 //
-                // When excluded is non-empty the outer WHERE filters those source URLs out before
-                // ordering, preventing a stamped-but-still-cheapest source from being returned
-                // again after the caller has already skipped it (N2 fix).
-                var exclusionClause = string.Empty;
-                if (excluded is { Count: > 0 })
+                // The failure count is CONSECUTIVE: a success zeroes it, anything else advances it.
+                // That is what makes an intermittent failure visible as a number, with no history
+                // table — the /streams tab that failed 170 times in two days and then stopped is
+                // the case this exists for.
+                switch (stage)
                 {
-                    var paramNames = excluded.Select((_, i) => $"$ex{i}").ToList();
-                    exclusionClause = " WHERE source_url NOT IN (" + string.Join(", ", paramNames) + ")";
-                    var index = 0;
-                    foreach (var url in excluded)
-                        cmd.Parameters.AddWithValue($"$ex{index++}", url);
+                    case SourceStage.ShortListing:
+                        cmd.CommandText =
+                            "UPDATE sources SET short_listing_result = $result, short_listing_detail = $detail, "
+                            + "short_listing_failures = CASE WHEN $result = $ok THEN 0 ELSE short_listing_failures + 1 END "
+                            + "WHERE url = $url";
+                        break;
+                    case SourceStage.FullListing:
+                        cmd.CommandText =
+                            "UPDATE sources SET full_listing_result = $result, full_listing_detail = $detail, "
+                            + "full_listing_failures = CASE WHEN $result = $ok THEN 0 ELSE full_listing_failures + 1 END "
+                            + "WHERE url = $url";
+                        break;
+                    case SourceStage.Cleanup:
+                        cmd.CommandText =
+                            "UPDATE sources SET cleanup_result = $result, cleanup_detail = $detail, "
+                            + "cleanup_failures = CASE WHEN $result = $ok THEN 0 ELSE cleanup_failures + 1 END "
+                            + "WHERE url = $url";
+                        break;
+                    case SourceStage.Wave:
+                        cmd.CommandText =
+                            "UPDATE sources SET wave_result = $result, wave_detail = $detail, "
+                            + "wave_failures = CASE WHEN $result = $ok THEN 0 ELSE wave_failures + 1 END "
+                            + "WHERE url = $url";
+                        break;
+                    case SourceStage.Checkup:
+                        cmd.CommandText =
+                            "UPDATE sources SET checkup_result = $result, checkup_detail = $detail, "
+                            + "checkup_failures = CASE WHEN $result = $ok THEN 0 ELSE checkup_failures + 1 END "
+                            + "WHERE url = $url";
+                        break;
+                    default:
+                        throw new ArgumentOutOfRangeException(nameof(stage));
                 }
 
-                // The exclusionClause is composed solely of SQLite parameter names ($ex0, $ex1 …),
-                // not from user-supplied strings.  The actual URL values are bound as parameters
-                // above, so this is safe despite the CA2100 flag.
-#pragma warning disable CA2100 // SQL built from parameter names only, not from user data
-                cmd.CommandText =
-                    "SELECT source_url FROM ("
-                    + "SELECT source_url, COUNT(*) AS due_count FROM videos "
-                    + "WHERE COALESCE(extractor_key, '') = $ieKey AND " + DueNowPredicate + " "
-                    + "GROUP BY source_url "
-                    + "UNION ALL "
-                    + "SELECT DISTINCT v.source_url, 0 AS due_count FROM videos v "
-                    + "JOIN sources s ON s.url = v.source_url "
-                    + "WHERE COALESCE(v.extractor_key, '') = $ieKey AND s.last_resolved_at IS NULL "
-                    + "AND NOT EXISTS (SELECT 1 FROM videos d WHERE d.source_url = v.source_url AND "
-                    + DueNowPredicate + ")"
-                    + ")" + exclusionClause + " ORDER BY due_count ASC, source_url ASC LIMIT 1";
-#pragma warning restore CA2100
-                cmd.Parameters.AddWithValue("$ieKey", ieKey);
-                cmd.Parameters.AddWithValue("$now", now.UtcDateTime.ToString("O"));
-                cmd.Parameters.AddWithValue("$retryMinutes", retryMinutes);
-                return cmd.ExecuteScalar() as string;
-            }
-        }
-
-        /// <inheritdoc />
-        public IReadOnlyList<VideoRecord> GetDueVideos(
-            string sourceUrl, DateTimeOffset now, int retryMinutes, int limit)
-        {
-            if (limit <= 0)
-                return [];
-
-            lock (_sync)
-            {
-                using var cmd = Connection.CreateCommand();
-                cmd.CommandText =
-                    "SELECT * FROM videos WHERE source_url = $url AND " + DueNowPredicate + " "
-                    + "ORDER BY listing_position IS NULL, listing_position, id LIMIT $limit";
                 cmd.Parameters.AddWithValue("$url", sourceUrl);
-                cmd.Parameters.AddWithValue("$now", now.UtcDateTime.ToString("O"));
-                cmd.Parameters.AddWithValue("$retryMinutes", retryMinutes);
-                cmd.Parameters.AddWithValue("$limit", limit);
-                using var r = cmd.ExecuteReader();
-                var list = new List<VideoRecord>();
-                while (r.Read())
-                    list.Add(MapVideo(r));
-                return list;
+                cmd.Parameters.AddWithValue("$result", outcome.ToString());
+                cmd.Parameters.AddWithValue("$ok", nameof(CallOutcome.Ok));
+                cmd.Parameters.AddWithValue("$detail", (object?)Truncate(detail) ?? DBNull.Value);
+                cmd.ExecuteNonQuery();
             }
         }
 
         /// <inheritdoc />
-        public void SetLastResolvedAt(string sourceUrl, DateTimeOffset when)
+        public void SetListingClock(string sourceUrl, bool full, DateTimeOffset when)
         {
             lock (_sync)
             {
                 using var cmd = Connection.CreateCommand();
-                cmd.CommandText = "UPDATE sources SET last_resolved_at = $when WHERE url = $url";
+
+                // A full listing also stamps the short clock: it has just seen everything a short
+                // listing would have, so leaving the short clock behind would make the source due
+                // for a redundant listing on the very next pass.
+                if (full)
+                {
+                    cmd.CommandText =
+                        "UPDATE sources SET full_listed_at = $when, short_listed_at = $when WHERE url = $url";
+                }
+                else
+                {
+                    cmd.CommandText = "UPDATE sources SET short_listed_at = $when WHERE url = $url";
+                }
                 cmd.Parameters.AddWithValue("$url", sourceUrl);
                 cmd.Parameters.AddWithValue("$when", when.ToString("O"));
                 cmd.ExecuteNonQuery();
@@ -939,45 +817,294 @@ namespace Jellyfin.Plugin.VOD.Data
         }
 
         /// <inheritdoc />
-        public void ClearLastResolvedAt(string sourceUrl)
+        public void ClearFullListedAt(string sourceUrl)
         {
             lock (_sync)
             {
                 using var cmd = Connection.CreateCommand();
-                cmd.CommandText = "UPDATE sources SET last_resolved_at = NULL WHERE url = $url";
+                cmd.CommandText = "UPDATE sources SET full_listed_at = NULL WHERE url = $url";
                 cmd.Parameters.AddWithValue("$url", sourceUrl);
                 cmd.ExecuteNonQuery();
             }
         }
 
         /// <inheritdoc />
+        public void SetListingCount(string sourceUrl, int? count)
+        {
+            lock (_sync)
+            {
+                using var cmd = Connection.CreateCommand();
+                cmd.CommandText = "UPDATE sources SET listing_count = $count WHERE url = $url";
+                cmd.Parameters.AddWithValue("$url", sourceUrl);
+                cmd.Parameters.AddWithValue("$count", (object?)count ?? DBNull.Value);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        /// <inheritdoc />
+        public void SetConfigFingerprint(string sourceUrl, string? fingerprint)
+        {
+            lock (_sync)
+            {
+                using var cmd = Connection.CreateCommand();
+                cmd.CommandText = "UPDATE sources SET config_fingerprint = $fingerprint WHERE url = $url";
+                cmd.Parameters.AddWithValue("$url", sourceUrl);
+                cmd.Parameters.AddWithValue("$fingerprint", (object?)fingerprint ?? DBNull.Value);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        /// <inheritdoc />
+        public void SetPublishedAnchorId(string sourceUrl, Guid? anchorId)
+        {
+            lock (_sync)
+            {
+                using var cmd = Connection.CreateCommand();
+                cmd.CommandText = "UPDATE sources SET published_anchor_id = $anchorId WHERE url = $url";
+                cmd.Parameters.AddWithValue("$url", sourceUrl);
+                cmd.Parameters.AddWithValue("$anchorId", (object?)anchorId?.ToString("N") ?? DBNull.Value);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        /// <inheritdoc />
+        public void SetMetadataOutcome(
+            string videoId, CallOutcome outcome, string? detail, DateTimeOffset when, bool countFailure)
+        {
+            lock (_sync)
+            {
+                using var cmd = Connection.CreateCommand();
+
+                // The clock moves whatever the outcome: a failed fetch has still been attempted, and
+                // leaving the clock behind would have the wave pick the same video again at once.
+                // The COUNT is what the caller controls, because a rate-limit window is the
+                // platform's failure, not the video's — counting it would push every video of a
+                // source a step further out for something none of them did.
+                cmd.CommandText =
+                    "UPDATE videos SET metadata_at = $when, metadata_result = $result, "
+                    + "metadata_detail = $detail, metadata_attempts = CASE "
+                    + "  WHEN $result = $ok THEN 0 "
+                    + "  WHEN $count = 0 THEN metadata_attempts "
+                    + "  ELSE metadata_attempts + 1 END "
+                    + "WHERE id = $id";
+                cmd.Parameters.AddWithValue("$id", videoId);
+                cmd.Parameters.AddWithValue("$when", when.ToString("O"));
+                cmd.Parameters.AddWithValue("$result", outcome.ToString());
+                cmd.Parameters.AddWithValue("$ok", nameof(CallOutcome.Ok));
+                cmd.Parameters.AddWithValue("$count", countFailure ? 1 : 0);
+                cmd.Parameters.AddWithValue("$detail", (object?)Truncate(detail) ?? DBNull.Value);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        /// <inheritdoc />
+        public void SetDescribeOutcome(
+            string videoId, CallOutcome outcome, string? detail, DateTimeOffset when)
+        {
+            lock (_sync)
+            {
+                using var cmd = Connection.CreateCommand();
+                cmd.CommandText =
+                    "UPDATE videos SET described_at = $when, describe_result = $result, "
+                    + "describe_detail = $detail, describe_attempts = CASE "
+                    + "  WHEN $result IN ($ok, $none) THEN 0 ELSE describe_attempts + 1 END "
+                    + "WHERE id = $id";
+                cmd.Parameters.AddWithValue("$id", videoId);
+                cmd.Parameters.AddWithValue("$when", when.ToString("O"));
+                cmd.Parameters.AddWithValue("$result", outcome.ToString());
+                cmd.Parameters.AddWithValue("$ok", nameof(CallOutcome.Ok));
+
+                // None means "we looked, and there is nothing to describe" — no manifest, or no
+                // quality tier. Nothing failed, so nothing is counted; the clock alone is what
+                // takes the video out of the selection, and its detail says why.
+                cmd.Parameters.AddWithValue("$none", nameof(CallOutcome.None));
+                cmd.Parameters.AddWithValue("$detail", (object?)Truncate(detail) ?? DBNull.Value);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        /// <inheritdoc />
+        public void ClearDescribedAt(string videoId)
+        {
+            lock (_sync)
+            {
+                using var cmd = Connection.CreateCommand();
+                cmd.CommandText =
+                    "UPDATE videos SET described_at = NULL, describe_result = $none, "
+                    + "describe_detail = NULL, describe_attempts = 0 WHERE id = $id";
+                cmd.Parameters.AddWithValue("$id", videoId);
+                cmd.Parameters.AddWithValue("$none", nameof(CallOutcome.None));
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        /// <inheritdoc />
+        public void MarkMetadataStale(string videoId)
+        {
+            lock (_sync)
+            {
+                using var cmd = Connection.CreateCommand();
+
+                // UnixEpoch is older than any freshness window, so the wave will refetch this
+                // video. It is NOT null: Publishability requires MetadataAt non-null, and nulling
+                // it would un-publish the video at the same turn's checkup — destroying its
+                // Jellyfin item and its watch state — for the sake of a title change.
+                cmd.CommandText =
+                    "UPDATE videos SET metadata_at = $epoch WHERE id = $id";
+                cmd.Parameters.AddWithValue("$id", videoId);
+                cmd.Parameters.AddWithValue("$epoch", DateTimeOffset.UnixEpoch.ToString("O"));
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        /// <inheritdoc />
+        public IReadOnlyDictionary<CallOutcome, int> GetOutcomeCounts()
+        {
+            lock (_sync)
+            {
+                using var cmd = Connection.CreateCommand();
+                cmd.CommandText =
+                    "SELECT metadata_result, COUNT(*) FROM videos "
+                    + "WHERE metadata_result IS NOT NULL GROUP BY metadata_result";
+                using var r = cmd.ExecuteReader();
+                var counts = new Dictionary<CallOutcome, int>();
+                while (r.Read())
+                {
+                    // An unreadable value is skipped rather than folded into a neighbour: a count
+                    // that silently absorbs an unknown result is worse than a count that is short,
+                    // because the page would report a cause it cannot have observed.
+                    if (Enum.TryParse<CallOutcome>(r.GetString(0), out var outcome) && Enum.IsDefined(outcome))
+                        counts[outcome] = counts.GetValueOrDefault(outcome) + r.GetInt32(1);
+                }
+
+                return counts;
+            }
+        }
+
+        /// <inheritdoc />
+        public void ResetVideo(string videoId)
+        {
+            lock (_sync)
+            {
+                using var cmd = Connection.CreateCommand();
+
+                // Clocks AND counters, so the video is eligible on the very next wave instead of
+                // serving out a backoff that was earned under a cause the administrator has since
+                // fixed — re-exported cookies, typically. Nothing here touches YtDlpThrottle: a
+                // platform's own backoff is not ours to lift, and lifting it would restart the
+                // rate limiting.
+                cmd.CommandText = """
+                    UPDATE videos SET
+                        metadata_at       = NULL,
+                        metadata_result   = $none,
+                        metadata_detail   = NULL,
+                        metadata_attempts = 0,
+                        described_at      = NULL,
+                        describe_result   = $none,
+                        describe_detail   = NULL,
+                        describe_attempts = 0
+                    WHERE id = $id;
+                    """;
+                cmd.Parameters.AddWithValue("$id", videoId);
+                cmd.Parameters.AddWithValue("$none", nameof(CallOutcome.None));
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        /// <inheritdoc />
+        public void ResetSource(string sourceUrl)
+        {
+            lock (_sync)
+            {
+                using var txn = Connection.BeginTransaction();
+                using var cmd = Connection.CreateCommand();
+                cmd.Transaction = txn;
+
+                // The stage counters go too. Without them the manual way out the design promises
+                // would only work by half: the videos would be eligible again while the source
+                // still carried the failure count that made it look broken.
+                cmd.CommandText = """
+                    UPDATE sources SET
+                        short_listed_at        = NULL,
+                        full_listed_at         = NULL,
+                        short_listing_result   = $none,
+                        short_listing_detail   = NULL,
+                        short_listing_failures = 0,
+                        full_listing_result    = $none,
+                        full_listing_detail    = NULL,
+                        full_listing_failures  = 0,
+                        cleanup_result         = $none,
+                        cleanup_detail         = NULL,
+                        cleanup_failures       = 0,
+                        wave_result            = $none,
+                        wave_detail            = NULL,
+                        wave_failures          = 0,
+                        checkup_result         = $none,
+                        checkup_detail         = NULL,
+                        checkup_failures       = 0
+                    WHERE url = $url;
+
+                    UPDATE videos SET
+                        metadata_at       = NULL,
+                        metadata_result   = $none,
+                        metadata_detail   = NULL,
+                        metadata_attempts = 0,
+                        described_at      = NULL,
+                        describe_result   = $none,
+                        describe_detail   = NULL,
+                        describe_attempts = 0
+                    WHERE source_url = $url;
+                    """;
+                cmd.Parameters.AddWithValue("$url", sourceUrl);
+                cmd.Parameters.AddWithValue("$none", nameof(CallOutcome.None));
+                cmd.ExecuteNonQuery();
+                txn.Commit();
+            }
+        }
+
+        /// <summary>The longest detail a row keeps.</summary>
+        /// <remarks>
+        /// Long enough for the first line of any stderr yt-dlp produces, and short enough that a
+        /// pathological answer cannot bloat every row of a source.
+        /// </remarks>
+        private const int MaxDetailLength = 500;
+
+        private static string? Truncate(string? detail)
+            => detail is { Length: > MaxDetailLength } ? detail[..MaxDetailLength] : detail;
+
+        /// <inheritdoc />
         public void Dispose() => _connection?.Dispose();
 
         private static void BindVideo(SqliteCommand cmd, VideoRecord v)
         {
+            object? N(object? value) => value ?? DBNull.Value;
+
             cmd.Parameters.AddWithValue("$id", v.Id);
             cmd.Parameters.AddWithValue("$sourceUrl", v.SourceUrl);
-            cmd.Parameters.AddWithValue("$extractorKey", (object?)v.ExtractorKey ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$nativeId", (object?)v.NativeId ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$nativeId", N(v.NativeId));
+            cmd.Parameters.AddWithValue("$extractorKey", N(v.ExtractorKey));
             cmd.Parameters.AddWithValue("$videoUrl", v.VideoUrl);
-            cmd.Parameters.AddWithValue("$title", (object?)v.Title ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$publishedAt", (object?)v.PublishedAt?.ToString("O") ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$durationSeconds", (object?)v.DurationSeconds ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$seasonNumber", (object?)v.SeasonNumber ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$episodeNumber", (object?)v.EpisodeNumber ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$syncedAt", v.SyncedAt.ToString("O"));
-            cmd.Parameters.AddWithValue("$thumbnailUrl", (object?)v.ThumbnailUrl ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$title", N(v.Title));
+            cmd.Parameters.AddWithValue("$listingTitle", N(v.ListingTitle));
+            cmd.Parameters.AddWithValue("$description", N(v.Description));
+            cmd.Parameters.AddWithValue("$durationSeconds", N(v.DurationSeconds));
+            cmd.Parameters.AddWithValue("$thumbnailUrl", N(v.ThumbnailUrl));
+            cmd.Parameters.AddWithValue("$publishedAt", N(v.PublishedAt?.ToString("O")));
             cmd.Parameters.AddWithValue("$extras", SerializeExtras(v.Extras));
-            cmd.Parameters.AddWithValue("$firstSeenAt", (object?)v.FirstSeenAt?.ToString("O") ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$description", (object?)v.Description ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$liveStatus", v.LiveStatus.ToString());
-            cmd.Parameters.AddWithValue("$resolutionState", v.ResolutionState.ToString());
-            cmd.Parameters.AddWithValue(
-                "$resolutionAttemptedAt", (object?)v.ResolutionAttemptedAt?.ToString("O") ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$resolutionAttempts", v.ResolutionAttempts);
-            cmd.Parameters.AddWithValue("$resolutionError", (object?)v.ResolutionError ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$listingPosition", (object?)v.ListingPosition ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$streamDescriptions", (object?)v.StreamDescriptions ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$seasonNumber", N(v.SeasonNumber));
+            cmd.Parameters.AddWithValue("$episodeNumber", N(v.EpisodeNumber));
+            cmd.Parameters.AddWithValue("$listingPosition", N(v.ListingPosition));
+            cmd.Parameters.AddWithValue("$firstSeenAt", N(v.FirstSeenAt?.ToString("O")));
+            cmd.Parameters.AddWithValue("$listedAt", N(v.ListedAt?.ToString("O")));
+            cmd.Parameters.AddWithValue("$metadataAt", N(v.MetadataAt?.ToString("O")));
+            cmd.Parameters.AddWithValue("$metadataResult", v.MetadataResult.ToString());
+            cmd.Parameters.AddWithValue("$metadataDetail", N(Truncate(v.MetadataDetail)));
+            cmd.Parameters.AddWithValue("$metadataAttempts", v.MetadataAttempts);
+            cmd.Parameters.AddWithValue("$describedAt", N(v.DescribedAt?.ToString("O")));
+            cmd.Parameters.AddWithValue("$describeResult", v.DescribeResult.ToString());
+            cmd.Parameters.AddWithValue("$describeDetail", N(Truncate(v.DescribeDetail)));
+            cmd.Parameters.AddWithValue("$describeAttempts", v.DescribeAttempts);
         }
 
         private static SourceRecord MapSource(SqliteDataReader r)
@@ -988,48 +1115,72 @@ namespace Jellyfin.Plugin.VOD.Data
                 return r.IsDBNull(ord) ? null : r.GetString(ord);
             }
 
+            int? I(string col)
+            {
+                var ord = r.GetOrdinal(col);
+                return r.IsDBNull(ord) ? null : r.GetInt32(ord);
+            }
+
             DateTimeOffset? D(string col)
             {
                 var s = S(col);
-                return s is null ? null : DateTimeOffset.Parse(s, null, System.Globalization.DateTimeStyles.RoundtripKind);
-            }
-
-            Guid? G(string col)
-            {
-                var s = S(col);
-                return s is not null && Guid.TryParse(s, out var id) ? id : null;
-            }
-
-            // An unknown value is read as null rather than coerced to a mode: a row claiming a
-            // mode the library does not hold would suppress the very republication it needs.
-            SourceMode? M(string col)
-            {
-                var ord = r.GetOrdinal(col);
-                if (r.IsDBNull(ord))
-                    return null;
-
-                var raw = r.GetInt32(ord);
-                return Enum.IsDefined(typeof(SourceMode), raw) ? (SourceMode)raw : null;
+                return s is null
+                    ? null
+                    : DateTimeOffset.Parse(s, null, System.Globalization.DateTimeStyles.RoundtripKind);
             }
 
             return new SourceRecord
             {
                 Url = r.GetString(r.GetOrdinal("url")),
+                Key = S("source_key"),
                 Name = S("name"),
+                SeriesSynopsis = S("series_synopsis"),
                 SeriesThumbnailUrl = S("series_thumbnail_url"),
                 SeriesBannerUrl = S("series_banner_url"),
                 Tags = S("tags"),
                 PublishedImageUrl = S("published_image_url"),
                 PublishedBannerUrl = S("published_banner_url"),
-                SeriesSynopsis = S("series_synopsis"),
-                LastSyncedAt = D("last_synced_at"),
-                LastError = S("last_error"),
+                PublishedAnchorId = S("published_anchor_id") is { } anchor && Guid.TryParse(anchor, out var id)
+                    ? id
+                    : null,
+                ConfigFingerprint = S("config_fingerprint"),
                 VideoCount = r.GetInt32(r.GetOrdinal("video_count")),
-                PublishedAnchorId = G("published_anchor_id"),
-                LastResolvedAt = D("last_resolved_at"),
-                PublishedMode = M("published_mode")
+                ShortListedAt = D("short_listed_at"),
+                FullListedAt = D("full_listed_at"),
+                ListingCount = I("listing_count"),
+                ShortListingResult = ReadOutcome(S("short_listing_result")),
+                ShortListingDetail = S("short_listing_detail"),
+                ShortListingFailures = r.GetInt32(r.GetOrdinal("short_listing_failures")),
+                FullListingResult = ReadOutcome(S("full_listing_result")),
+                FullListingDetail = S("full_listing_detail"),
+                FullListingFailures = r.GetInt32(r.GetOrdinal("full_listing_failures")),
+                CleanupResult = ReadOutcome(S("cleanup_result")),
+                CleanupDetail = S("cleanup_detail"),
+                CleanupFailures = r.GetInt32(r.GetOrdinal("cleanup_failures")),
+                WaveResult = ReadOutcome(S("wave_result")),
+                WaveDetail = S("wave_detail"),
+                WaveFailures = r.GetInt32(r.GetOrdinal("wave_failures")),
+                CheckupResult = ReadOutcome(S("checkup_result")),
+                CheckupDetail = S("checkup_detail"),
+                CheckupFailures = r.GetInt32(r.GetOrdinal("checkup_failures")),
             };
         }
+
+        /// <summary>
+        /// Reads a stored outcome, answering <see cref="CallOutcome.None"/> for a value this build
+        /// does not know.
+        /// </summary>
+        /// <param name="raw">The stored text, or null.</param>
+        /// <returns>The outcome.</returns>
+        /// <remarks>
+        /// <c>None</c> rather than a guess: an unknown value means a newer build wrote it, and
+        /// reading it as "no answer yet" costs one more call, where reading it as any particular
+        /// failure would report a cause nothing observed.
+        /// </remarks>
+        private static CallOutcome ReadOutcome(string? raw)
+            => raw is not null && Enum.TryParse<CallOutcome>(raw, out var outcome) && Enum.IsDefined(outcome)
+                ? outcome
+                : CallOutcome.None;
 
         private static VideoRecord MapVideo(SqliteDataReader r)
         {
@@ -1048,44 +1199,42 @@ namespace Jellyfin.Plugin.VOD.Data
             DateTimeOffset? D(string col)
             {
                 var s = S(col);
-                return s is null ? null : DateTimeOffset.Parse(s, null, System.Globalization.DateTimeStyles.RoundtripKind);
+                return s is null
+                    ? null
+                    : DateTimeOffset.Parse(s, null, System.Globalization.DateTimeStyles.RoundtripKind);
             }
 
             return new VideoRecord
             {
                 Id = r.GetString(r.GetOrdinal("id")),
                 SourceUrl = r.GetString(r.GetOrdinal("source_url")),
-                ExtractorKey = S("extractor_key"),
                 NativeId = S("native_id"),
+                ExtractorKey = S("extractor_key"),
                 VideoUrl = r.GetString(r.GetOrdinal("video_url")),
                 Title = S("title"),
-                PublishedAt = D("published_at"),
-                DurationSeconds = I("duration_seconds"),
-                SeasonNumber = I("season_number"),
-                EpisodeNumber = I("episode_number"),
-                SyncedAt = DateTimeOffset.Parse(
-                    r.GetString(r.GetOrdinal("synced_at")), null,
-                    System.Globalization.DateTimeStyles.RoundtripKind),
-                ThumbnailUrl = S("thumbnail_url"),
-                Extras = ReadExtras(S("extras")),
-                FirstSeenAt = D("first_seen_at"),
-                PublishedImageUrl = S("published_image_url"),
+                ListingTitle = S("listing_title"),
                 Description = S("description"),
+                DurationSeconds = I("duration_seconds"),
+                ThumbnailUrl = S("thumbnail_url"),
+                PublishedImageUrl = S("published_image_url"),
+                PublishedAt = D("published_at"),
+                Extras = ReadExtras(S("extras")),
                 LiveStatus = Enum.TryParse<LiveStatus>(S("live_status"), out var ls) && Enum.IsDefined(ls)
                     ? ls
                     : LiveStatus.NotLive,
-
-                // An unparseable state means a newer build wrote it; pending is the safe reading,
-                // since it only costs one resolution and never publishes anything wrong.
-                ResolutionState =
-                    Enum.TryParse<ResolutionState>(S("resolution_state"), out var rs) && Enum.IsDefined(rs)
-                        ? rs
-                        : ResolutionState.Pending,
-                ResolutionAttemptedAt = D("resolution_attempted_at"),
-                ResolutionAttempts = r.GetInt32(r.GetOrdinal("resolution_attempts")),
-                ResolutionError = S("resolution_error"),
+                SeasonNumber = I("season_number"),
+                EpisodeNumber = I("episode_number"),
                 ListingPosition = I("listing_position"),
-                StreamDescriptions = S("stream_descriptions"),
+                FirstSeenAt = D("first_seen_at"),
+                ListedAt = D("listed_at"),
+                MetadataAt = D("metadata_at"),
+                MetadataResult = ReadOutcome(S("metadata_result")),
+                MetadataDetail = S("metadata_detail"),
+                MetadataAttempts = r.GetInt32(r.GetOrdinal("metadata_attempts")),
+                DescribedAt = D("described_at"),
+                DescribeResult = ReadOutcome(S("describe_result")),
+                DescribeDetail = S("describe_detail"),
+                DescribeAttempts = r.GetInt32(r.GetOrdinal("describe_attempts")),
             };
         }
 
@@ -1141,9 +1290,10 @@ namespace Jellyfin.Plugin.VOD.Data
         private partial void LogSchemaMigrated(int fromVersion, int toVersion);
 
         [LoggerMessage(EventId = 102, Level = LogLevel.Warning,
-            Message = "Migration v7 deleted {Dropped} duplicate video row(s): a listing had "
-                + "returned the same video twice and each repeat had been stored separately")]
-        private partial void LogDroppedDuplicateVideos(int dropped);
+            Message = "VOD database is at schema v{FromVersion} but this build knows v{KnownVersion}: "
+                + "it was written by a newer plugin, and reads may fail on columns this build does "
+                + "not know about")]
+        private partial void LogSchemaFromTheFuture(int fromVersion, int knownVersion);
 
         [LoggerMessage(EventId = 103, Level = LogLevel.Error,
             Message = "VOD database migration from schema v{FromVersion} rolled back: the schema "

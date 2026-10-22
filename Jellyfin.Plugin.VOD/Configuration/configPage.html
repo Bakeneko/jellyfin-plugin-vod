@@ -132,7 +132,7 @@
                                placeholder="5" />
                         <div class="fieldDescription">
                             How often sources are polled for a broadcast in progress. Set to 0 to disable.
-                            The sync alone cannot find a live in time: it runs per source every 720 minutes by default.
+                            A listing alone cannot find a live in time: it runs per source every 720 minutes by default.
                             The task itself wakes every 5 minutes, so any value below 5 behaves as 5.
                         </div>
                     </div>
@@ -143,34 +143,85 @@
                                is="emby-input" class="emby-input"
                                placeholder="20" />
                         <div class="fieldDescription">
-                            How fast background work may call yt-dlp for one platform — sync enumerations,
-                            resolution waves and the live probe share this budget, and two platforms advance
+                            How fast background work may call yt-dlp for one platform — listings, metadata
+                            waves and the live probe share this budget, and two platforms advance
                             independently. A started video is never held back by it.
                             Raising it risks the platform rate-limiting the whole session for up to an hour.
                         </div>
                     </div>
 
                     <div class="inputContainer">
-                        <label class="inputLabel inputLabelUnfocused" for="resolutionWaveSize">Videos resolved per wave</label>
-                        <input id="resolutionWaveSize" name="ResolutionWaveSize" type="number" min="1"
+                        <label class="inputLabel inputLabelUnfocused" for="waveSize">Videos fetched per wave</label>
+                        <input id="waveSize" name="WaveSize" type="number" min="1"
                                is="emby-input" class="emby-input"
                                placeholder="20" />
                         <div class="fieldDescription">
-                            How many unresolved videos a single wave fetches before the library is updated.
-                            Each video costs one yt-dlp call, paced by the rate-limit setting above; this is
-                            the granularity at which new videos appear — a smaller value publishes more often,
-                            a larger one covers more ground per pass.
+                            How many videos one wave fetches before the library is updated. Each video costs
+                            one yt-dlp call, paced by the rate-limit setting above; this is the granularity at
+                            which new videos appear — a smaller value publishes more often, a larger one
+                            covers more ground per turn.
                         </div>
                     </div>
 
                     <div class="inputContainer">
-                        <label class="inputLabel inputLabelUnfocused" for="resolutionRetryMinutes">Retry a failed video after (minutes)</label>
-                        <input id="resolutionRetryMinutes" name="ResolutionRetryMinutes" type="number" min="1"
+                        <label class="inputLabel inputLabelUnfocused" for="retryMinutes">Retry a failed video after (minutes)</label>
+                        <input id="retryMinutes" name="RetryMinutes" type="number" min="1"
                                is="emby-input" class="emby-input"
                                placeholder="15" />
                         <div class="fieldDescription">
                             Initial delay before a failed video is retried. The delay doubles on each
-                            consecutive failure and is capped unconditionally at seven days.
+                            consecutive failure and is capped unconditionally at seven days. A failure the
+                            platform caused — a rate limit, a timeout — does not count towards it.
+                        </div>
+                    </div>
+
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="fullListingIntervalDays">Full listing every (days)</label>
+                        <input id="fullListingIntervalDays" name="FullListingIntervalDays" type="number" min="1"
+                               is="emby-input" class="emby-input"
+                               placeholder="7" />
+                        <div class="fieldDescription">
+                            Each source is listed often (see its own interval below), but that short listing
+                            only sees the head of the list. Only a full one notices that a video was DELETED,
+                            or renamed further down — so this is how long a removal can take to reach the
+                            library. A full listing costs one request per 30 videos.
+                        </div>
+                    </div>
+
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="listingsPerPass">Sources listed per turn</label>
+                        <input id="listingsPerPass" name="ListingsPerPass" type="number" min="1"
+                               is="emby-input" class="emby-input"
+                               placeholder="10" />
+                        <div class="fieldDescription">
+                            Spreads the listing work instead of spending every source's budget at once. The
+                            most overdue sources go first, so a low value delays nothing indefinitely — the
+                            turn is just shorter and the task comes round again.
+                        </div>
+                    </div>
+
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="metadataMaxAgeDays">Refresh video metadata after (days)</label>
+                        <input id="metadataMaxAgeDays" name="MetadataMaxAgeDays" type="number" min="1"
+                               is="emby-input" class="emby-input"
+                               placeholder="30" />
+                        <div class="fieldDescription">
+                            How long a video's title, synopsis and quality list may go unrefreshed. This is
+                            also what retries a video the platform called unavailable: there is no separate
+                            rule for those any more.
+                        </div>
+                    </div>
+
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="preferredMetadataLanguage">Preferred metadata language</label>
+                        <input id="preferredMetadataLanguage" name="PreferredMetadataLanguage" type="text"
+                               is="emby-input" class="emby-input"
+                               placeholder="(leave empty for the original titles)" />
+                        <div class="fieldDescription">
+                            A language code such as <code>fr</code> or <code>de</code>, pinned when a source is
+                            listed. YouTube serves translated titles there when a channel provides them.
+                            Leave it empty to publish whatever each channel calls its original title — which is
+                            a valid choice, not a missing setting.
                         </div>
                     </div>
 
@@ -209,7 +260,7 @@
                     <p class="fieldDescription">
                         One row per channel, playlist or single-video URL. Removing a row retires
                         the source: its videos and its series are deleted from the library on the
-                        next sync. To stop syncing a source without deleting anything, clear its
+                        next pass. To stop listing a source without deleting anything, clear its
                         checkbox instead.
                     </p>
 
@@ -222,7 +273,7 @@
                                 <th style="text-align:center;padding:4px 8px">Enabled</th>
                                 <th style="text-align:left;padding:4px 8px">Retention (days)</th>
                                 <th style="text-align:left;padding:4px 8px">Max videos</th>
-                                <th style="text-align:left;padding:4px 8px">Interval (min)</th>
+                                <th style="text-align:left;padding:4px 8px">Listing interval (min)</th>
                                 <th style="text-align:left;padding:4px 8px">Description</th>
                                 <th style="text-align:left;padding:4px 8px">Status</th>
                                 <th></th>
@@ -288,71 +339,45 @@
                     '         value="' + (s.MaxVideosPerSource || 0) + '" /></td>',
                     '<td style="padding:4px 8px">',
                     '  <input class="src-interval emby-input" type="number" min="0" style="width:64px"',
-                    '         value="' + (s.SyncIntervalMinutes == null ? 720 : s.SyncIntervalMinutes) + '" /></td>',
+                    '         value="' + (s.ListingIntervalMinutes == null ? 720 : s.ListingIntervalMinutes) + '" /></td>',
                     '<td style="padding:4px 8px">',
                     '  <input class="src-description emby-input" type="text" style="width:150px"',
                     '         value="' + escAttr(s.Description) + '" /></td>',
                     '<td class="src-status" style="padding:4px 8px;font-size:90%"></td>',
                     '<td style="padding:4px 8px;white-space:nowrap">',
-                    '  <button type="button" is="emby-button" class="raised emby-button src-info">Info</button>',
+                    '  <button type="button" is="emby-button" class="raised emby-button src-detail"',
+                    '          style="margin-right:4px">Detail</button>',
                     '  <button type="button" is="emby-button" class="raised emby-button src-remove"',
-                    '          style="margin-left:4px">&#10005;</button></td>'
+                    '          >&#10005;</button></td>'
                 ].join('');
 
-                tr.querySelector('.src-info').addEventListener('click', function () {
-                    fetchSourceInfo(tr);
+                tr.querySelector('.src-detail').addEventListener('click', function () {
+                    var url = tr.querySelector('.src-url').value.trim();
+                    toggleSourceDetail(tr, url);
                 });
+
                 tr.querySelector('.src-remove').addEventListener('click', function () {
-                    // Removing a row retires the source: the next sync deletes its episodes, its
+                    // Removing a row retires the source: the next pass deletes its episodes, its
                     // series, and the watch history attached to them, which re-adding the row
                     // does not bring back. Worth one click of friction.
                     var url = tr.querySelector('.src-url').value.trim();
                     if (url && !confirm('Remove ' + url
-                            + '?\n\nOn the next sync its videos, its series and their watch '
+                            + '?\n\nOn the next pass its videos, its series and their watch '
                             + 'history will be deleted. This cannot be undone.')) {
                         return;
+                    }
+                    // Also remove the detail row, if open.
+                    var next = tr.nextElementSibling;
+                    if (next && next.classList.contains('src-detail-row')) {
+                        next.remove();
                     }
                     tr.remove();
                 });
 
                 // A row added by hand has no status yet, and only a reload would fill it.
-                tr.querySelector('.src-status').textContent = 'never synced';
+                tr.querySelector('.src-status').textContent = 'never listed';
 
                 document.getElementById('sourcesBody').appendChild(tr);
-            }
-
-            function fetchSourceInfo(tr) {
-                var url = tr.querySelector('.src-url').value.trim();
-                if (!url) {
-                    Dashboard.alert('Enter a URL first.');
-                    return;
-                }
-
-                var btn = tr.querySelector('.src-info');
-                btn.disabled = true;
-                Dashboard.showLoadingMsg();
-                ApiClient.ajax({
-                    url: ApiClient.getUrl('VOD/source-info', { url: url }),
-                    type: 'GET',
-                    dataType: 'json'
-                }).then(function (info) {
-                    btn.disabled = false;
-                    Dashboard.hideLoadingMsg();
-                    var nameInput = tr.querySelector('.src-name');
-                    if (!nameInput.value) { nameInput.value = info.Name || ''; }
-                    var descInput = tr.querySelector('.src-description');
-                    if (!descInput.value && info.Description) {
-                        descInput.value = info.Description.split('\n')[0];
-                    }
-                    if (!info.HasEntries) {
-                        Dashboard.alert('yt-dlp read this URL (' + info.DetectedType
-                            + ') but found no videos to sync.');
-                    }
-                }).catch(function () {
-                    btn.disabled = false;
-                    Dashboard.hideLoadingMsg();
-                    Dashboard.alert('yt-dlp could not read this URL. Check it, and check the plugin logs.');
-                });
             }
 
             function intervalOf(tr) {
@@ -361,8 +386,15 @@
             }
 
             function collectSources() {
-                return Array.prototype.map.call(
+                return Array.prototype.filter.call(
                     document.querySelectorAll('#sourcesBody tr'),
+                    // An open detail panel is a row of this tbody too, and it carries none of the
+                    // inputs below. Without this guard a save taken while a panel is open throws
+                    // before any request leaves the page: the admin is told saving failed, the
+                    // plugin log holds nothing because the server was never called, and every
+                    // edit typed into the form is lost.
+                    function (tr) { return tr.querySelector('.src-url') !== null; }
+                ).map(
                     function (tr) {
                         return {
                             Url: tr.querySelector('.src-url').value.trim(),
@@ -375,7 +407,7 @@
                             // here 0 means "no throttle — re-enumerate every playlist on every
                             // task run, hourly". An emptied field must fall back to the 720
                             // default, not silently disable the throttle.
-                            SyncIntervalMinutes: intervalOf(tr),
+                            ListingIntervalMinutes: intervalOf(tr),
                             Description: tr.querySelector('.src-description').value.trim()
                         };
                     }
@@ -394,6 +426,10 @@
                 return null;
             }
 
+            // Source status rows keyed by URL (lower-cased), updated each time applyStatus runs.
+            // The detail panel reads this rather than making a second call to /sources/status.
+            var _sourceStatusByUrl = Object.create(null);
+
             function applyStatus(status) {
                 var alert = document.getElementById('libraryAlert');
                 var warning = document.getElementById('libraryWarning');
@@ -408,7 +444,7 @@
                 // Set through textContent, not innerHTML: the messages carry library names the
                 // administrator typed.
                 alert.textContent = errors.length
-                    ? errors.join(' ') + ' No source can sync until this is fixed.'
+                    ? errors.join(' ') + ' No source can be published until this is fixed.'
                     : '';
                 alert.style.display = errors.length ? '' : 'none';
 
@@ -424,6 +460,13 @@
                         + c.Urls.join(' , ') + '. Give them distinct URLs.');
                 });
 
+                // Server-computed warnings: an expired cookie session, and a listing budget set to
+                // zero — which stops every listing silently, so the page is the only place it can
+                // ever be noticed.
+                (status.Warnings || []).forEach(function (w) {
+                    warnings.push(w);
+                });
+
                 warning.textContent = warnings.join(' ');
                 warning.style.display = warnings.length ? '' : 'none';
 
@@ -437,8 +480,16 @@
                 Array.prototype.forEach.call(
                     document.querySelectorAll('#sourcesBody tr'),
                     function (tr) {
+                        // An open detail panel is a row of this tbody too, and it carries none of
+                        // the inputs below. Without this guard every status refresh taken while a
+                        // panel is open throws on the first null, and the whole function — library
+                        // errors, collisions, warnings — stops half-applied.
+                        var urlInput = tr.querySelector('.src-url');
+                        if (!urlInput)
+                            return;
+
                         var cell = tr.querySelector('.src-status');
-                        var row = byUrl[tr.querySelector('.src-url').value.trim().toLowerCase()];
+                        var row = byUrl[urlInput.value.trim().toLowerCase()];
 
                         // The name the source was last published under, so each URL can be told
                         // apart at a glance. Only visible while no override is typed.
@@ -446,43 +497,30 @@
                             row && row.Name ? row.Name : '(from platform)';
 
                         if (!row) {
-                            cell.textContent = 'never synced';
+                            cell.textContent = 'never listed';
                             cell.style.color = '';
                             cell.title = '';
                             return;
                         }
-                        if (row.LastError) {
-                            // yt-dlp errors run to several hundred characters and would wreck a
-                            // ten-column table; the full text stays reachable on hover.
-                            cell.textContent = row.LastError.length > 80
-                                ? row.LastError.slice(0, 77) + '...'
-                                : row.LastError;
-                            cell.title = row.LastError;
-                            cell.style.color = '#ff8a80';
-                            return;
-                        }
-                        if (!row.LastSyncedAt) {
+                        if (!row.FullListedAt) {
                             cell.style.color = '';
                             cell.title = '';
-                            cell.textContent = 'never synced';
+                            cell.textContent = 'never listed';
                             return;
                         }
-                        // "300 videos — 280 resolved, 15 pending, 3 failed · waiting for resolution, <date>".
-                        // A source that is not settled publishes none of its new videos yet; saying
-                        // so is the point of this cell.
-                        var parts = [];
-                        if (row.Resolved) { parts.push(row.Resolved + ' resolved'); }
-                        if (row.Pending) { parts.push(row.Pending + ' pending'); }
-                        if (row.Failed) { parts.push(row.Failed + ' failed'); }
-                        if (row.Unavailable) { parts.push(row.Unavailable + ' unavailable'); }
-                        var text = row.VideoCount + ' videos';
-                        if (parts.length) { text += ' — ' + parts.join(', '); }
-                        if (!row.Settled) { text += ' · waiting for resolution'; }
-                        cell.textContent = text + ', ' + new Date(row.LastSyncedAt).toLocaleString();
-                        cell.title = row.LastResolutionError || '';
-                        cell.style.color = row.Failed ? '#ffb74d' : '';
+                        // "300 videos, listed 14/10/2026 09:12". The per-stage results and the
+                        // failure counts replace the old per-state counts, and arrive with the
+                        // source detail page.
+                        var listed = row.ShortListedAt || row.FullListedAt;
+                        cell.style.color = '';
+                        cell.title = '';
+                        cell.textContent =
+                            row.VideoCount + ' videos, listed ' + new Date(listed).toLocaleString();
                     }
                 );
+
+                // Make the stage data available to the detail panel without a second API call.
+                _sourceStatusByUrl = byUrl;
             }
 
             function refreshStatus() {
@@ -584,8 +622,12 @@
                             document.querySelector('#cacheMinutes').value      = config.CacheMinutes || 5;
                             document.querySelector('#liveProbeIntervalMinutes').value = config.LiveProbeIntervalMinutes != null ? config.LiveProbeIntervalMinutes : 5;
                             document.querySelector('#ytDlpCallsPerMinute').value = config.YtDlpCallsPerMinute != null ? config.YtDlpCallsPerMinute : 20;
-                            document.querySelector('#resolutionWaveSize').value = config.ResolutionWaveSize != null ? config.ResolutionWaveSize : 20;
-                            document.querySelector('#resolutionRetryMinutes').value = config.ResolutionRetryMinutes != null ? config.ResolutionRetryMinutes : 15;
+                            document.querySelector('#waveSize').value = config.WaveSize != null ? config.WaveSize : 20;
+                            document.querySelector('#retryMinutes').value = config.RetryMinutes != null ? config.RetryMinutes : 15;
+                            document.querySelector('#fullListingIntervalDays').value = config.FullListingIntervalDays != null ? config.FullListingIntervalDays : 7;
+                            document.querySelector('#listingsPerPass').value = config.ListingsPerPass != null ? config.ListingsPerPass : 10;
+                            document.querySelector('#metadataMaxAgeDays').value = config.MetadataMaxAgeDays != null ? config.MetadataMaxAgeDays : 30;
+                            document.querySelector('#preferredMetadataLanguage').value = config.PreferredMetadataLanguage || '';
                             document.querySelector('#preferredAudioLanguages').value =
                                 (config.PreferredAudioLanguages || []).join(', ');
                             document.querySelector('#preferredSubtitleLanguages').value =
@@ -623,10 +665,18 @@
                             config.LiveProbeIntervalMinutes = parseInt(document.querySelector('#liveProbeIntervalMinutes').value, 10) || 0;
                             var ytDlpCallsPerMinute = parseInt(document.querySelector('#ytDlpCallsPerMinute').value, 10);
                             config.YtDlpCallsPerMinute = isNaN(ytDlpCallsPerMinute) || ytDlpCallsPerMinute < 1 ? 20 : ytDlpCallsPerMinute;
-                            var resolutionWaveSize = parseInt(document.querySelector('#resolutionWaveSize').value, 10);
-                            config.ResolutionWaveSize = isNaN(resolutionWaveSize) ? 20 : resolutionWaveSize;
-                            var resolutionRetryMinutes = parseInt(document.querySelector('#resolutionRetryMinutes').value, 10);
-                            config.ResolutionRetryMinutes = isNaN(resolutionRetryMinutes) ? 15 : resolutionRetryMinutes;
+                            var waveSize = parseInt(document.querySelector('#waveSize').value, 10);
+                            config.WaveSize = isNaN(waveSize) || waveSize < 1 ? 20 : waveSize;
+                            var retryMinutes = parseInt(document.querySelector('#retryMinutes').value, 10);
+                            config.RetryMinutes = isNaN(retryMinutes) || retryMinutes < 1 ? 15 : retryMinutes;
+                            var fullListingIntervalDays = parseInt(document.querySelector('#fullListingIntervalDays').value, 10);
+                            config.FullListingIntervalDays = isNaN(fullListingIntervalDays) || fullListingIntervalDays < 1 ? 7 : fullListingIntervalDays;
+                            var listingsPerPass = parseInt(document.querySelector('#listingsPerPass').value, 10);
+                            config.ListingsPerPass = isNaN(listingsPerPass) || listingsPerPass < 1 ? 10 : listingsPerPass;
+                            var metadataMaxAgeDays = parseInt(document.querySelector('#metadataMaxAgeDays').value, 10);
+                            config.MetadataMaxAgeDays = isNaN(metadataMaxAgeDays) || metadataMaxAgeDays < 1 ? 30 : metadataMaxAgeDays;
+                            config.PreferredMetadataLanguage =
+                                document.querySelector('#preferredMetadataLanguage').value.trim();
                             config.PreferredAudioLanguages = document.querySelector('#preferredAudioLanguages').value
                                 .split(',').map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; });
                             config.PreferredSubtitleLanguages = document.querySelector('#preferredSubtitleLanguages').value
@@ -658,6 +708,275 @@
                             }
                         });
                 });
+
+            // ── Source detail panel ───────────────────────────────────────────────────────────────
+
+            // Toggle the collapsible detail row that follows a source row. Opens and populates it
+            // on first click; subsequent clicks just show/hide.
+            function toggleSourceDetail(sourceTr, url) {
+                var next = sourceTr.nextElementSibling;
+                if (next && next.classList.contains('src-detail-row')) {
+                    next.style.display = (next.style.display === 'none') ? '' : 'none';
+                    return;
+                }
+                var detailTr = document.createElement('tr');
+                detailTr.className = 'src-detail-row';
+                var td = document.createElement('td');
+                td.colSpan = 10;
+                td.style.cssText = 'padding:12px 16px;background:#1a1a1a';
+                td.textContent = 'Loading…';
+                detailTr.appendChild(td);
+                sourceTr.parentNode.insertBefore(detailTr, sourceTr.nextSibling);
+                loadSourceDetail(td, url);
+            }
+
+            // Fetch the video list for one source, then render the full detail panel.
+            function loadSourceDetail(container, url) {
+                var sourceStatus = _sourceStatusByUrl[url.toLowerCase()] || null;
+                ApiClient.ajax({
+                    url: ApiClient.getUrl('VOD/sources/detail') + '?url=' + encodeURIComponent(url),
+                    type: 'GET',
+                    dataType: 'json'
+                }).then(function (detail) {
+                    detail = detail || {};
+                    renderSourceDetail(
+                        container, detail.Videos || [], detail.TotalVideos || 0, sourceStatus, url);
+                }).catch(function () {
+                    container.textContent = 'Failed to load detail for this source.';
+                });
+            }
+
+            // Render outcome text on a container element.
+            // counter > 0 → failure (orange); counter = 0 → conclusion (default colour).
+            // The distinction matters: None with counter 0 is a normal conclusion, not an error —
+            // about 6% of YouTube videos have no HLS manifest, which is expected.
+            function appendOutcome(parent, result, counter) {
+                var span = document.createElement('span');
+                // textContent: result comes from the server enum value, but using textContent
+                // keeps this safe even if an unexpected string arrives.
+                span.textContent = result;
+                if (counter > 0) {
+                    span.style.color = '#e07050';
+                    var badge = document.createElement('span');
+                    badge.textContent = ' ×' + counter;
+                    badge.style.color = '#e07050';
+                    parent.appendChild(span);
+                    parent.appendChild(badge);
+                } else {
+                    parent.appendChild(span);
+                }
+            }
+
+            // Add one stage row to a <tbody>.
+            function appendStageRow(tbody, label, result, detail, failures) {
+                var tr = document.createElement('tr');
+
+                var tdLabel = document.createElement('td');
+                tdLabel.style.cssText = 'padding:2px 8px;white-space:nowrap;font-weight:bold';
+                tdLabel.textContent = label;
+                tr.appendChild(tdLabel);
+
+                var tdResult = document.createElement('td');
+                tdResult.style.cssText = 'padding:2px 8px;white-space:nowrap';
+                appendOutcome(tdResult, result, failures);
+                tr.appendChild(tdResult);
+
+                var tdDetail = document.createElement('td');
+                tdDetail.style.cssText = 'padding:2px 8px;font-size:85%;white-space:pre-wrap';
+                // textContent: detail comes from yt-dlp error output — untrusted, must not go
+                // through innerHTML under any circumstances.
+                tdDetail.textContent = detail || '';
+                tr.appendChild(tdDetail);
+
+                tbody.appendChild(tr);
+            }
+
+            // Add one video section (title + both triplets + reset button) to a container.
+            function appendVideoSection(parent, video, onReset) {
+                var section = document.createElement('div');
+                section.style.cssText = 'margin:6px 0;padding:6px 8px;border-left:2px solid #444';
+
+                // Header line: title and URL.
+                var header = document.createElement('div');
+                header.style.cssText = 'margin-bottom:4px;font-weight:bold';
+                // textContent: title is a channel/video name from yt-dlp — untrusted.
+                header.textContent = video.Title || video.VideoUrl;
+                section.appendChild(header);
+
+                // Numbering, broadcast state and publication date. The numbering especially: a
+                // wrong season or episode number is diagnosed by comparing the stored numbers with
+                // the publication date they were derived from, and this is the only place both are
+                // visible. Built as text, never concatenated into markup.
+                var facts = [];
+                if (video.SeasonNumber !== null && video.SeasonNumber !== undefined) {
+                    facts.push('S' + video.SeasonNumber
+                        + (video.EpisodeNumber !== null && video.EpisodeNumber !== undefined
+                            ? 'E' + video.EpisodeNumber
+                            : ''));
+                }
+
+                if (video.PublishedAt)
+                    facts.push('published ' + video.PublishedAt);
+                if (video.LiveStatus && video.LiveStatus !== 'NotLive')
+                    facts.push(video.LiveStatus);
+
+                if (facts.length) {
+                    var factLine = document.createElement('div');
+                    factLine.style.cssText = 'font-size:85%;opacity:0.75;margin-bottom:4px';
+                    factLine.textContent = facts.join(' · ');
+                    section.appendChild(factLine);
+                }
+
+                // Triplet table (metadata row + describe row).
+                var table = document.createElement('table');
+                table.style.cssText = 'font-size:85%;border-collapse:collapse;margin-bottom:4px';
+                var tbody = document.createElement('tbody');
+
+                appendStageRow(
+                    tbody,
+                    'Metadata',
+                    video.MetadataResult,
+                    video.MetadataDetail,
+                    video.MetadataAttempts);
+                appendStageRow(
+                    tbody,
+                    'Describe',
+                    video.DescribeResult,
+                    video.DescribeDetail,
+                    video.DescribeAttempts);
+
+                table.appendChild(tbody);
+                section.appendChild(table);
+
+                // Reset button for this video.
+                var btn = document.createElement('button');
+                btn.type = 'button';
+                btn.setAttribute('is', 'emby-button');
+                btn.className = 'raised emby-button';
+                btn.style.fontSize = '80%';
+                btn.textContent = 'Reset video';
+                btn.addEventListener('click', function () {
+                    btn.disabled = true;
+                    // POST /VOD/videos/{id}/reset — resets clocks and counters immediately.
+                    ApiClient.ajax({
+                        url: ApiClient.getUrl('VOD/videos/' + encodeURIComponent(video.Id) + '/reset'),
+                        type: 'POST'
+                    }).then(function () {
+                        btn.textContent = 'Reset ✓';
+                        btn.disabled = false;
+                        onReset();
+                    }).catch(function () {
+                        btn.textContent = 'Reset failed';
+                        btn.disabled = false;
+                    });
+                });
+                section.appendChild(btn);
+
+                parent.appendChild(section);
+            }
+
+            // Render the full detail panel: five stage rows + video list + source reset button.
+            function renderSourceDetail(container, videos, totalVideos, sourceStatus, sourceUrl) {
+                // Clear via textContent rather than innerHTML so no DOM element is set from
+                // user data. We immediately repopulate with createElement/textContent below.
+                while (container.firstChild) {
+                    container.removeChild(container.firstChild);
+                }
+
+                // ── Stage table ──────────────────────────────────────────────────────────────────
+
+                var stageHeading = document.createElement('div');
+                stageHeading.style.cssText = 'font-weight:bold;margin-bottom:4px';
+                stageHeading.textContent = 'Stages';
+                container.appendChild(stageHeading);
+
+                var stageTable = document.createElement('table');
+                stageTable.style.cssText = 'border-collapse:collapse;margin-bottom:12px';
+                var stageTbody = document.createElement('tbody');
+
+                if (sourceStatus) {
+                    appendStageRow(stageTbody, 'Short listing',
+                        sourceStatus.ShortListingResult, sourceStatus.ShortListingDetail, sourceStatus.ShortListingFailures);
+                    appendStageRow(stageTbody, 'Full listing',
+                        sourceStatus.FullListingResult, sourceStatus.FullListingDetail, sourceStatus.FullListingFailures);
+                    appendStageRow(stageTbody, 'Cleanup',
+                        sourceStatus.CleanupResult, sourceStatus.CleanupDetail, sourceStatus.CleanupFailures);
+                    appendStageRow(stageTbody, 'Wave',
+                        sourceStatus.WaveResult, sourceStatus.WaveDetail, sourceStatus.WaveFailures);
+                    appendStageRow(stageTbody, 'Checkup',
+                        sourceStatus.CheckupResult, sourceStatus.CheckupDetail, sourceStatus.CheckupFailures);
+                } else {
+                    var noStage = document.createElement('tr');
+                    var noStageTd = document.createElement('td');
+                    noStageTd.textContent = 'Stage data not yet loaded — save the page to refresh.';
+                    noStage.appendChild(noStageTd);
+                    stageTbody.appendChild(noStage);
+                }
+
+                stageTable.appendChild(stageTbody);
+                container.appendChild(stageTable);
+
+                // ── Video list ───────────────────────────────────────────────────────────────────
+
+                var videoHeading = document.createElement('div');
+                videoHeading.style.cssText = 'font-weight:bold;margin-bottom:4px';
+                // Says what it is NOT showing when the server capped the list. The ones needing
+                // attention come first, so a cap never hides a failure — but an admin who counts
+                // the rows and finds fewer than the source has must not conclude videos are
+                // missing from the database.
+                if (!videos.length) {
+                    videoHeading.textContent = 'No videos';
+                } else if (totalVideos > videos.length) {
+                    videoHeading.textContent = 'Videos (' + videos.length + ' of ' + totalVideos
+                        + ' shown, the ones needing attention first)';
+                } else {
+                    videoHeading.textContent = 'Videos (' + videos.length
+                        + ', the ones needing attention first)';
+                }
+
+                container.appendChild(videoHeading);
+
+                // onReset: reload the detail panel in place after a video reset.
+                function onReset() {
+                    container.textContent = 'Reloading…';
+                    loadSourceDetail(container, sourceUrl);
+                }
+
+                for (var i = 0; i < videos.length; i++) {
+                    appendVideoSection(container, videos[i], onReset);
+                }
+
+                // ── Source reset button ──────────────────────────────────────────────────────────
+
+                var resetSrcBtn = document.createElement('button');
+                resetSrcBtn.type = 'button';
+                resetSrcBtn.setAttribute('is', 'emby-button');
+                resetSrcBtn.className = 'raised emby-button';
+                resetSrcBtn.style.marginTop = '8px';
+                resetSrcBtn.textContent = 'Reset source (clears stage counters + all video backlogs)';
+                resetSrcBtn.addEventListener('click', function () {
+                    resetSrcBtn.disabled = true;
+                    // POST /VOD/sources/reset?url=... — resets stage counters AND all videos.
+                    ApiClient.ajax({
+                        url: ApiClient.getUrl('VOD/sources/reset') + '?url=' + encodeURIComponent(sourceUrl),
+                        type: 'POST'
+                    }).then(function () {
+                        container.textContent = 'Reloading…';
+
+                        // The status is refreshed FIRST, because the stage table reads the cached
+                        // status and the five stage counters going to zero are the main visible
+                        // effect of a source reset. Reloading only the video list would leave the
+                        // panel showing the counters that made the source look broken.
+                        return refreshStatus();
+                    }).then(function () {
+                        loadSourceDetail(container, sourceUrl);
+                    }).catch(function () {
+                        resetSrcBtn.textContent = 'Reset failed';
+                        resetSrcBtn.disabled = false;
+                    });
+                });
+                container.appendChild(resetSrcBtn);
+            }
         </script>
     </div>
 </body>

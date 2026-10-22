@@ -6,7 +6,9 @@ using System.Threading.Tasks;
 using Jellyfin.Plugin.VOD.Configuration;
 using Jellyfin.Plugin.VOD.Data;
 using Jellyfin.Plugin.VOD.Data.Models;
+using Jellyfin.Plugin.VOD.Services.Publication;
 using Jellyfin.Plugin.VOD.Services.Sync.Dto;
+using MediaBrowser.Model.Entities;
 using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Plugin.VOD.Services.Sync
@@ -149,7 +151,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         private readonly IVodDatabase _db;
         private readonly LibraryPublisher _publisher;
         private readonly StreamDescriber _describer;
-        private readonly VideoDescriptionStep _description;
+        private readonly StreamDescriptionStep _description;
         private readonly ILogger<LiveProbeService> _logger;
 
         /// <summary>Initializes a new instance of the <see cref="LiveProbeService"/> class.</summary>
@@ -164,7 +166,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             IVodDatabase db,
             LibraryPublisher publisher,
             StreamDescriber describer,
-            VideoDescriptionStep description,
+            StreamDescriptionStep description,
             ILogger<LiveProbeService> logger)
         {
             _ytDlp = ytDlp;
@@ -305,16 +307,14 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             var found = DeduplicateFound(outcome.Found);
 
             // Build or update a record for every video the pass found broadcasting.
-            var syncedAt = DateTimeOffset.UtcNow;
+            var now = DateTimeOffset.UtcNow;
             var existingVideos = _db.GetVideosBySource(source.Url);
 
-            // Whether the resolver still had something to wait for before this pass. Read from the
-            // same snapshot the numbering works from, so it describes the source as found.
-            var settledBefore = ResolutionService.SourceIsSettled(existingVideos);
-
-            // The day-by-day tally the sync's numbering rule works from. Advanced as numbers are
-            // handed out, so two broadcasts found in the same pass cannot both take the same rank.
-            var numberedPerDay = SyncService.NumberedPerDay(existingVideos);
+            // Descriptions this pass produced, carried to publication in memory. They are not
+            // persisted: the manifest they came from would be stale by the next pass anyway.
+            var describedStreams =
+                new Dictionary<string, IReadOnlyDictionary<string, IReadOnlyList<MediaStream>>>(
+                    StringComparer.OrdinalIgnoreCase);
 
             foreach (var meta in found)
             {
@@ -324,41 +324,37 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
                 var record = existing ?? new VideoRecord
                 {
-                    Id = Guid.NewGuid().ToString(),
+                    // Derived from the platform's id, as the listing does, so that a broadcast the
+                    // probe creates and a later listing meets again is one item with one watch
+                    // history. Drawn at random only when the platform named nothing to derive from,
+                    // which leaves nothing to be consistent with either.
+                    Id = meta.Id is { Length: > 0 } nativeId
+                        ? VodNativeId.UuidForVideo(
+                            VodNativeId.ForSource(source.Url) ?? source.Url, nativeId)
+                        : Guid.NewGuid().ToString(),
                     SourceUrl = source.Url,
                     NativeId = meta.Id,
                     ExtractorKey = meta.ExtractorKey,
                     VideoUrl = meta.WebpageUrl ?? source.Url,
-                    FirstSeenAt = syncedAt
+                    FirstSeenAt = now
                 };
 
-                var publishedAt = SyncService.ParseDate(meta);
-                var effectiveTitle = PlatformRules.TitleFor(meta) ?? meta.Id;
+                MetadataFill.Apply(record, meta, source.Url, PlatformRules.TitleFor(meta) ?? meta.Id, now);
 
-                SyncService.FillVideoRecord(record, meta, source.Url, effectiveTitle, syncedAt, publishedAt);
+                // This pass fetched the broadcast itself, so its row has fresh metadata. ListedAt
+                // moves with it, which is what keeps the cleanup's live exemption alive: the probe
+                // publishes ids no listing carries, and a sweep would otherwise take the row away
+                // mid-broadcast.
+                record.MetadataAt = now;
+                record.MetadataResult = CallOutcome.Ok;
+                record.MetadataDetail = null;
+                record.MetadataAttempts = 0;
+                record.ListedAt = now;
 
-                // This pass resolved the broadcast itself, so its row is resolved. Left pending it
-                // would be published here — the probe reconciles its own list — and then retired by
-                // the next sync, which offers the library only resolved rows.
-                record.ResolutionState = ResolutionState.Resolved;
-                record.ResolutionError = null;
-                record.ResolutionAttempts = 0;
-                record.ResolutionAttemptedAt = syncedAt;
-
-                // The sync's own rule, not a second one. An unnumbered episode is filed under
-                // Specials and renumbered by the next sync, which loses the watch state: an
-                // episode's user-data key is built from its season and episode numbers.
-                // The date-based number is only asked for when this row has none: computing it
-                // advances the day's tally as a side effect, so spending a rank on a broadcast
-                // this source already numbered pushes the next new one past the number the sync
-                // would have given it — and no later pass corrects that, because the date-based
-                // branch of AssignNumbers never overwrites a number a row already carries.
-                var dateBased = record.SeasonNumber.HasValue
-                    ? null
-                    : SyncService.NextDateBasedNumber(numberedPerDay, publishedAt);
-
-                SyncService.AssignNumbers(record, meta, effectiveTitle, dateBased);
-
+                // No numbering here. Numbers are recomputed from the whole source below, which is
+                // the one place that can see a day's full membership — the old per-row tally could
+                // only ever advance, so a broadcast took a rank the rest of its day then had to
+                // work around.
                 _db.UpsertVideo(record);
             }
 
@@ -423,42 +419,71 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                         continue;
                     }
 
-                    var refreshedTitle = PlatformRules.TitleFor(refreshed) ?? refreshed.Id;
-                    SyncService.FillVideoRecord(video, refreshed, source.Url, refreshedTitle, syncedAt, SyncService.ParseDate(refreshed));
-
-                    // This branch resolved the video too — the ex-broadcast whose stream has
-                    // ended. Left in whatever state it was read with, a migrated payload-less row
-                    // would stay pending while now carrying a payload, so the sync's skip set
-                    // would never fetch it again either.
-                    video.ResolutionState = ResolutionState.Resolved;
-                    video.ResolutionError = null;
-                    video.ResolutionAttempts = 0;
-                    video.ResolutionAttemptedAt = syncedAt;
+                    MetadataFill.Apply(
+                        video, refreshed, source.Url, PlatformRules.TitleFor(refreshed) ?? refreshed.Id, now);
+                    video.MetadataAt = now;
+                    video.MetadataResult = CallOutcome.Ok;
+                    video.MetadataDetail = null;
+                    video.MetadataAttempts = 0;
+                    video.ListedAt = now;
 
                     // Stored before describing: the describer probes through our own stream
                     // route, which reads this row and refuses it while it is still Upcoming.
                     _db.UpsertVideo(video);
 
                     // The archive is described now, while the manifest URL is fresh, rather than
-                    // on its first play. A failure here leaves the row resolved: the probe has no
+                    // on its first play. A failure here leaves the metadata alone: the probe has no
                     // retry of its own, and the playback failsafe describes it on first play.
-                    if (await DescribeEndedLiveAsync(config, source, video, refreshed.ManifestUrl, syncedAt, ct)
-                            .ConfigureAwait(false))
+                    var description = await DescribeEndedLiveAsync(
+                            config, source, video, refreshed.ManifestUrl, now, ct)
+                        .ConfigureAwait(false);
+
+                    if (description.Attempted)
                     {
-                        _db.UpsertVideo(video);
+                        _db.SetDescribeOutcome(video.Id, description.Outcome, description.Detail, now);
+                    }
+
+                    if (description.Streams is not null)
+                    {
+                        describedStreams[video.Id] = description.Streams;
                     }
                 }
             }
 
-            // The probe never runs the resolver's numbering pass, so when this pass resolved the
-            // source's last blocking row, its dated unnumbered rows wait for the resolver — which
-            // has no due row left to serve the source for. Clearing last_resolved_at gives it the
-            // same one free wave as a listing verdict or an orphan cleanup: resolve nothing,
-            // number, publish, stamp. Only on the transition, or every probe pass would hand a
-            // settled source a free wave.
             var rowsAfter = _db.GetVideosBySource(source.Url);
-            if (!settledBefore && ResolutionService.SourceIsSettled(rowsAfter))
-                _db.ClearLastResolvedAt(source.Url);
+
+            // Publishability is computed, not read: there is no state column any more. The probe
+            // applies the same predicate as the pass, on rows it has just reloaded.
+            var publishable = new List<VideoRecord>();
+            foreach (var row in rowsAfter)
+            {
+                if (Publishability.IsPublishable(row, source.RetentionDays, now))
+                    publishable.Add(row);
+            }
+
+            // Numbers are recomputed over the whole publishable set, and written back when they
+            // change. A number is no longer frozen, so the probe no longer has to avoid numbering:
+            // it just redoes the calculation the checkup would do.
+            var numbers = DateNumbering.Assign(publishable);
+            foreach (var row in publishable)
+            {
+                int? season = null;
+                int? episode = null;
+                if (numbers.TryGetValue(row.Id, out var assigned))
+                {
+                    season = assigned.Season;
+                    episode = assigned.Episode;
+                }
+
+                // Written back only when it differs. A row rewritten for an unchanged number would
+                // be one needless write per probe pass per video, every few minutes.
+                if (row.SeasonNumber == season && row.EpisodeNumber == episode)
+                    continue;
+
+                row.SeasonNumber = season;
+                row.EpisodeNumber = episode;
+                _db.UpsertVideo(row);
+            }
 
             var libraryName = LibraryRouting.NameFor(config, source.Mode);
             if (string.IsNullOrWhiteSpace(libraryName))
@@ -469,14 +494,6 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
 
             var target = _publisher.ResolveTarget(libraryName);
 
-            // The same filter as the resolver: retention, and no dated row without a number. The
-            // probe numbers the broadcasts it writes, but never runs the resolver's numbering pass,
-            // so a settled source it reaches first keeps its unnumbered rows for the resolver.
-            var publishable = ResolutionService.Publishable(
-                rowsAfter,
-                DateTimeOffset.UtcNow,
-                source.RetentionDays);
-
             var report = await _publisher.ReconcileAsync(
                     target,
                     _publisher.SweepAnchorsFor(config, source, sourceRecord),
@@ -484,28 +501,52 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                     source.Mode,
                     sourceRecord.Name!,
                     publishable,
-                    _db.GetPublishableVideoIds().ToHashSet(StringComparer.OrdinalIgnoreCase),
+                    // The same protected set the publication pass computes, from the same
+                    // rule: the global set is wider than publishability on purpose, and the
+                    // owning source's publication is what applies its retention and tier
+                    // filters. Passing the raw set here would spare the very rows the pass
+                    // retracts, so the two paths would quietly stop agreeing.
+                    Publishability.ProtectedIds(
+                        _db.GetVideoIdsWithMetadata(), rowsAfter, source.RetentionDays, now),
                     config.LocalBaseUrl,
                     config.UseReleaseDateAsDateAdded,
                     ct)
                 .ConfigureAwait(false);
 
-            // Items this reconcile created receive the description stored on their row — an
-            // archive this pass just described among them — as the resolver's publication does.
-            // Only the videos the reconcile created an item for are visited: the probe publishes
-            // every few minutes, and looking every described row up again each time would cost a
-            // library query per row for nothing. ApplyStored still skips a member that already
-            // has a video stream.
+            // Items this reconcile created receive the description this pass produced, when it
+            // produced one. Only the created ids are visited: the probe publishes every few
+            // minutes, and looking every row up again each time would cost a library query per row
+            // for nothing. ApplyDescribed still skips a member that already has a video stream.
+            //
+            // An item created WITHOUT a description in hand becomes eligible for describing again.
+            // Descriptions no longer outlive the pass that made them, so without this the item
+            // would stay undescribed until the freshness clock expired — and Jellyfin decides an
+            // undescribed tier's codec blind, which means transcoding.
             foreach (var video in publishable)
             {
-                if (report.CreatedVideoIds.Contains(video.Id) && video.StreamDescriptions is { Length: > 0 })
-                    _describer.ApplyStored(video.Id, video.StreamDescriptions, ct);
+                if (!report.CreatedVideoIds.Contains(video.Id))
+                    continue;
+
+                if (describedStreams.TryGetValue(video.Id, out var streams))
+                {
+                    _describer.ApplyDescribed(video.Id, streams, ct);
+                }
+                else if (video.DescribedAt is not null)
+                {
+                    _db.ClearDescribedAt(video.Id);
+                }
             }
         }
 
         /// <summary>Describes a broadcast the probe found ended, without ever failing its row.</summary>
-        /// <returns>Whether a description was stored on <paramref name="video"/>.</returns>
-        private async Task<bool> DescribeEndedLiveAsync(
+        /// <param name="config">The current plugin configuration.</param>
+        /// <param name="source">The source the video belongs to.</param>
+        /// <param name="video">The row, already filled and stored.</param>
+        /// <param name="manifestUrl">The HLS master the refresh named, or null.</param>
+        /// <param name="now">The reference time.</param>
+        /// <param name="ct">Cancellation token.</param>
+        /// <returns>What describing produced; never throws except on cancellation.</returns>
+        private async Task<StreamDescription> DescribeEndedLiveAsync(
             PluginConfiguration config,
             SourceDefinition source,
             VideoRecord video,
@@ -513,13 +554,19 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             DateTimeOffset now,
             CancellationToken ct)
         {
-            var before = video.StreamDescriptions;
-            string? error;
             try
             {
-                error = await _description
+                var description = await _description
                     .DescribeAsync(config, video, manifestUrl, source.RetentionDays, now, ct)
                     .ConfigureAwait(false);
+
+                // Attempted, not just "carries a detail": a conclusion carries one too — "the
+                // platform offered no HLS manifest" is the normal answer for roughly six percent of
+                // videos, and warning about it sends the admin hunting an outage that is not there.
+                if (description.Attempted && description.Detail is not null)
+                    LogDescribeFailed(video.VideoUrl, description.Detail);
+
+                return description;
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -529,16 +576,11 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             catch (Exception ex)
 #pragma warning restore CA1031
             {
-                error = "describe: " + ex.Message;
+                var detail = "describe: " + ex.Message;
+                LogDescribeFailed(video.VideoUrl, detail);
+                return new StreamDescription(
+                    CallOutcome.ProbeFailed, detail, null, Attempted: true);
             }
-
-            if (error is not null)
-            {
-                LogDescribeFailed(video.VideoUrl, error);
-                return false;
-            }
-
-            return !string.Equals(before, video.StreamDescriptions, StringComparison.Ordinal);
         }
 
         private async Task<ProbeOutcome> RunProbeAsync(

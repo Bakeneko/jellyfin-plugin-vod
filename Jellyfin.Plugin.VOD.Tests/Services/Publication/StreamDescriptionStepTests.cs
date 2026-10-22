@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using Jellyfin.Plugin.VOD.Configuration;
 using Jellyfin.Plugin.VOD.Data.Models;
 using Jellyfin.Plugin.VOD.Services;
+using Jellyfin.Plugin.VOD.Services.Publication;
 using Jellyfin.Plugin.VOD.Services.Sync;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
@@ -16,9 +17,14 @@ using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
 using Xunit;
 
-namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
+namespace Jellyfin.Plugin.VOD.Tests.Services.Publication
 {
-    public sealed class VideoDescriptionStepTests
+    /// <summary>
+    /// The description step now RETURNS its result instead of writing it onto the row. The row has
+    /// no column to put it in: describing and publishing happen in the same pass, so the dictionary
+    /// travels in memory.
+    /// </summary>
+    public sealed class StreamDescriptionStepTests
     {
         private const string Master = """
             #EXTM3U
@@ -42,7 +48,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
 
         private readonly IMediaEncoder _encoder = Substitute.For<IMediaEncoder>();
 
-        private VideoDescriptionStep Make(StubHandler handler)
+        private StreamDescriptionStep Make(StubHandler handler)
         {
             var cache = new PlaylistCache();
             var describer = new StreamDescriber(
@@ -56,7 +62,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             var factory = Substitute.For<IHttpClientFactory>();
             factory.CreateClient(Arg.Any<string>()).Returns(_ => new HttpClient(handler, disposeHandler: false));
 
-            return new VideoDescriptionStep(factory, describer);
+            return new StreamDescriptionStep(factory, describer);
         }
 
         private static VideoRecord Video(
@@ -66,7 +72,6 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 Id = "3f9a2b1c-0000-0000-0000-000000000002",
                 SourceUrl = "https://example.test/s",
                 VideoUrl = "https://example.test/v",
-                SyncedAt = DateTimeOffset.UnixEpoch,
                 LiveStatus = live,
                 PublishedAt = publishedAt ?? Now.AddDays(-1),
                 Extras = new VideoExtras
@@ -77,6 +82,46 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
 
         private static readonly PluginConfiguration Config = new() { LocalBaseUrl = "http://localhost:8096" };
 
+        /// <summary>
+        /// Nothing to describe, and nothing wrong with that. <c>Attempted</c> is what the caller
+        /// reads to decide NOT to record an outcome — a live stream or a video outside retention
+        /// must not advance a failure counter it was never a candidate for.
+        /// </summary>
+        /// <summary>
+        /// Nothing to describe, for a reason only a new metadata answer could change.
+        /// </summary>
+        /// <remarks>
+        /// <c>Conclusive</c> is the assertion that matters, and it is there to stop a loop. A video
+        /// is selected for a wave partly because it has never been described; an answer that writes
+        /// nothing would leave it due for ever, since its metadata fetch succeeds every turn and so
+        /// no backoff ever starts. The caller stamps the clock on these, and the detail says why.
+        /// </remarks>
+        private static void AssertNothingToDescribe(StreamDescription result)
+        {
+            Assert.False(result.Attempted);
+            Assert.True(result.Conclusive);
+            Assert.Equal(CallOutcome.None, result.Outcome);
+            Assert.NotNull(result.Detail);
+            Assert.Null(result.Streams);
+        }
+
+        /// <summary>
+        /// Not a candidate yet, for a reason that changes on its own.
+        /// </summary>
+        /// <remarks>
+        /// The selection query already excludes a live stream and a video outside retention, so
+        /// there is nothing to record — and recording would be wrong, since a broadcast ends and a
+        /// retention window can be widened.
+        /// </remarks>
+        private static void AssertNotYetApplicable(StreamDescription result)
+        {
+            Assert.False(result.Attempted);
+            Assert.False(result.Conclusive);
+            Assert.Equal(CallOutcome.None, result.Outcome);
+            Assert.Null(result.Detail);
+            Assert.Null(result.Streams);
+        }
+
         [Theory]
         [InlineData(null)]
         [InlineData("")]
@@ -84,10 +129,10 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         {
             var handler = new StubHandler(HttpStatusCode.OK, Master);
 
-            var error = await Make(handler).DescribeAsync(
+            var result = await Make(handler).DescribeAsync(
                 Config, Video(), manifest, 0, Now, CancellationToken.None);
 
-            Assert.Null(error);
+            AssertNothingToDescribe(result);
             Assert.Equal(0, handler.Calls);
         }
 
@@ -96,10 +141,10 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         {
             var handler = new StubHandler(HttpStatusCode.OK, Master);
 
-            var error = await Make(handler).DescribeAsync(
+            var result = await Make(handler).DescribeAsync(
                 Config, Video(live: LiveStatus.Live), "https://cdn.test/m.m3u8", 0, Now, CancellationToken.None);
 
-            Assert.Null(error);
+            AssertNotYetApplicable(result);
             Assert.Equal(0, handler.Calls);
         }
 
@@ -108,10 +153,10 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         {
             var handler = new StubHandler(HttpStatusCode.OK, Master);
 
-            var error = await Make(handler).DescribeAsync(
+            var result = await Make(handler).DescribeAsync(
                 Config, Video(withTiers: false), "https://cdn.test/m.m3u8", 0, Now, CancellationToken.None);
 
-            Assert.Null(error);
+            AssertNothingToDescribe(result);
             Assert.Equal(0, handler.Calls);
         }
 
@@ -121,11 +166,11 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             // E3: a video that will never be published is not worth 25 MB of probe per tier.
             var handler = new StubHandler(HttpStatusCode.OK, Master);
 
-            var error = await Make(handler).DescribeAsync(
+            var result = await Make(handler).DescribeAsync(
                 Config, Video(publishedAt: Now.AddDays(-40)), "https://cdn.test/m.m3u8", 30, Now,
                 CancellationToken.None);
 
-            Assert.Null(error);
+            AssertNotYetApplicable(result);
             Assert.Equal(0, handler.Calls);
         }
 
@@ -136,25 +181,26 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             // bad manifest URL from yt-dlp returns a reason instead of crashing the resolver.
             var handler = new StubHandler(HttpStatusCode.OK, Master);
 
-            var error = await Make(handler).DescribeAsync(
+            var result = await Make(handler).DescribeAsync(
                 Config, Video(), "not a valid url %%", 0, Now, CancellationToken.None);
 
-            Assert.NotNull(error);
-            Assert.StartsWith("describe:", error, StringComparison.Ordinal);
+            Assert.True(result.Attempted);
+            Assert.Equal(CallOutcome.ProbeFailed, result.Outcome);
+            Assert.StartsWith("describe:", result.Detail, StringComparison.Ordinal);
+            Assert.Null(result.Streams);
             Assert.Equal(0, handler.Calls);
         }
 
         [Fact]
         public async Task AMasterThatCannotBeFetched_IsAFailure()
         {
-            var video = Video();
+            var result = await Make(new StubHandler(HttpStatusCode.ServiceUnavailable, ""))
+                .DescribeAsync(Config, Video(), "https://cdn.test/m.m3u8", 0, Now, CancellationToken.None);
 
-            var error = await Make(new StubHandler(HttpStatusCode.ServiceUnavailable, ""))
-                .DescribeAsync(Config, video, "https://cdn.test/m.m3u8", 0, Now, CancellationToken.None);
-
-            Assert.NotNull(error);
-            Assert.Contains("503", error, StringComparison.Ordinal);
-            Assert.Null(video.StreamDescriptions);
+            Assert.True(result.Attempted);
+            Assert.Equal(CallOutcome.ProbeFailed, result.Outcome);
+            Assert.Contains("503", result.Detail, StringComparison.Ordinal);
+            Assert.Null(result.Streams);
         }
 
         [Fact]
@@ -162,32 +208,30 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         {
             _encoder.GetMediaInfo(Arg.Any<MediaInfoRequest>(), Arg.Any<CancellationToken>())
                 .Returns<Task<MediaInfo>>(_ => throw new InvalidOperationException("ffprobe died"));
-            var video = Video();
+            var result = await Make(new StubHandler(HttpStatusCode.OK, Master))
+                .DescribeAsync(Config, Video(), "https://cdn.test/m.m3u8", 0, Now, CancellationToken.None);
 
-            var error = await Make(new StubHandler(HttpStatusCode.OK, Master))
-                .DescribeAsync(Config, video, "https://cdn.test/m.m3u8", 0, Now, CancellationToken.None);
-
-            Assert.NotNull(error);
-            Assert.Null(video.StreamDescriptions);
+            Assert.True(result.Attempted);
+            Assert.Equal(CallOutcome.ProbeFailed, result.Outcome);
+            Assert.Null(result.Streams);
         }
 
         [Fact]
-        public async Task ASuccessfulDescription_IsStoredOnTheRow()
+        public async Task ASuccessfulDescription_IsReturnedPerMember()
         {
             _encoder.GetMediaInfo(Arg.Any<MediaInfoRequest>(), Arg.Any<CancellationToken>())
                 .Returns(Task.FromResult(new MediaInfo
                 {
                     MediaStreams = [new MediaStream { Type = MediaStreamType.Video, Codec = "h264", Height = 1080 }],
                 }));
-            var video = Video();
+            var result = await Make(new StubHandler(HttpStatusCode.OK, Master))
+                .DescribeAsync(Config, Video(), "https://cdn.test/m.m3u8", 0, Now, CancellationToken.None);
 
-            var error = await Make(new StubHandler(HttpStatusCode.OK, Master))
-                .DescribeAsync(Config, video, "https://cdn.test/m.m3u8", 0, Now, CancellationToken.None);
-
-            Assert.Null(error);
-            var stored = StoredStreams.Deserialize(video.StreamDescriptions)!;
-            Assert.True(stored.ContainsKey(StoredStreams.PrimaryKey));
-            Assert.True(stored.ContainsKey("1080/h264"));
+            Assert.Equal(CallOutcome.Ok, result.Outcome);
+            Assert.Null(result.Detail);
+            Assert.NotNull(result.Streams);
+            Assert.True(result.Streams.ContainsKey("primary"));
+            Assert.True(result.Streams.ContainsKey("1080/h264"));
         }
     }
 }

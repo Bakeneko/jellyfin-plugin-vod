@@ -1,3 +1,4 @@
+using System;
 using Jellyfin.Plugin.VOD.Services.Sync;
 using Xunit;
 
@@ -35,12 +36,12 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
 
         [Theory]
         [InlineData("https://www.youtube.com/@deadwattsofficiel/videos",           "youtube_ch_deadwattsofficiel")]
-        [InlineData("https://www.youtube.com/@MrBeast/videos",                     "youtube_ch_MrBeast")]
+        [InlineData("https://www.youtube.com/@MrBeast/videos",                     "youtube_ch_mrbeast")]
         [InlineData("https://youtube.com/@arte",                                   "youtube_ch_arte")]
         [InlineData("https://www.youtube.com/channel/UCwBCIWxUAT4J2MnjKGPeFMQ",   "youtube_ch_UCwBCIWxUAT4J2MnjKGPeFMQ")]
         [InlineData("https://www.youtube.com/c/artede",                            "youtube_ch_artede")]
         [InlineData("https://www.youtube.com/c/artede/videos",                     "youtube_ch_artede")]
-        [InlineData("https://www.youtube.com/user/Thinkerview",                    "youtube_ch_Thinkerview")]
+        [InlineData("https://www.youtube.com/user/Thinkerview",                    "youtube_ch_thinkerview")]
         [InlineData("https://www.youtube.com/playlist?list=PLAvUNBCqj5HGqACcp4maJDye8hznbIwhe", "youtube_pl_PLAvUNBCqj5HGqACcp4maJDye8hznbIwhe")]
         [InlineData("https://www.arte.tv/fr/videos/RC-027708/happy-valley/",       "arte_pl_RC-027708")]
         [InlineData("https://www.arte.tv/fr/videos/RC-022076/les-idees-larges/",   "arte_pl_RC-022076")]
@@ -120,6 +121,105 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             Assert.NotEqual(a, b);
         }
 
+        // ── Case folding ──────────────────────────────────────────────────────
+
+        /// <summary>
+        /// YouTube resolves handles, /c/ paths and /user/ paths case-insensitively. Without
+        /// folding, "@Arte" and "@arte" derive different series GUIDs, so each publication
+        /// renames the series and un-claims the other source's episodes indefinitely.
+        /// </summary>
+        [Theory]
+        [InlineData("https://www.youtube.com/@Arte/videos",   "https://www.youtube.com/@arte/videos")]
+        [InlineData("https://www.youtube.com/c/Foo/videos",   "https://www.youtube.com/c/foo/videos")]
+        [InlineData("https://www.youtube.com/user/Bar",       "https://www.youtube.com/user/bar")]
+        public void ForSource_FoldsCase_ForHandlesAndLegacyChannelForms(string mixedCase, string lowerCase)
+            => Assert.Equal(VodNativeId.ForSource(mixedCase), VodNativeId.ForSource(lowerCase));
+
+        /// <summary>
+        /// Channel IDs are assigned by YouTube and are case-sensitive: UCxxx and ucxxx name
+        /// distinct channels. If the key were folded, two different series would silently share
+        /// one GUID and each publication would rename and un-claim the other's episodes.
+        /// This is the most expensive possible mistake, so a dedicated test is the guard.
+        /// </summary>
+        [Fact]
+        public void ForSource_PreservesCase_ForYouTubeChannelId()
+        {
+            var upper = VodNativeId.ForSource("https://www.youtube.com/channel/UCAbCdEfGhIjKl");
+            var lower = VodNativeId.ForSource("https://www.youtube.com/channel/UCabcdefghijkl");
+            Assert.NotEqual(upper, lower);
+        }
+
+        /// <summary>
+        /// Playlist IDs are case-sensitive: PLxxx and plxxx identify distinct playlists.
+        /// Same guard as the channel ID test — silent series merges are the most expensive
+        /// possible outcome of an erroneous fold.
+        /// </summary>
+        [Fact]
+        public void ForSource_PreservesCase_ForYouTubePlaylistId()
+        {
+            var upper = VodNativeId.ForSource("https://www.youtube.com/playlist?list=PLAbCdEfGh");
+            var lower = VodNativeId.ForSource("https://www.youtube.com/playlist?list=PLAbcdefgh");
+            Assert.NotEqual(upper, lower);
+        }
+
+        // ── Unicode normalisation ──────────────────────────────────────────────
+
+        /// <summary>
+        /// NFC and NFD are two byte-level encodings of the same character. A handle stored in
+        /// one encoding or the other names the same channel, so both must produce the same key.
+        /// </summary>
+        [Fact]
+        public void ForSource_NfcAndNfdHandles_DeriveTheSameKey()
+        {
+            // "\u00E9" is U+00E9, ‘é’ in NFC (precomposed Latin small letter e with acute).
+            // "e\u0301" is its NFD decomposition: Latin small letter e (U+0065) followed by
+            // combining acute accent (U+0301). Using escape sequences rather than literal characters
+            // makes the encoding explicit and verifiable by a reader without opening a hex editor.
+            const string NfcUrl = "https://www.youtube.com/@\u00E9vasion/videos";
+            const string NfdUrl = "https://www.youtube.com/@e\u0301vasion/videos";
+            Assert.Equal(VodNativeId.ForSource(NfcUrl), VodNativeId.ForSource(NfdUrl));
+        }
+
+        // ── F2: legacy /c/ and /user/ percent-encoding ────────────────────────
+
+        /// <summary>
+        /// Before the fix, the /c/ and /user/ regexes used a character class that excluded "%",
+        /// so "/c/Art%C3%A9" was truncated to "Art" — the same defect that "@arte%C3%A9vasion"
+        /// had before v3. The corrected key must match the literal-character form of the URL
+        /// and must not be truncated at the percent-escape.
+        /// </summary>
+        [Fact]
+        public void ForSource_LegacyChannelWithPercentEncodedName_IsDecodedWhole()
+        {
+            var encoded = VodNativeId.ForSource("https://www.youtube.com/c/Art%C3%A9");
+            // "é" is 'é' NFC — the decoded form of %C3%A9.
+            var literal  = VodNativeId.ForSource("https://www.youtube.com/c/Arté");
+            Assert.NotNull(encoded);
+            Assert.NotEqual("youtube_ch_art", encoded);   // must not truncate at the escape
+            Assert.Equal(literal, encoded);               // must match the literal-character form
+        }
+
+        // ── FindCollisions after case folding ─────────────────────────────────
+
+        /// <summary>
+        /// After case folding, "@Arte" and "@arte" derive the same key. FindCollisions must
+        /// surface them as a collision so the operator learns they point at one channel, rather
+        /// than silently alternating which source owns the series on every publication pass.
+        /// </summary>
+        [Fact]
+        public void FindCollisions_ReportsCaseFoldingCollision()
+        {
+            var collisions = VodNativeId.FindCollisions(
+            [
+                "https://www.youtube.com/@Arte/videos",
+                "https://www.youtube.com/@arte/videos",
+            ]);
+
+            var only = Assert.Single(collisions);
+            Assert.Equal("youtube_ch_arte", only.Key);
+            Assert.Equal(2, only.Urls.Count);
+        }
+
         // ── IsChannel ─────────────────────────────────────────────────────────
 
         [Theory]
@@ -189,6 +289,82 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             const string MobileUrl = "https://m.twitch.tv/otplol_";
             Assert.Equal(SourceType.TwitchChannelLive, SourceTypeDetector.Detect(MobileUrl));
             Assert.Equal("twitch_ch_otplol_", VodNativeId.ForSource(MobileUrl));
+        }
+
+        /// <summary>
+        /// Twitch logins are case-insensitive at the platform level: "Riotgames" and "riotgames"
+        /// are the same channel. Without case folding, a user who copies the URL from the browser
+        /// (mixed case) and a user who types it in lowercase would end up with two separate series.
+        /// Case is folded in ForSource, not in TwitchUrls.ChannelFrom, because ChannelFrom also
+        /// drives SourceTypeDetector and PlatformRules — widening a key fix there would introduce
+        /// risk this task does not cover.
+        /// </summary>
+        [Fact]
+        public void ForSource_Twitch_FoldsChannelCase()
+        {
+            var upper = VodNativeId.ForSource("https://www.twitch.tv/Riotgames");
+            var lower = VodNativeId.ForSource("https://www.twitch.tv/riotgames");
+            Assert.Equal(upper, lower);
+            Assert.Equal("twitch_ch_riotgames", lower);
+        }
+
+        // ── UuidForVideo ──────────────────────────────────────────────────────
+        //
+        // The video uuid is what Jellyfin's watch history hangs on. GetNewItemId derives an item's
+        // GUID from "vod:{uuid}", and for a Movie that GUID is the ONLY user-data key Jellyfin
+        // writes under — Video.GetUserDataKeys inserts a provider key only for Imdb or Tmdb, and
+        // Jellyfin 12 accepts neither from this plugin. A random uuid therefore means that any
+        // video which leaves the database and comes back loses everything the viewer had done
+        // with it, silently.
+
+        [Fact]
+        public void UuidForVideo_IsReproducible()
+        {
+            // The whole point: the same source and the same platform id must produce the same uuid
+            // in a different process, on a different day, after a purge.
+            Assert.Equal(
+                VodNativeId.UuidForVideo("youtube_ch_arte", "PM6lMoClzy8"),
+                VodNativeId.UuidForVideo("youtube_ch_arte", "PM6lMoClzy8"));
+        }
+
+        [Fact]
+        public void UuidForVideo_SeparatesTheSourceFromTheNativeId()
+        {
+            // Concatenating without a separator would make ("ab", "c") and ("a", "bc") the same
+            // video, so two sources could claim one Jellyfin item and overwrite each other's.
+            Assert.NotEqual(
+                VodNativeId.UuidForVideo("ab", "c"),
+                VodNativeId.UuidForVideo("a", "bc"));
+        }
+
+        [Fact]
+        public void UuidForVideo_DistinguishesTheSource()
+        {
+            // The same platform id under two sources is a real case: a video cross-posted to two
+            // channels. They are two rows, so they must be two items.
+            Assert.NotEqual(
+                VodNativeId.UuidForVideo("youtube_ch_arte", "PM6lMoClzy8"),
+                VodNativeId.UuidForVideo("youtube_ch_other", "PM6lMoClzy8"));
+        }
+
+        [Fact]
+        public void UuidForVideo_DistinguishesTheVideo()
+        {
+            Assert.NotEqual(
+                VodNativeId.UuidForVideo("youtube_ch_arte", "PM6lMoClzy8"),
+                VodNativeId.UuidForVideo("youtube_ch_arte", "aaaaaaaaaaa"));
+        }
+
+        [Fact]
+        public void UuidForVideo_IsAWellFormedUuid()
+        {
+            // Stored as text in a TEXT primary key and published inside a provider id, so the
+            // shape has to be the one every reader expects. Version 8 is the one RFC 9562 reserves
+            // for a value derived by the application rather than drawn at random.
+            var uuid = VodNativeId.UuidForVideo("youtube_ch_arte", "PM6lMoClzy8");
+
+            Assert.Equal(uuid, Guid.Parse(uuid).ToString());
+            Assert.Equal('8', uuid[14]);
         }
     }
 }

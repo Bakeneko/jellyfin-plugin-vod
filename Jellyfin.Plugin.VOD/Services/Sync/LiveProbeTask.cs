@@ -13,7 +13,7 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
     /// </summary>
     /// <remarks>
     /// The sync cannot find a live in time: it runs per source at
-    /// <see cref="Configuration.SourceDefinition.SyncIntervalMinutes"/>, 720 minutes by default,
+    /// <see cref="Configuration.SourceDefinition.ListingIntervalMinutes"/>, 720 minutes by default,
     /// and the sync task itself only wakes once an hour. This task polls every five minutes by
     /// default and skips sources whose platform cannot answer the question, so no yt-dlp call
     /// is spent learning nothing.

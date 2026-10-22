@@ -54,6 +54,18 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
         /// </remarks>
         public bool IsUnavailable => FormatCount == 0 && LiveStatus != LiveStatus.Upcoming;
 
+        /// <summary>
+        /// Gets the platform's own word for why a video may not be playable, verbatim.
+        /// </summary>
+        /// <remarks>
+        /// yt-dlp's <c>availability</c> field: "needs_auth" for an age-restricted or members-only
+        /// video, "private", "premium_only", "subscriber_only", "public"… Measured on 2026-10-19,
+        /// where 14 of 16 failing videos on the test instance were age-restricted and this field
+        /// was the only thing that said so. Kept raw rather than mapped here: the mapping belongs
+        /// to the classifier, and a value a later yt-dlp invents must survive the trip.
+        /// </remarks>
+        public string? Availability { get; init; }
+
         /// <summary>Gets the alternative title. For Arte episodes this is the episode title.</summary>
         public string? AltTitle { get; init; }
 
@@ -228,6 +240,10 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
                     Title = root.TryGetProperty("title", out var title) ? title.GetString() : null,
                     FullTitle = root.TryGetProperty("fulltitle", out var ft) ? ft.GetString() : null,
                     AltTitle = root.TryGetProperty("alt_title", out var alt) ? alt.GetString() : null,
+                    Availability = root.TryGetProperty("availability", out var av)
+                        && av.ValueKind == JsonValueKind.String
+                            ? av.GetString()
+                            : null,
                     Description = root.TryGetProperty("description", out var desc) ? desc.GetString() : null,
                     UploadDate = root.TryGetProperty("upload_date", out var ud) ? ud.GetString() : null,
                     Timestamp = root.TryGetProperty("timestamp", out var ts) && ts.ValueKind == JsonValueKind.Number

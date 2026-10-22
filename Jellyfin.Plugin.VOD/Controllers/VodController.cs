@@ -42,6 +42,16 @@ namespace Jellyfin.Plugin.VOD.Controllers
         private readonly LibraryPublisher _publisher;
         private readonly ILogger<VodController> _logger;
 
+        /// <summary>How many videos one source's detail panel is given at most.</summary>
+        /// <remarks>
+        /// The biggest source measured on the author's instance holds 7449 videos, and the panel
+        /// renders every row it receives as a div, a two-row table and a button. Uncapped, one
+        /// click ships every video's verbatim stderr in a single response and freezes the browser.
+        /// Two hundred is far more than anyone reads and still a page the browser builds instantly;
+        /// the videos needing attention are at the top, so the cap never hides a failure.
+        /// </remarks>
+        private const int SourceDetailCap = 200;
+
         /// <summary>Initializes a new instance of the <see cref="VodController"/> class.</summary>
         /// <param name="db">The VOD database used to look up videos by UUID.</param>
         /// <param name="ytDlp">The yt-dlp service used to resolve stream URLs.</param>
@@ -268,34 +278,6 @@ namespace Jellyfin.Plugin.VOD.Controllers
         }
 
         /// <summary>
-        /// Reports what yt-dlp can tell us about a candidate source URL.
-        /// </summary>
-        /// <param name="url">The channel, playlist or video URL to inspect.</param>
-        /// <param name="cancellationToken">Cancellation token.</param>
-        /// <returns>The source description, or an error status.</returns>
-        /// <remarks>
-        /// Requires elevation: the route issues an outbound request to a URL the caller supplies,
-        /// which is an SSRF primitive if left anonymous.
-        /// </remarks>
-        [HttpGet("source-info")]
-        [Authorize(Policy = Policies.RequiresElevation)]
-        public async Task<ActionResult> GetSourceInfo(
-            [FromQuery] string? url,
-            CancellationToken cancellationToken)
-        {
-            if (!IsProbeableUrl(url))
-            {
-                return BadRequest(new { error = "url must be an absolute HTTP(S) URL" });
-            }
-
-            var info = await _ytDlp.GetSourceInfoAsync(url!, cancellationToken).ConfigureAwait(false);
-
-            return info is null
-                ? StatusCode(503, new { error = "yt-dlp could not read this URL", url })
-                : Ok(info);
-        }
-
-        /// <summary>
         /// Lists the Jellyfin libraries an administrator may publish into.
         /// </summary>
         /// <returns>Library names, sorted for display.</returns>
@@ -308,21 +290,6 @@ namespace Jellyfin.Plugin.VOD.Controllers
         [Authorize(Policy = Policies.RequiresElevation)]
         public ActionResult<IReadOnlyList<LibraryOption>> GetLibraries()
             => Ok(ProjectLibraryOptions(_libraryManager.GetVirtualFolders()));
-
-        /// <summary>
-        /// Returns whether a caller-supplied URL is safe to hand to yt-dlp.
-        /// </summary>
-        /// <param name="url">The URL the caller asked to probe.</param>
-        /// <returns>True when the URL is absolute and uses HTTP or HTTPS.</returns>
-        /// <remarks>
-        /// Anything else — a relative path, a <c>file://</c> URL, a <c>javascript:</c> URL — would
-        /// either fail noisily inside yt-dlp or reach something local that the caller should not be
-        /// able to name.
-        /// </remarks>
-        internal static bool IsProbeableUrl(string? url)
-            => !string.IsNullOrWhiteSpace(url)
-               && Uri.TryCreate(url, UriKind.Absolute, out var parsed)
-               && (parsed.Scheme == Uri.UriSchemeHttp || parsed.Scheme == Uri.UriSchemeHttps);
 
         /// <summary>
         /// Reduces Jellyfin's virtual folders to the options the configuration page offers.
@@ -379,10 +346,13 @@ namespace Jellyfin.Plugin.VOD.Controllers
                 ? []
                 : VodNativeId.FindCollisions(config.Sources.Select(s => s.Url));
 
+            var warnings = BuildWarnings(config, _db.GetOutcomeCounts());
+
             return Ok(new SourcesStatus(
                 libraries,
-                ProjectSourceStatus(_db.GetAllSources(), _db.GetResolutionSummaries()),
-                collisions));
+                ProjectSourceStatus(_db.GetAllSources()),
+                collisions,
+                warnings));
         }
 
         /// <summary>Resolves one library role live and reduces it to what the page shows.</summary>
@@ -436,24 +406,201 @@ namespace Jellyfin.Plugin.VOD.Controllers
         }
 
         /// <summary>
-        /// Reduces stored source rows and their resolution summaries to what the configuration
-        /// table displays.
+        /// Reduces stored source rows to what the configuration table displays.
         /// </summary>
         /// <param name="records">The sources the database knows about.</param>
-        /// <param name="summaries">Resolution summaries keyed by source URL; a source without rows has none.</param>
         /// <returns>One row per source, in the order the database returned them; never null.</returns>
         internal static IReadOnlyList<SourceStatus> ProjectSourceStatus(
-            IEnumerable<SourceRecord> records,
-            IReadOnlyDictionary<string, ResolutionSummary> summaries)
+            IEnumerable<SourceRecord> records)
             => records
-                .Select(r =>
-                {
-                    var s = summaries.GetValueOrDefault(r.Url) ?? new ResolutionSummary(0, 0, 0, 0, true, null);
-                    return new SourceStatus(
-                        r.Url, r.Name, r.LastSyncedAt, r.LastError, r.VideoCount,
-                        s.Resolved, s.Pending, s.Failed, s.Unavailable, s.Settled, s.LastError);
-                })
+                .Select(r => new SourceStatus(
+                    r.Url,
+                    r.Name,
+                    r.ShortListedAt,
+                    r.FullListedAt,
+                    r.VideoCount,
+                    r.ListingCount,
+                    r.ShortListingResult,
+                    r.ShortListingDetail,
+                    r.ShortListingFailures,
+                    r.FullListingResult,
+                    r.FullListingDetail,
+                    r.FullListingFailures,
+                    r.CleanupResult,
+                    r.CleanupDetail,
+                    r.CleanupFailures,
+                    r.WaveResult,
+                    r.WaveDetail,
+                    r.WaveFailures,
+                    r.CheckupResult,
+                    r.CheckupDetail,
+                    r.CheckupFailures))
                 .ToList();
+
+        /// <summary>
+        /// Reduces stored video rows to what the source detail page displays.
+        /// </summary>
+        /// <param name="records">The videos belonging to the source.</param>
+        /// <returns>One row per video, in the order the database returned them; never null.</returns>
+        internal static IReadOnlyList<VideoStatus> ProjectVideoStatus(
+            IEnumerable<VideoRecord> records)
+            => records
+                .Select(r => new VideoStatus(
+                    r.Id,
+                    r.Title,
+                    r.VideoUrl,
+                    r.LiveStatus,
+                    r.PublishedAt,
+                    r.SeasonNumber,
+                    r.EpisodeNumber,
+                    r.MetadataResult,
+                    r.MetadataDetail,
+                    r.MetadataAttempts,
+                    r.MetadataAt,
+                    r.DescribeResult,
+                    r.DescribeDetail,
+                    r.DescribeAttempts,
+                    r.DescribedAt))
+                .ToList();
+
+        /// <summary>
+        /// Reports the videos of one source, with everything that happened to each one.
+        /// </summary>
+        /// <param name="url">The source URL (query parameter).</param>
+        /// <returns>
+        /// The videos needing attention first, then the most recent, capped — with the total so the
+        /// page can say what it is leaving out. <c>404</c> when the source URL is not known.
+        /// </returns>
+        /// <remarks>
+        /// The order is the panel's whole purpose. The database returns its rows oldest publication
+        /// date first, undated ones ahead of those, so on a real channel the one video that failed
+        /// today sits below hundreds of healthy ones. A non-zero failure counter is this project's
+        /// own definition of a failure — a conclusion such as "no HLS manifest" keeps its counter at
+        /// zero and is not an error — so that counter is what sorts.
+        /// </remarks>
+        [HttpGet("sources/detail")]
+        [Authorize(Policy = Policies.RequiresElevation)]
+        public ActionResult<SourceDetail> GetSourceDetail([FromQuery] string url)
+        {
+            if (_db.GetSource(url) is null)
+                return NotFound();
+
+            var all = _db.GetVideosBySource(url);
+
+            var ordered = all
+                .OrderByDescending(r => r.MetadataAttempts + r.DescribeAttempts)
+                .ThenByDescending(r => r.PublishedAt ?? DateTimeOffset.MinValue)
+                .ThenBy(r => r.Id, StringComparer.Ordinal)
+                .Take(SourceDetailCap);
+
+            return Ok(new SourceDetail(all.Count, ProjectVideoStatus(ordered)));
+        }
+
+        /// <summary>
+        /// Resets a video's clocks and counters, making it immediately eligible for the next wave.
+        /// </summary>
+        /// <param name="id">The video UUID (primary key).</param>
+        /// <returns>
+        /// <c>204</c> on success, or <c>404</c> when the video UUID is not known.
+        /// </returns>
+        /// <remarks>
+        /// The manual exit when the external cause is known to be fixed — re-exported cookies,
+        /// typically. It never lifts the platform backoff the throttle holds: working around that
+        /// would restart the rate limiting that already hit this project. The throttle's state is
+        /// not exposed, so there is deliberately no test for this invariant — the constraint is
+        /// structural, not conditional.
+        /// </remarks>
+        [HttpPost("videos/{id}/reset")]
+        [Authorize(Policy = Policies.RequiresElevation)]
+        public ActionResult ResetVideo([FromRoute] string id)
+        {
+            // An unknown id must return 404, not a silent 200: an administrator who clicks Reset
+            // and sees nothing cannot tell "done" from "the id matched nothing".
+            if (_db.GetVideoByUuid(id) is null)
+                return NotFound(new { error = "Unknown video id", id });
+
+            _db.ResetVideo(id);
+            return NoContent();
+        }
+
+        /// <summary>
+        /// Resets a source's clocks, stage counters, and all of its videos.
+        /// </summary>
+        /// <param name="url">The source URL (primary key), as a query parameter.</param>
+        /// <returns>
+        /// <c>204</c> on success, or <c>404</c> when the source URL is not known.
+        /// </returns>
+        /// <remarks>
+        /// The stage counters go too: without them the source would still carry the failure count
+        /// that made it look broken while its videos were already eligible again. It never lifts
+        /// the platform backoff the throttle holds: working around that would restart the rate
+        /// limiting. The throttle's state is not exposed, so there is deliberately no test for
+        /// this invariant — the constraint is structural, not conditional.
+        /// </remarks>
+        [HttpPost("sources/reset")]
+        [Authorize(Policy = Policies.RequiresElevation)]
+        public ActionResult ResetSource([FromQuery] string url)
+        {
+            // An unknown URL must return 404, not a silent 200.
+            if (_db.GetSource(url) is null)
+                return NotFound(new { error = "Unknown source URL", url });
+
+            _db.ResetSource(url);
+            return NoContent();
+        }
+
+        /// <summary>
+        /// Builds the list of configuration warnings to surface on the status page.
+        /// </summary>
+        /// <param name="config">The current plugin configuration, or null when not initialised.</param>
+        /// <param name="outcomeCounts">Video counts per metadata outcome, as returned by the database.</param>
+        /// <returns>Zero or more warning messages, never null.</returns>
+        /// <remarks>
+        /// Two warnings are emitted:
+        /// <list type="bullet">
+        /// <item><description>
+        /// A NeedsAuth warning when at least one video carries <see cref="CallOutcome.NeedsAuth"/>
+        /// AND a cookies file is configured. Both conditions must hold: a single age-restricted video
+        /// on an instance with no cookies is normal, not an anomaly. On an instance that has cookies,
+        /// it means the session has expired.
+        /// </description></item>
+        /// <item><description>
+        /// A ListingsPerPass warning when the value is zero or negative. At zero nothing is ever
+        /// listed, so the library stays empty, silently. The default is 10.
+        /// </description></item>
+        /// </list>
+        /// </remarks>
+        internal static IReadOnlyList<string> BuildWarnings(
+            PluginConfiguration? config,
+            IReadOnlyDictionary<CallOutcome, int> outcomeCounts)
+        {
+            var warnings = new List<string>();
+
+            if (config is not null)
+            {
+                // Both conditions must hold: a NeedsAuth video on an instance without cookies is
+                // normal (age-restricted content). On an instance with cookies it means the session
+                // has expired and must be renewed.
+                var hasNeedsAuth = outcomeCounts.TryGetValue(CallOutcome.NeedsAuth, out var count) && count > 0;
+                var hasCookies = !string.IsNullOrEmpty(config.CookiesPath);
+                if (hasNeedsAuth && hasCookies)
+                {
+                    warnings.Add(
+                        "One or more videos require authentication. " +
+                        "The configured cookies file may have expired — re-export it from your browser.");
+                }
+
+                if (config.ListingsPerPass <= 0)
+                {
+                    warnings.Add(
+                        "ListingsPerPass is set to 0 or a negative value. " +
+                        "No source will ever be listed or refreshed until this is corrected. " +
+                        "The default value is 10.");
+                }
+            }
+
+            return warnings;
+        }
 
         /// <summary>
         /// Whether the quality selection is complete. height and codec identify one variant

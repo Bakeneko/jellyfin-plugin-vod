@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.Threading;
@@ -17,7 +18,7 @@ namespace Jellyfin.Plugin.VOD.Services
     /// playlist that carries video, audio and subtitles together; neither YouTube nor Arte still publishes
     /// a muxed progressive format, so the bare URL means video without audio.
     /// </remarks>
-    public sealed partial class YtDlpService
+    public sealed partial class YtDlpService : IYtDlpService
     {
         private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(60);
         private static readonly TimeSpan PlaylistTimeout = TimeSpan.FromMinutes(10);
@@ -104,16 +105,21 @@ namespace Jellyfin.Plugin.VOD.Services
         /// </param>
         /// <param name="cancellationToken">Cancellation token.</param>
         /// <param name="lane">
-        /// The throttle lane to spend, when it is not the URL's own platform — an administrator's
-        /// own action uses <see cref="PlatformLane.Interactive"/> so it cannot queue behind a
+        /// The throttle lane to spend, when it is not the URL's own platform — playback uses
+        /// <see cref="PlatformLane.Playback"/> so a started video cannot queue behind a
         /// platform's backoff.
+        /// </param>
+        /// <param name="metadataLanguage">
+        /// A BCP-47 prefix pinned as <c>--extractor-args "youtube:lang=XX"</c>, or null to pass
+        /// nothing.
         /// </param>
         public async Task<PlaylistInfo?> GetPlaylistEntriesAsync(
             string url,
             int? maxEntries,
             DateTimeOffset? dateAfter,
             CancellationToken cancellationToken,
-            string? lane = null)
+            string? lane = null,
+            string? metadataLanguage = null)
         {
             lane ??= PlatformLane.For(url);
 
@@ -128,22 +134,11 @@ namespace Jellyfin.Plugin.VOD.Services
             ApplyCookies(startInfo, cookies);
             ApplyJsRuntime(startInfo);
 
-            startInfo.ArgumentList.Add("--flat-playlist");
-            startInfo.ArgumentList.Add("-J");
-            if (maxEntries.HasValue)
+            foreach (var argument in BuildPlaylistArguments(
+                url, maxEntries, dateAfter, lane, metadataLanguage))
             {
-                startInfo.ArgumentList.Add("--playlist-end");
-                startInfo.ArgumentList.Add(maxEntries.Value.ToString(CultureInfo.InvariantCulture));
+                startInfo.ArgumentList.Add(argument);
             }
-
-            if (dateAfter.HasValue)
-            {
-                startInfo.ArgumentList.Add("--dateafter");
-                startInfo.ArgumentList.Add(dateAfter.Value.UtcDateTime.ToString("yyyyMMdd", CultureInfo.InvariantCulture));
-            }
-
-            startInfo.ArgumentList.Add("--no-warnings");
-            startInfo.ArgumentList.Add(url);
 
             var stdout = await RunProcessAsync(startInfo, PlaylistTimeout, cancellationToken, lane, lease)
                 .ConfigureAwait(false);
@@ -214,32 +209,27 @@ namespace Jellyfin.Plugin.VOD.Services
             var run = await RunProcessRawAsync(startInfo, Timeout, cancellationToken, lane, lease)
                 .ConfigureAwait(false);
 
-            if (run.ExitCode != 0)
+            var result = Interpret(run.ExitCode, run.Stdout, run.StdErr, run.TimedOut);
+
+            switch (result.Outcome)
             {
-                if (IndicatesChannelOffAir(run.StdErr))
-                {
+                case MetadataOutcome.ChannelOffAir:
                     LogChannelOffAir(url);
-                    return MetadataResult.ChannelOffAir;
-                }
-
-                LogResolveFailed(url, run.ExitCode, run.StdErr.Trim());
-                return MetadataResult.Failed;
+                    break;
+                case MetadataOutcome.Failed when run.ExitCode != 0:
+                    LogResolveFailed(url, run.ExitCode, run.StdErr.Trim());
+                    break;
+                case MetadataOutcome.Failed when result.Metadata is null:
+                    LogParseFailed(url, "video metadata");
+                    break;
+                case MetadataOutcome.Failed:
+                    LogUnavailable(url);
+                    break;
+                default:
+                    break;
             }
 
-            var meta = VideoMetadata.ParseJson(run.Stdout);
-            if (meta is null)
-            {
-                LogParseFailed(url, "video metadata");
-                return MetadataResult.Failed;
-            }
-
-            if (meta.IsUnavailable)
-            {
-                LogUnavailable(url);
-                return MetadataResult.Failed;
-            }
-
-            return MetadataResult.From(meta);
+            return result;
         }
 
         /// <summary>
@@ -315,43 +305,106 @@ namespace Jellyfin.Plugin.VOD.Services
         }
 
         /// <summary>
-        /// Probes a candidate source URL and reports what the configuration page needs to show.
+        /// Turns a finished yt-dlp run into a verdict, as a pure function of its outputs.
         /// </summary>
         /// <remarks>
-        /// Enumerates a single entry: enough to prove yt-dlp can read the source and to pick up its
-        /// title, description and artwork, without paying for a full channel listing every time an
-        /// administrator pastes a URL.
-        ///
-        /// Note for the caller: this inherits GetPlaylistEntriesAsync's ten-minute PlaylistTimeout.
-        /// A cold channel behind a JS runtime can genuinely take minutes, so a UI must not block on
-        /// it behind a modal with no way out.
+        /// Extracted so the verdict is testable without running a process. It is also where the
+        /// reason for a failure survives: the previous code returned the shared
+        /// <c>MetadataResult.Failed</c> singleton, which carried neither stderr nor the parsed
+        /// metadata — so <c>availability</c> never reached a caller, and 14 of 16 failing videos
+        /// on the test instance recorded nothing but the word "Failed".
         /// </remarks>
-        /// <param name="url">The channel, playlist or video URL to inspect.</param>
-        /// <param name="cancellationToken">Cancellation token.</param>
-        /// <returns>
-        /// The source description, or <see langword="null"/> when yt-dlp could not read the URL.
-        /// </returns>
-        public async Task<SourceInfo?> GetSourceInfoAsync(
-            string url,
-            CancellationToken cancellationToken)
+        /// <param name="exitCode">yt-dlp's exit code; -1 when it had to be killed.</param>
+        /// <param name="stdout">Everything it wrote to standard output.</param>
+        /// <param name="stderr">Everything it wrote to standard error.</param>
+        /// <param name="timedOut">Whether it had to be killed for taking too long.</param>
+        /// <returns>The verdict, carrying stderr and whatever metadata parsed.</returns>
+        internal static MetadataResult Interpret(
+            int exitCode, string stdout, string stderr, bool timedOut)
         {
-            ArgumentException.ThrowIfNullOrWhiteSpace(url);
+            if (timedOut)
+                return new MetadataResult(MetadataOutcome.Failed, null, stderr, TimedOut: true);
 
-            // Someone is waiting on the configuration page: this must not queue behind a
-            // platform's backoff (see PlatformLane.Interactive).
-            var playlist = await GetPlaylistEntriesAsync(
-                    url, 1, null, cancellationToken, PlatformLane.Interactive)
-                .ConfigureAwait(false);
+            if (exitCode != 0)
+            {
+                return IndicatesChannelOffAir(stderr)
+                    ? new MetadataResult(MetadataOutcome.ChannelOffAir, null, stderr)
+                    : new MetadataResult(MetadataOutcome.Failed, null, stderr);
+            }
 
-            if (playlist is null)
-                return null;
+            var meta = VideoMetadata.ParseJson(stdout);
+            if (meta is null)
+                return new MetadataResult(MetadataOutcome.Failed, null, stderr);
 
-            return new SourceInfo(
-                SeriesNaming.Resolve(url, playlist),
-                playlist.Description,
-                playlist.ThumbnailUrl,
-                SourceTypeDetector.Detect(url).ToString(),
-                playlist.Entries.Count > 0);
+            // The metadata is KEPT on this failure path. It holds `availability`, which is the
+            // only thing that distinguishes an age-restricted video from a deleted one.
+            return meta.IsUnavailable
+                ? new MetadataResult(MetadataOutcome.Failed, meta, stderr)
+                : new MetadataResult(MetadataOutcome.Succeeded, meta, stderr);
+        }
+
+        /// <summary>
+        /// The arguments a flat-playlist listing needs, as a pure function of its inputs.
+        /// </summary>
+        /// <remarks>
+        /// Extracted so it can be tested directly. The alternative — faking the process — would put
+        /// test scaffolding in production code to verify something that is a function of its
+        /// arguments and nothing else.
+        /// </remarks>
+        /// <param name="url">The playlist or channel URL, passed last as yt-dlp expects.</param>
+        /// <param name="maxEntries">
+        /// The cap, or null for no cap. Null is NOT the same as zero: a source configured with
+        /// <c>MaxVideosPerSource = 0</c> means unlimited, and passing <c>--playlist-end 0</c> would
+        /// fetch nothing at all. Callers map zero to null.
+        /// </param>
+        /// <param name="dateAfter">When set, passes <c>--dateafter YYYYMMDD</c>.</param>
+        /// <param name="lane">The platform lane, which decides whether a language may be pinned.</param>
+        /// <param name="metadataLanguage">
+        /// A BCP-47 prefix pinned as <c>--extractor-args "youtube:lang=XX"</c>, or null.
+        /// <para>
+        /// Measured on 2026-10-19: a flat listing serves the LOCALIZED title and honours this
+        /// argument, while a single-video metadata call serves the ORIGINAL and ignores it. Pinning
+        /// it makes a change detector's fingerprint deterministic — left unpinned, the language
+        /// served depends on the session and drifts, which would mark every video as changed on
+        /// every pass.
+        /// </para>
+        /// <para>
+        /// Applied on the YouTube lane only: it is a YouTube extractor argument, and this project
+        /// never carries one platform's rule to another.
+        /// </para>
+        /// </param>
+        /// <returns>The arguments, in the order yt-dlp receives them.</returns>
+        internal static IReadOnlyList<string> BuildPlaylistArguments(
+            string url,
+            int? maxEntries,
+            DateTimeOffset? dateAfter,
+            string lane,
+            string? metadataLanguage)
+        {
+            var args = new List<string> { "--flat-playlist", "-J" };
+
+            if (maxEntries.HasValue)
+            {
+                args.Add("--playlist-end");
+                args.Add(maxEntries.Value.ToString(CultureInfo.InvariantCulture));
+            }
+
+            if (dateAfter.HasValue)
+            {
+                args.Add("--dateafter");
+                args.Add(dateAfter.Value.UtcDateTime.ToString("yyyyMMdd", CultureInfo.InvariantCulture));
+            }
+
+            if (!string.IsNullOrWhiteSpace(metadataLanguage)
+                && string.Equals(lane, PlatformLane.Youtube, StringComparison.OrdinalIgnoreCase))
+            {
+                args.Add("--extractor-args");
+                args.Add($"youtube:lang={metadataLanguage}");
+            }
+
+            args.Add("--no-warnings");
+            args.Add(url);
+            return args;
         }
 
         private static ProcessStartInfo BuildBaseStartInfo() => new()
@@ -383,7 +436,8 @@ namespace Jellyfin.Plugin.VOD.Services
         }
 
         /// <summary>What one yt-dlp process left behind.</summary>
-        private readonly record struct ProcessRun(int ExitCode, string Stdout, string StdErr);
+        private readonly record struct ProcessRun(
+            int ExitCode, string Stdout, string StdErr, bool TimedOut = false);
 
         /// <summary>Runs a yt-dlp process and returns stdout, or null on non-zero exit.</summary>
         private async Task<string?> RunProcessAsync(
@@ -411,9 +465,11 @@ namespace Jellyfin.Plugin.VOD.Services
         /// </summary>
         /// <remarks>
         /// The throttle's verdict is settled here rather than at each call site: a timeout is
-        /// <b>thrown</b> from this method, not returned, and <see cref="RunProcessAsync"/> does not
-        /// hand stderr back to its callers — so two of the four background entry points could not
-        /// judge their own outcome. One place knows "exit code, stderr, timeout" and reports it.
+        /// <b>returned</b> from this method, not thrown — a rate-limited session stops answering
+        /// rather than saying so, which makes the timeout itself the signal — and
+        /// <see cref="RunProcessAsync"/> does not hand stderr back to its callers, so two of the
+        /// four background entry points could not judge their own outcome. One place knows
+        /// "exit code, stderr, timeout" and reports it.
         /// </remarks>
         private async Task<ProcessRun> RunProcessRawAsync(
             ProcessStartInfo startInfo,
@@ -441,7 +497,12 @@ namespace Jellyfin.Plugin.VOD.Services
                 // F9: a rate-limited session stops answering rather than saying so, so a timeout
                 // is a refusal on every platform and backs its lane off.
                 lease?.RateLimited();
-                throw new TimeoutException($"yt-dlp timed out after {timeout.TotalSeconds:0}s");
+
+                // Returned, not thrown. A timeout is the single most informative failure this
+                // service can report — it is how a rate limit actually manifests — and an
+                // exception reduced it to a message string that callers folded into a generic
+                // failure. The caller now sees the flag and can classify it.
+                return new ProcessRun(-1, string.Empty, string.Empty, TimedOut: true);
             }
             catch (OperationCanceledException)
             {

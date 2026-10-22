@@ -499,7 +499,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 Id = "v", SourceUrl = "s", VideoUrl = "u",
                 FirstSeenAt = DateTimeOffset.Parse(firstSeen, null, DateTimeStyles.RoundtripKind),
                 PublishedAt = DateTimeOffset.Parse(published, null, DateTimeStyles.RoundtripKind),
-                SyncedAt = DateTimeOffset.UtcNow
+                MetadataAt = DateTimeOffset.UtcNow
             };
 
             Assert.Equal(
@@ -517,33 +517,33 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             var noPublished = new VideoRecord
             {
                 Id = "v", SourceUrl = "s", VideoUrl = "u", FirstSeenAt = seen,
-                SyncedAt = new DateTimeOffset(2026, 7, 7, 0, 0, 0, TimeSpan.Zero)
+                MetadataAt = new DateTimeOffset(2026, 7, 7, 0, 0, 0, TimeSpan.Zero)
             };
 
             Assert.Equal(seen.UtcDateTime, LibraryPublisher.DateAddedFor(noPublished, true));
         }
 
         /// <summary>
-        /// SyncedAt is rewritten on every pass — SyncService assigns syncStart to it and TouchVideos
-        /// updates the column for rows it did not re-fetch — so deriving the published date from it
-        /// would move that date every pass and rewrite the item for ever. Only FirstSeenAt and
-        /// PublishedAt are set once, so only they may be read. A row with neither yields null, and
-        /// the item then keeps whatever date it already carries.
+        /// MetadataAt is rewritten on every fetch, and a 30-day freshness clock means every row is
+        /// refetched eventually — so deriving the published date from it would move that date and
+        /// rewrite the item for ever. Only FirstSeenAt and PublishedAt are set once, so only they
+        /// may be read for a NotLive row. A row with neither yields null, and the item then keeps
+        /// whatever date it already carries.
         /// </summary>
         [Fact]
-        public void DateAddedFor_IgnoresSyncedAt_SoTheValueCannotMoveBetweenPasses()
+        public void DateAddedFor_IgnoresMetadataAt_SoTheValueCannotMoveBetweenPasses()
         {
             var video = new VideoRecord
             {
                 Id = "v", SourceUrl = "s", VideoUrl = "u",
-                SyncedAt = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
+                MetadataAt = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
             };
 
             Assert.Null(LibraryPublisher.DateAddedFor(video, useReleaseDate: false));
             Assert.Null(LibraryPublisher.DateAddedFor(video, useReleaseDate: true));
 
-            // A later pass moved SyncedAt. The derived date must not have moved with it.
-            video.SyncedAt = new DateTimeOffset(2026, 12, 31, 0, 0, 0, TimeSpan.Zero);
+            // A later fetch moved MetadataAt. The derived date must not have moved with it.
+            video.MetadataAt = new DateTimeOffset(2026, 12, 31, 0, 0, 0, TimeSpan.Zero);
 
             Assert.Null(LibraryPublisher.DateAddedFor(video, useReleaseDate: false));
             Assert.Null(LibraryPublisher.DateAddedFor(video, useReleaseDate: true));
@@ -654,7 +654,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             {
                 Id = "v", SourceUrl = "s", VideoUrl = "u",
                 FirstSeenAt = new DateTimeOffset(2026, 5, 1, 2, 0, 0, TimeSpan.FromHours(2)),
-                SyncedAt = DateTimeOffset.UtcNow
+                MetadataAt = DateTimeOffset.UtcNow
             };
 
             var result = LibraryPublisher.DateAddedFor(video, false);
@@ -1087,7 +1087,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 // Always set in production (SyncService assigns syncStart), and it must be here too:
                 // a default DateTimeOffset derives a MinValue date added, which AddChild then treats
                 // as unset and replaces — the item would differ on every pass for ever.
-                SyncedAt = new DateTimeOffset(2026, 9, 28, 0, 0, 0, TimeSpan.Zero)
+                MetadataAt = new DateTimeOffset(2026, 9, 28, 0, 0, 0, TimeSpan.Zero)
             };
 
         /// <summary>
@@ -1207,6 +1207,51 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         /// published outside a scan. Without this call the studio is a name no query resolves, and
         /// its page in the client sits on a loading spinner until the next library scan.
         /// </summary>
+        /// <summary>
+        /// Jellyfin does not delete an item's played state, resume position or favourite mark when
+        /// the item goes away: it detaches those rows and keeps them ninety days, to be re-attached
+        /// to an item that returns under the same user-data key. The re-attachment normally rides on
+        /// the first metadata refresh, and nothing refreshes these items — they are virtual and this
+        /// plugin is the authority on their metadata — so the publisher has to ask for it. Without
+        /// this call a deterministic uuid buys nothing: the rows stay detached and the viewer's
+        /// history is invisible even though it is still in the database.
+        /// </summary>
+        [Fact]
+        public async Task ReconcileAsync_ReclaimsTheUserData_OfAnArrivingItem()
+        {
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000077";
+            var created = await PublishOneMovieAsync(vodId, "Youtube", null);
+
+            await _library.Received(1).ReattachUserDataAsync(
+                Arg.Is<BaseItem>(i => i.Id == created.Id), Arg.Any<CancellationToken>());
+        }
+
+        [Fact]
+        public async Task ReconcileAsync_DoesNotReclaimUserData_ForAnItemItMerelyUpdates()
+        {
+            // Asked only for an arriving item. An item already under this parent keeps the rows it
+            // already has, and calling on every sync would be a query per video per pass — 7449 of
+            // them on the biggest source measured here, for nothing.
+            const string vodId = "3f9a2b1c-0000-0000-0000-000000000078";
+            var existing = await PublishOneMovieAsync(vodId, "Youtube", null);
+            _library.ClearReceivedCalls();
+
+            _library.GetItemList(Arg.Any<InternalItemsQuery>()).Returns([existing]);
+            _library.GetItemById(existing.Id).Returns(existing);
+
+            await _publisher.ReconcileAsync(
+                StudioTarget, [],
+                new SourceRecord { Url = "https://example.com/source" },
+                SourceMode.Movies, "Test",
+                new[] { VideoWith(vodId, "Youtube", null) },
+                new HashSet<string> { vodId },
+                "http://localhost:8096", useReleaseDateAsDateAdded: false,
+                CancellationToken.None);
+
+            await _library.DidNotReceive().ReattachUserDataAsync(
+                Arg.Any<BaseItem>(), Arg.Any<CancellationToken>());
+        }
+
         [Fact]
         public async Task ReconcileAsync_CreatesTheStudioEntity()
         {
@@ -1314,7 +1359,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             {
                 Id = vodId, SourceUrl = "https://example.com/s", VideoUrl = "http://localhost:8096/stream.m3u8",
                 Title = "Ep 1", SeasonNumber = 1, EpisodeNumber = 1,
-                FirstSeenAt = DateTimeOffset.UtcNow, SyncedAt = DateTimeOffset.UtcNow
+                FirstSeenAt = DateTimeOffset.UtcNow, MetadataAt = DateTimeOffset.UtcNow
             };
 
             await _publisher.ReconcileAsync(
@@ -1566,7 +1611,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             {
                 Id = vodId, SourceUrl = "https://example.com/shell", VideoUrl = "u",
                 Title = "Ep", SeasonNumber = 1, EpisodeNumber = 1,
-                FirstSeenAt = DateTimeOffset.UtcNow, SyncedAt = DateTimeOffset.UtcNow
+                FirstSeenAt = DateTimeOffset.UtcNow, MetadataAt = DateTimeOffset.UtcNow
             };
 
             await _publisher.ReconcileAsync(
@@ -1605,7 +1650,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             {
                 Id = vodId, SourceUrl = "https://example.com/active", VideoUrl = "u",
                 Title = "Ep", SeasonNumber = 1, EpisodeNumber = 1,
-                FirstSeenAt = DateTimeOffset.UtcNow, SyncedAt = DateTimeOffset.UtcNow
+                FirstSeenAt = DateTimeOffset.UtcNow, MetadataAt = DateTimeOffset.UtcNow
             };
 
             await _publisher.ReconcileAsync(
@@ -2563,13 +2608,13 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         {
             // A live keeps living, so it must stay at the top of "recently added" and of the release
             // date sort even as other videos arrive after it started. Both therefore track the last
-            // pass that saw it live, not when it was first seen.
+            // answer we got about it, not when it was first seen.
             var lastPass = new DateTimeOffset(2026, 10, 3, 9, 30, 0, TimeSpan.Zero);
             var live = TieredVideo("3f9a2b1c-0000-0000-0000-000000000073");
             live.LiveStatus = LiveStatus.Live;
             live.FirstSeenAt = new DateTimeOffset(2026, 10, 1, 0, 0, 0, TimeSpan.Zero);
             live.PublishedAt = new DateTimeOffset(2026, 10, 1, 0, 0, 0, TimeSpan.Zero);
-            live.SyncedAt = lastPass;
+            live.MetadataAt = lastPass;
 
             Assert.Equal(lastPass.UtcDateTime, LibraryPublisher.DateAddedFor(live, useReleaseDate: false));
             Assert.Equal(lastPass.UtcDateTime, LibraryPublisher.DateAddedFor(live, useReleaseDate: true));
@@ -2585,7 +2630,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             var upcoming = TieredVideo("3f9a2b1c-0000-0000-0000-000000000074");
             upcoming.LiveStatus = LiveStatus.Upcoming;
             upcoming.PublishedAt = scheduled;
-            upcoming.SyncedAt = new DateTimeOffset(2026, 10, 3, 9, 30, 0, TimeSpan.Zero);
+            upcoming.MetadataAt = new DateTimeOffset(2026, 10, 3, 9, 30, 0, TimeSpan.Zero);
 
             Assert.Equal(scheduled.UtcDateTime, LibraryPublisher.PremiereDateFor(upcoming));
         }

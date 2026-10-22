@@ -25,8 +25,25 @@ namespace Jellyfin.Plugin.VOD.Services.Sync.Dto
     /// The result of a metadata call that may legitimately come back without metadata.
     /// </summary>
     /// <param name="Outcome">What the call concluded.</param>
-    /// <param name="Metadata">The metadata, present only when the call succeeded.</param>
-    public sealed record MetadataResult(MetadataOutcome Outcome, VideoMetadata? Metadata)
+    /// <param name="Metadata">
+    /// The metadata. Present when the call succeeded, and **also** when the platform answered but
+    /// declared the video unplayable — that answer carries
+    /// <see cref="VideoMetadata.Availability"/>, which is the only thing that tells an
+    /// age-restricted video from a deleted one.
+    /// </param>
+    /// <param name="StdErr">
+    /// Everything yt-dlp wrote to standard error, verbatim. Carried so a caller can classify the
+    /// failure instead of recording that there was one.
+    /// </param>
+    /// <param name="TimedOut">
+    /// Whether the process had to be killed. Measured: a rate-limited session stops answering
+    /// rather than saying so, which makes this the most informative failure the service reports.
+    /// </param>
+    public sealed record MetadataResult(
+        MetadataOutcome Outcome,
+        VideoMetadata? Metadata,
+        string? StdErr = null,
+        bool TimedOut = false)
     {
         /// <summary>A call that produced no answer.</summary>
         public static MetadataResult Failed { get; } = new(MetadataOutcome.Failed, null);

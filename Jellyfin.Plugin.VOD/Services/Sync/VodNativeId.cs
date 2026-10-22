@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using Jellyfin.Plugin.VOD.Services.Sync.Dto;
@@ -52,6 +53,57 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
                && sourceKey.Contains("_ch_", StringComparison.Ordinal);
 
         /// <summary>
+        /// Derives a video's primary key from the source it belongs to and the platform's own id
+        /// for it, so that the same video always gets the same uuid.
+        /// </summary>
+        /// <param name="sourceIdentity">
+        /// The source's derived key, or its URL when the URL is not a shape we recognise.
+        /// </param>
+        /// <param name="nativeId">The platform's own id for the video.</param>
+        /// <returns>A uuid in canonical text form.</returns>
+        /// <remarks>
+        /// This is what Jellyfin's watch history hangs on, and the reason it may not be random.
+        /// <c>GetNewItemId</c> derives an item's GUID from <c>"vod:{uuid}"</c>, and for a Movie that
+        /// GUID is the only key Jellyfin writes user data under: <c>Video.GetUserDataKeys</c>
+        /// inserts a provider-based key only for Imdb or Tmdb, and Jellyfin 12 accepts neither from
+        /// this plugin. Deleting an item does not delete its user data — Jellyfin detaches the rows
+        /// and keeps them 90 days — so a video that leaves the database and comes back can recover
+        /// its played state, its resume position and its favourite mark, but only if it comes back
+        /// under the same uuid. Drawn at random, every retirement and every re-listing silently
+        /// threw that away.
+        /// <para>
+        /// The source's identity rather than its raw URL, so that two spellings of one channel —
+        /// the case folding and Unicode normalisation <see cref="ForSource"/> applies — keep one
+        /// video's identity. The separator is not decorative: without it ("ab", "c") and
+        /// ("a", "bc") would be the same video, and two sources could claim one Jellyfin item.
+        /// </para>
+        /// <para>
+        /// Version 8 is what RFC 9562 reserves for a uuid an application derived rather than drew,
+        /// which is exactly what this is. SHA-256 truncated to 16 bytes: the uuid is an identity,
+        /// never a secret, and the only property asked of the hash is that two different videos do
+        /// not collide.
+        /// </para>
+        /// </remarks>
+        public static string UuidForVideo(string sourceIdentity, string nativeId)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(sourceIdentity);
+            ArgumentException.ThrowIfNullOrEmpty(nativeId);
+
+            var hash = SHA256.HashData(
+                Encoding.UTF8.GetBytes("vod-video\u0000" + sourceIdentity + "\u0000" + nativeId));
+
+            var bytes = hash.AsSpan(0, 16).ToArray();
+
+            // RFC 9562: version in the high nibble of byte 6, variant in the top two bits of byte 8.
+            bytes[6] = (byte)((bytes[6] & 0x0F) | 0x80);
+            bytes[8] = (byte)((bytes[8] & 0x3F) | 0x80);
+
+            // Big-endian: the bytes are a hash, so the layout only has to be the same everywhere,
+            // and Guid's own constructor reads the first three groups in the host's byte order.
+            return new Guid(bytes, bigEndian: true).ToString();
+        }
+
+        /// <summary>
         /// Returns the stable ID for a source (channel, playlist, or series URL),
         /// e.g. <c>"youtube_ch_deadwattsofficiel"</c> or <c>"arte_pl_RC-027708"</c>.
         /// Returns <see langword="null"/> when the URL doesn't match a known pattern.
@@ -65,14 +117,19 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             if (m.Success) return $"youtube_ch_{DecodeSegment(m.Groups[1].Value)}";
 
             // YouTube channel ID: https://www.youtube.com/channel/UCxxxxxxxx
+            // Channel IDs are assigned by YouTube and are case-sensitive: UCxxx and ucxxx name
+            // distinct channels. Folding would silently merge two series into one.
             m = YoutubeChannelIdRegex().Match(sourceUrl);
             if (m.Success) return $"youtube_ch_{m.Groups[1].Value}";
 
-            // Legacy YouTube channel forms: /c/name and /user/name
+            // Legacy YouTube channel forms: /c/name and /user/name.
+            // YouTube resolves these case-insensitively, so the same decode-and-fold that the
+            // handle form uses applies here too.
             m = YoutubeLegacyChannelRegex().Match(sourceUrl);
-            if (m.Success) return $"youtube_ch_{m.Groups[1].Value}";
+            if (m.Success) return $"youtube_ch_{DecodeSegment(m.Groups[1].Value)}";
 
             // YouTube playlist: https://www.youtube.com/playlist?list=PLxxxxxxxx
+            // Playlist IDs are case-sensitive; folding would silently merge two series into one.
             m = YoutubePlaylistRegex().Match(sourceUrl);
             if (m.Success) return $"youtube_pl_{m.Groups[1].Value}";
 
@@ -91,8 +148,11 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
             // Twitch channel: both the root and the /videos tab derive the same channel key.
             // "twitch.tv/videos", which names no channel, deliberately derives none — IsChannel
             // would otherwise be true for a URL with no channel to be named after.
+            // Case is folded here, not in TwitchUrls.ChannelFrom: ChannelFrom also drives
+            // SourceTypeDetector and PlatformRules, and widening a key-normalisation fix to type
+            // detection and live-stream recognition would introduce risk this task does not cover.
             if (TwitchUrls.ChannelFrom(sourceUrl) is { } twitchChannel)
-                return $"twitch_ch_{twitchChannel}";
+                return $"twitch_ch_{twitchChannel.ToLowerInvariant()}";
 
             return null;
         }
@@ -137,7 +197,8 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         }
 
         /// <summary>
-        /// Percent-decodes a captured URL segment and normalises it to composed form.
+        /// Percent-decodes a captured URL segment, normalises it to composed Unicode form, and
+        /// folds its case.
         /// </summary>
         /// <remarks>
         /// A handle may be any non-ASCII text, which reaches us percent-encoded. Decoding has to
@@ -146,14 +207,21 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         /// the wrong series. Composed form matters because "é" and "e"+combining-accent are
         /// different strings for the same handle.
         /// <para>
-        /// Case is deliberately NOT folded, although YouTube resolves handles case-insensitively:
-        /// folding it would change the derived key of every source whose handle carries a capital,
-        /// and the key computes the series GUID — 2143 videos would be re-created and lose their
-        /// watch state. That normalisation waits for the rework, where the data is rebuilt anyway.
+        /// Case is folded because YouTube resolves handles case-insensitively: "@Arte" and "@arte"
+        /// name the same channel, so without folding they derive different series GUIDs and each
+        /// publication renames the series and un-claims the other's episodes. <c>ToLowerInvariant</c>,
+        /// not <c>ToLower</c>: the Turkish "I" makes the result locale-dependent and would let two
+        /// servers derive different keys for the same handle. This normalisation was deferred until
+        /// the orchestration rework, where the data is purged anyway — applied earlier it would have
+        /// re-created 2143 videos and discarded their watch state.
+        /// </para>
+        /// <para>
+        /// Order: NFC normalise first, then case-fold. Folding before normalising can recompose
+        /// characters whose case the fold did not reach.
         /// </para>
         /// </remarks>
         private static string DecodeSegment(string segment)
-            => Uri.UnescapeDataString(segment).Normalize(NormalizationForm.FormC);
+            => Uri.UnescapeDataString(segment).Normalize(NormalizationForm.FormC).ToLowerInvariant();
 
         // YouTube @handle — the whole path segment, not a character class: a class stops at the
         // first character it does not list, and "%" is how every non-ASCII handle arrives.
@@ -163,7 +231,10 @@ namespace Jellyfin.Plugin.VOD.Services.Sync
         [GeneratedRegex(@"youtube\.com/channel/([A-Za-z0-9_-]+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
         private static partial Regex YoutubeChannelIdRegex();
 
-        [GeneratedRegex(@"youtube\.com/(?:c|user)/([A-Za-z0-9._-]+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+        // Legacy /c/ and /user/ forms — the whole path segment, not a character class: a class
+        // stops at the first character it does not list, and "%" is how every non-ASCII name
+        // arrives (the same defect that "@arte%C3%A9vasion" had before v3).
+        [GeneratedRegex(@"youtube\.com/(?:c|user)/([^/?#]+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
         private static partial Regex YoutubeLegacyChannelRegex();
 
         [GeneratedRegex(@"[?&]list=([A-Za-z0-9_-]+)", RegexOptions.CultureInvariant)]

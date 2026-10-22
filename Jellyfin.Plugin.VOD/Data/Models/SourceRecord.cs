@@ -1,82 +1,145 @@
 using System;
-using Jellyfin.Plugin.VOD.Configuration;
 
 namespace Jellyfin.Plugin.VOD.Data.Models
 {
-    /// <summary>A persisted sync source (channel, playlist or single-video URL).</summary>
+    /// <summary>A configured source, as the database knows it.</summary>
+    /// <remarks>
+    /// There is no field for "where this source is in its work". Everything the pass needs to
+    /// schedule is a clock or a result, so the state the old model carried has no successor.
+    /// </remarks>
     public sealed class SourceRecord
     {
-        /// <summary>Gets or sets the source URL (primary key).</summary>
+        /// <summary>
+        /// The configured URL, unchanged, as the administrator typed it. Primary key. Reaches the
+        /// platform; NEVER the identity of a series — that is <see cref="Key"/>.
+        /// </summary>
         public string Url { get; set; } = string.Empty;
 
-        /// <summary>Gets or sets the resolved display name.</summary>
+        /// <summary>
+        /// The key derived from the URL, stored so collision detection and the series lookup need
+        /// not recompute it. Null when the URL is not a shape we recognise.
+        /// </summary>
+        public string? Key { get; set; }
+
+        /// <summary>The series name the listing resolved. Published as it stands.</summary>
         public string? Name { get; set; }
 
-        /// <summary>Gets or sets the thumbnail URL for the series artwork.</summary>
-        public string? SeriesThumbnailUrl { get; set; }
+        /// <summary>The source's synopsis as the listing returned it. Published.</summary>
+        public string? SeriesSynopsis { get; set; }
 
         /// <summary>
-        /// The remote URL for the series image that was last published to Jellyfin. Compared against the
-        /// current URL to decide whether the artwork must be re-pointed; Jellyfin caches the image
-        /// locally and keeps no record of its origin.
+        /// The source's own image. Kept for information and NOT published: the series is dressed
+        /// with its newest video's still, which reads better in Jellyfin's 16:9 slots.
+        /// </summary>
+        public string? SeriesThumbnailUrl { get; set; }
+
+        /// <summary>The source's wide image, kept for the same reason as <see cref="SeriesThumbnailUrl"/>.</summary>
+        public string? SeriesBannerUrl { get; set; }
+
+        /// <summary>The source's tags, as a JSON array. Published on the series.</summary>
+        public string? Tags { get; set; }
+
+        /// <summary>
+        /// The image URL actually posted on the series, so an unchanged image is not re-pointed.
+        /// Jellyfin localises an image on first display and keeps no record of where it came from,
+        /// which makes this the only way to tell that the upstream artwork changed.
         /// </summary>
         public string? PublishedImageUrl { get; set; }
 
-        /// <summary>
-        /// The wide image for the series, shown as its Thumb. On YouTube this is the channel banner;
-        /// most sources have none.
-        /// </summary>
-        public string? SeriesBannerUrl { get; set; }
-
-        /// <summary>The banner URL last published to Jellyfin, for the same reason as
-        /// <see cref="PublishedImageUrl"/>.</summary>
+        /// <summary>The banner URL actually posted, for the same reason.</summary>
         public string? PublishedBannerUrl { get; set; }
 
-        /// <summary>The channel's tags, as a JSON array. Published on the series.</summary>
-        public string? Tags { get; set; }
-
-        /// <summary>Gets or sets the series synopsis as returned by yt-dlp.</summary>
-        public string? SeriesSynopsis { get; set; }
-
-        /// <summary>Gets or sets the UTC timestamp of the last successful sync.</summary>
-        public DateTimeOffset? LastSyncedAt { get; set; }
-
-        /// <summary>Gets or sets the error message from the last failed sync, or null when last sync succeeded.</summary>
-        public string? LastError { get; set; }
-
-        /// <summary>Gets or sets the count of videos currently synced for this source.</summary>
-        public int VideoCount { get; set; }
-
         /// <summary>
-        /// Gets or sets the id of the anchor folder this source last published into, or null when it
-        /// has never published or predates the column.
+        /// The Jellyfin folder this source last published into, or null when it never has.
         /// </summary>
         /// <remarks>
-        /// Read at the start of a sync and of a retirement, to know where else this source's items may
-        /// still be. It covers the one case the two configured libraries cannot: changing a source's
-        /// mode AND its library in the same edit leaves the old target as neither of them. Null is not
-        /// an error — the sweep then falls back to the configured libraries.
+        /// Read at retirement, to find this source's items even when its library has since left the
+        /// configuration — the one case the two configured libraries cannot cover.
         /// </remarks>
         public Guid? PublishedAnchorId { get; set; }
 
         /// <summary>
-        /// Gets or sets the mode this source last published in, or null when it has never published.
+        /// A fingerprint of the configuration the last successful checkup used. A disagreement with
+        /// the current configuration clears <see cref="FullListedAt"/>, which makes a full listing
+        /// due and so brings the source back to a checkup.
         /// </summary>
         /// <remarks>
-        /// The configuration holds the mode the administrator wants; this holds the one the library
-        /// actually reflects. A sync that finds the two disagree clears
-        /// <see cref="LastResolvedAt"/>, which is what lets the resolver select a source whose videos
-        /// are all resolved and republish them in the new shape. Without it, flipping the mode of a
-        /// settled source changes nothing in the library.
+        /// One fingerprint over every parameter, rather than one stored column per parameter: the
+        /// latter multiplies special cases, and the v3 fix that compared the published mode alone
+        /// is exactly the narrow version of this.
         /// </remarks>
-        public SourceMode? PublishedMode { get; set; }
+        public string? ConfigFingerprint { get; set; }
 
-        /// <summary>Gets or sets when this source's last resolution wave finished.</summary>
+        /// <summary>How many videos the database holds for this source. Displayed.</summary>
+        public int VideoCount { get; set; }
+
+        /// <summary>
+        /// When the last short listing succeeded. The scheduling clock: it is compared against the
+        /// source's own listing interval.
+        /// </summary>
+        public DateTimeOffset? ShortListedAt { get; set; }
+
+        /// <summary>
+        /// When the last full listing succeeded. Null means no listing has ever run, and a first
+        /// listing is always full — on an empty source every short entry would be unknown and would
+        /// escalate to a full one anyway.
+        /// </summary>
+        public DateTimeOffset? FullListedAt { get; set; }
+
+        /// <summary>
+        /// The last <c>playlist_count</c> the platform reported, where it reports one at all.
+        /// </summary>
         /// <remarks>
-        /// Diagnostic only — the status shown on the configuration page, and the logs. The order
-        /// sources are served in is derived from how many videos each has due, so the scheduler
-        /// keeps no persistent state of its own.
+        /// Only playlists return it; a channel does not. It is a better detector than a title,
+        /// because a count that drops reveals a DELETION, which a glance at the head of the
+        /// listing cannot see. Null must stay null and never become zero: the cleanup treats zero
+        /// entries as a platform failure, not as an emptied source.
         /// </remarks>
-        public DateTimeOffset? LastResolvedAt { get; set; }
+        public int? ListingCount { get; set; }
+
+        /// <summary>The result of the last short listing.</summary>
+        public CallOutcome ShortListingResult { get; set; }
+
+        /// <summary>Why the last short listing ended as it did, in plain text.</summary>
+        public string? ShortListingDetail { get; set; }
+
+        /// <summary>Consecutive short-listing failures. Reset to zero by a success.</summary>
+        public int ShortListingFailures { get; set; }
+
+        /// <summary>The result of the last full listing.</summary>
+        public CallOutcome FullListingResult { get; set; }
+
+        /// <summary>Why the last full listing ended as it did, in plain text.</summary>
+        public string? FullListingDetail { get; set; }
+
+        /// <summary>Consecutive full-listing failures. Reset to zero by a success.</summary>
+        public int FullListingFailures { get; set; }
+
+        /// <summary>The result of the last cleanup.</summary>
+        public CallOutcome CleanupResult { get; set; }
+
+        /// <summary>Why the last cleanup ended as it did, in plain text.</summary>
+        public string? CleanupDetail { get; set; }
+
+        /// <summary>Consecutive cleanup failures. Reset to zero by a success.</summary>
+        public int CleanupFailures { get; set; }
+
+        /// <summary>The result of the last wave.</summary>
+        public CallOutcome WaveResult { get; set; }
+
+        /// <summary>Why the last wave ended as it did, in plain text.</summary>
+        public string? WaveDetail { get; set; }
+
+        /// <summary>Consecutive wave failures. Reset to zero by a success.</summary>
+        public int WaveFailures { get; set; }
+
+        /// <summary>The result of the last checkup.</summary>
+        public CallOutcome CheckupResult { get; set; }
+
+        /// <summary>Why the last checkup ended as it did, in plain text.</summary>
+        public string? CheckupDetail { get; set; }
+
+        /// <summary>Consecutive checkup failures. Reset to zero by a success.</summary>
+        public int CheckupFailures { get; set; }
     }
 }

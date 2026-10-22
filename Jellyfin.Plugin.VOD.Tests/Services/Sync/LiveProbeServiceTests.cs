@@ -11,6 +11,7 @@ using Jellyfin.Plugin.VOD.Data.Models;
 using Jellyfin.Plugin.VOD.Imaging;
 using Jellyfin.Plugin.VOD.Localization;
 using Jellyfin.Plugin.VOD.Services;
+using Jellyfin.Plugin.VOD.Services.Publication;
 using Jellyfin.Plugin.VOD.Services.Sync;
 using Jellyfin.Plugin.VOD.Services.Sync.Dto;
 using MediaBrowser.Controller.Library;
@@ -338,12 +339,20 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
             // season and episode numbers, so being renumbered loses the watch state.
             var db = Substitute.For<IVodDatabase>();
             const string sourceUrl = "https://www.twitch.tv/otplol_/videos";
-            db.GetVideosBySource(sourceUrl).Returns([]);
             db.GetAllVideoIds().Returns([]);
 
-            VideoRecord? stored = null;
+            // A store, not a fixed answer: numbering reads the source back AFTER the fill loop has
+            // written to it, so a stub that always answers "empty" would have nothing to number
+            // and the test would pass against a probe that never numbers anything.
+            var rows = new List<VideoRecord>();
+            db.GetVideosBySource(sourceUrl).Returns(_ => rows.ToList());
             db.When(d => d.UpsertVideo(Arg.Any<VideoRecord>()))
-              .Do(c => stored = c.Arg<VideoRecord>());
+              .Do(c =>
+              {
+                  var written = c.Arg<VideoRecord>();
+                  rows.RemoveAll(r => r.Id == written.Id);
+                  rows.Add(written);
+              });
 
             var meta = new VideoMetadata
             {
@@ -352,7 +361,11 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 Title = "A stream",
                 FullTitle = "A stream",
                 UploadDate = "20261004",
-                LiveStatus = LiveStatus.Live
+                LiveStatus = LiveStatus.Live,
+
+                // A tier, because numbering now runs over the PUBLISHABLE rows and an offered tier
+                // is one of the three conditions. A real live stream reports formats.
+                Qualities = [new VideoQuality(1080, "h264", 30)],
             };
 
             await MakeService(db).ProbeSourceCoreAsync(
@@ -363,8 +376,8 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 new ProbeOutcome(true, [meta]),
                 CancellationToken.None);
 
-            Assert.NotNull(stored);
-            Assert.Equal(2026, stored!.SeasonNumber);
+            var stored = Assert.Single(rows);
+            Assert.Equal(2026, stored.SeasonNumber);
             Assert.Equal(1004001, stored.EpisodeNumber);
         }
 
@@ -408,11 +421,12 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
         }
 
         [Fact]
-        public async Task ProbeSourceCoreAsync_MarksTheRowItWritesAsResolved()
+        public async Task ProbeSourceCoreAsync_MarksTheRowItWritesAsFreshlyFetched()
         {
-            // The probe resolves a broadcast's metadata itself, so the row it writes is resolved.
-            // Left pending, it would be published by this pass — the probe passes its own list —
-            // and then RETIRED by the next sync, which only offers resolved rows to the library.
+            // The probe fetched the broadcast's metadata itself, so the row it writes carries a
+            // successful metadata outcome. ListedAt moves with it, which is what keeps the
+            // cleanup's live exemption alive: the probe publishes ids no listing carries, and a
+            // sweep on ListedAt alone would take the row away mid-broadcast.
             var db = Substitute.For<IVodDatabase>();
             const string sourceUrl = "https://www.youtube.com/@live2/videos";
             db.GetVideosBySource(sourceUrl).Returns([]);
@@ -441,128 +455,51 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 CancellationToken.None);
 
             Assert.NotNull(stored);
-            Assert.Equal(ResolutionState.Resolved, stored!.ResolutionState);
-        }
-
-        private static VideoRecord ProbeRow(string sourceUrl, string nativeId, ResolutionState state)
-            => new()
-            {
-                Id = "row-" + nativeId,
-                SourceUrl = sourceUrl,
-                NativeId = nativeId,
-                VideoUrl = sourceUrl + "/" + nativeId,
-                SyncedAt = DateTimeOffset.UnixEpoch,
-                LiveStatus = LiveStatus.Live,
-                ResolutionState = state,
-                PublishedAt = new DateTimeOffset(2026, 10, 13, 20, 0, 0, TimeSpan.Zero),
-                SeasonNumber = 2026,
-                EpisodeNumber = 1013001,
-            };
-
-        [Fact]
-        public async Task ProbeSourceCoreAsync_WakesTheResolver_WhenItSettlesTheSource()
-        {
-            // I2: the broadcast was the source's last pending row. The probe resolves it but never
-            // numbers the source's dated rows; unless last_resolved_at is cleared, the resolver
-            // never serves the now-settled source again and those rows stay unpublished.
-            const string sourceUrl = "https://www.twitch.tv/settles";
-            var db = Substitute.For<IVodDatabase>();
-            db.GetVideosBySource(sourceUrl).Returns(
-                [ProbeRow(sourceUrl, "airing", ResolutionState.Pending)],
-                [ProbeRow(sourceUrl, "airing", ResolutionState.Resolved)]);
-
-            await MakeService(db).ProbeSourceCoreAsync(
-                new PluginConfiguration { SeriesLibraryName = string.Empty },
-                new SourceDefinition { Url = sourceUrl, Mode = SourceMode.Series },
-                SourceType.TwitchChannelLive,
-                new SourceRecord { Url = sourceUrl, Name = "Settles" },
-                new ProbeOutcome(true, [Live("airing")]),
-                CancellationToken.None);
-
-            db.Received(1).ClearLastResolvedAt(sourceUrl);
+            Assert.Equal(CallOutcome.Ok, stored!.MetadataResult);
+            Assert.NotNull(stored.MetadataAt);
+            Assert.Equal(0, stored.MetadataAttempts);
+            Assert.NotNull(stored.ListedAt);
         }
 
         [Fact]
-        public async Task ProbeSourceCoreAsync_LeavesTheResolverAlone_OnAnAlreadySettledSource()
+        public async Task ProbeSourceCoreAsync_RecomputesTheDaysRanks_RatherThanAdvancingATally()
         {
-            // Settled before the pass: the resolver already had its chance to number it, so a
-            // probe pass must not hand the source a free wave every few minutes.
-            const string sourceUrl = "https://www.twitch.tv/settled";
-            var db = Substitute.For<IVodDatabase>();
-            db.GetVideosBySource(sourceUrl).Returns(
-                [ProbeRow(sourceUrl, "airing", ResolutionState.Resolved)]);
-
-            await MakeService(db).ProbeSourceCoreAsync(
-                new PluginConfiguration { SeriesLibraryName = string.Empty },
-                new SourceDefinition { Url = sourceUrl, Mode = SourceMode.Series },
-                SourceType.TwitchChannelLive,
-                new SourceRecord { Url = sourceUrl, Name = "Settled" },
-                new ProbeOutcome(true, [Live("airing")]),
-                CancellationToken.None);
-
-            db.DidNotReceive().ClearLastResolvedAt(Arg.Any<string>());
-        }
-
-        [Fact]
-        public async Task ProbeSourceCoreAsync_LeavesTheResolverAlone_WhileTheSourceIsStillUnsettled()
-        {
-            const string sourceUrl = "https://www.twitch.tv/unsettled";
-            var other = ProbeRow(sourceUrl, "other", ResolutionState.Pending);
-            other.LiveStatus = LiveStatus.NotLive;
-            var db = Substitute.For<IVodDatabase>();
-            db.GetVideosBySource(sourceUrl).Returns(
-                [ProbeRow(sourceUrl, "airing", ResolutionState.Pending), other],
-                [ProbeRow(sourceUrl, "airing", ResolutionState.Resolved), other]);
-
-            await MakeService(db).ProbeSourceCoreAsync(
-                new PluginConfiguration { SeriesLibraryName = string.Empty },
-                new SourceDefinition { Url = sourceUrl, Mode = SourceMode.Series },
-                SourceType.TwitchVideos,
-                new SourceRecord { Url = sourceUrl, Name = "Unsettled" },
-                new ProbeOutcome(true, [Live("airing")]),
-                CancellationToken.None);
-
-            db.DidNotReceive().ClearLastResolvedAt(Arg.Any<string>());
-        }
-
-        [Fact]
-        public async Task ProbeSourceCoreAsync_DoesNotSpendADayRank_OnABroadcastItAlreadyNumbered()
-        {
-            // A pass re-finds a broadcast it numbered earlier and finds a second, new one. The
-            // tally is seeded from the stored rows, so advancing it again for the already-numbered
-            // one pushes the new broadcast a rank further than the sync would have given it — and
-            // nothing renumbers it afterwards, because the date-based branch never overwrites a
-            // number a row already carries.
+            // A pass re-finds a broadcast it numbered earlier and finds a second, new one, both on
+            // the same UTC day. The ranks are recomputed over the day's whole membership, so the
+            // re-found one keeps rank 1 and the new one takes rank 2.
+            //
+            // The old model could only ever ADVANCE a per-day tally, so re-finding a numbered
+            // broadcast spent a rank on it and pushed the new one a step too far — with nothing to
+            // correct it afterwards, because a stored number was frozen. Recomputing removes the
+            // whole class of defect, at the accepted cost that a rank can now move.
             var db = Substitute.For<IVodDatabase>();
             const string sourceUrl = "https://www.youtube.com/@live/videos";
-            db.GetVideosBySource(sourceUrl).Returns(
-            [
-                new VideoRecord
-                {
-                    Id = Guid.NewGuid().ToString(),
-                    SourceUrl = sourceUrl,
-                    VideoUrl = sourceUrl,
-                    NativeId = "first",
-                    LiveStatus = LiveStatus.Live,
-                    PublishedAt = new DateTimeOffset(2026, 10, 12, 0, 0, 0, TimeSpan.Zero),
-                    SeasonNumber = 2026,
-                    EpisodeNumber = 1012001
-                }
-            ]);
-            db.GetAllVideoIds().Returns([]);
+            var day = new DateTimeOffset(2026, 10, 12, 0, 0, 0, TimeSpan.Zero);
 
             var saved = new List<VideoRecord>();
             db.When(d => d.UpsertVideo(Arg.Any<VideoRecord>()))
               .Do(c => saved.Add(c.Arg<VideoRecord>()));
 
-            VideoMetadata Live(string id, string title) => new VideoMetadata
+            // The rows as the probe will have written them by the time it numbers: two live
+            // broadcasts of the same day, both with metadata, so both publishable.
+            db.GetVideosBySource(sourceUrl).Returns(
+                [],
+                [
+                    PublishableLiveRow(sourceUrl, "first", day, season: 2026, episode: 1012001),
+                    PublishableLiveRow(sourceUrl, "second", day.AddHours(3)),
+                ]);
+            db.GetAllVideoIds().Returns([]);
+            db.GetVideoIdsWithMetadata().Returns([]);
+
+            VideoMetadata Airing(string id, string title) => new()
             {
                 Id = id,
                 ExtractorKey = "Youtube",
                 Title = title,
                 FullTitle = title,
                 UploadDate = "20261012",
-                LiveStatus = LiveStatus.Live
+                LiveStatus = LiveStatus.Live,
+                Qualities = [new VideoQuality(1080, "h264", 30)],
             };
 
             await MakeService(db).ProbeSourceCoreAsync(
@@ -570,60 +507,35 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 new SourceDefinition { Url = sourceUrl, Mode = SourceMode.Series },
                 SourceType.YoutubeChannel,
                 new SourceRecord { Url = sourceUrl, Name = "A channel" },
-                new ProbeOutcome(true, [Live("first", "Still airing"), Live("second", "A new one")]),
+                new ProbeOutcome(true, [Airing("first", "Still airing"), Airing("second", "A new one")]),
                 CancellationToken.None);
 
-            Assert.Equal(1012001, saved[0].EpisodeNumber);
-            Assert.Equal(1012002, saved[1].EpisodeNumber);
+            // Only the row whose number changed is written back. The one that was already 1012001
+            // keeps it and costs no write — which is the second half of the behaviour: the old
+            // tally would have spent a rank on it and pushed the new one to 1012003.
+            var renumbered = saved.Where(v => v.EpisodeNumber.HasValue).ToList();
+            Assert.Equal(1012002, Assert.Single(renumbered).EpisodeNumber);
+            Assert.Equal("row-second", renumbered[0].Id);
         }
 
-        [Fact]
-        public async Task ProbeSourceCoreAsync_ContinuesTheDaysRanking_LikeTheSyncWould()
-        {
-            // One numbering rule, shared with the sync: the rank continues after the videos already
-            // numbered on that UTC day, so the number the probe gives is the number the sync would
-            // have given and no later pass has cause to change it.
-            var db = Substitute.For<IVodDatabase>();
-            const string sourceUrl = "https://www.twitch.tv/otplol_/videos";
-            db.GetVideosBySource(sourceUrl).Returns(
-            [
-                new VideoRecord
-                {
-                    Id = Guid.NewGuid().ToString(),
-                    SourceUrl = sourceUrl,
-                    VideoUrl = sourceUrl,
-                    NativeId = "2890000000",
-                    PublishedAt = new DateTimeOffset(2026, 10, 4, 0, 0, 0, TimeSpan.Zero),
-                    SeasonNumber = 2026,
-                    EpisodeNumber = 1004001
-                }
-            ]);
-            db.GetAllVideoIds().Returns([]);
-
-            VideoRecord? stored = null;
-            db.When(d => d.UpsertVideo(Arg.Any<VideoRecord>()))
-              .Do(c => stored = c.Arg<VideoRecord>());
-
-            var meta = new VideoMetadata
+        /// <summary>A row shaped as the probe leaves one: fetched, with a tier, so publishable.</summary>
+        private static VideoRecord PublishableLiveRow(
+            string sourceUrl, string nativeId, DateTimeOffset publishedAt,
+            int? season = null, int? episode = null)
+            => new()
             {
-                Id = "2890554613",
-                ExtractorKey = "TwitchVod",
-                Title = "A later stream",
-                FullTitle = "A later stream",
-                UploadDate = "20261004",
-                LiveStatus = LiveStatus.Live
+                Id = "row-" + nativeId,
+                SourceUrl = sourceUrl,
+                NativeId = nativeId,
+                VideoUrl = sourceUrl + "/" + nativeId,
+                LiveStatus = LiveStatus.Live,
+                PublishedAt = publishedAt,
+                SeasonNumber = season,
+                EpisodeNumber = episode,
+                MetadataAt = publishedAt,
+                MetadataResult = CallOutcome.Ok,
+                Extras = new VideoExtras { Qualities = [new VideoQuality(1080, "h264", 30)] },
             };
-
-            await MakeService(db).ProbeSourceCoreAsync(
-                new PluginConfiguration { SeriesLibraryName = string.Empty },
-                new SourceDefinition { Url = sourceUrl, Mode = SourceMode.Series },
-                SourceType.TwitchVideos,
-                new SourceRecord { Url = sourceUrl, Name = "otplol_" },
-                new ProbeOutcome(true, [meta]),
-                CancellationToken.None);
-
-            Assert.Equal(1004002, stored!.EpisodeNumber);
-        }
 
         // ── The gates in ProbeSourceAsync, before any yt-dlp call ─────────────────────────────────
 
@@ -772,7 +684,7 @@ namespace Jellyfin.Plugin.VOD.Tests.Services.Sync
                 db,
                 publisher,
                 describer,
-                new VideoDescriptionStep(Substitute.For<IHttpClientFactory>(), describer),
+                new StreamDescriptionStep(Substitute.For<IHttpClientFactory>(), describer),
                 NullLogger<LiveProbeService>.Instance);
         }
 

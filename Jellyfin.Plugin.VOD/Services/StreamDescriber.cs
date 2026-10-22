@@ -50,7 +50,7 @@ namespace Jellyfin.Plugin.VOD.Services
     /// served the filtered master from memory and yt-dlp is not run again.
     /// </para>
     /// </remarks>
-    public sealed partial class StreamDescriber : IDisposable
+    public sealed partial class StreamDescriber : IStreamDescriber, IDisposable
     {
         private readonly ILibraryManager _library;
         private readonly IMediaStreamRepository _repository;
@@ -174,7 +174,7 @@ namespace Jellyfin.Plugin.VOD.Services
         /// <param name="masterBaseUri">The URI the master was fetched from, for absolutising.</param>
         /// <param name="cancellationToken">Cancellation token.</param>
         /// <returns>
-        /// Each member's prepared streams keyed by <see cref="StoredStreams.KeyFor"/>, or null when
+        /// Each member's prepared streams keyed by <see cref="DescribedStreams.KeyFor"/>, or null when
         /// a probe failed or came back empty — the resolver then marks the video failed (spec E1).
         /// A tier the master no longer carries is skipped, not a failure.
         /// </returns>
@@ -231,7 +231,7 @@ namespace Jellyfin.Plugin.VOD.Services
                         audioLangs, subLangs),
                     filtered);
 
-                var key = StoredStreams.KeyFor(tier?.Height, tier?.Codec);
+                var key = DescribedStreams.KeyFor(tier?.Height, tier?.Codec);
 
                 if (tier is not null
                     && primaryProbed is not null
@@ -239,7 +239,7 @@ namespace Jellyfin.Plugin.VOD.Services
                     && string.Equals(mine, primaryVariant, StringComparison.Ordinal))
                 {
                     // Cloned: Prepare relabels in place, and the primary's streams must not change.
-                    described[key] = Prepare(StoredStreams.Clone(primaryProbed), filtered);
+                    described[key] = Prepare(DescribedStreams.Clone(primaryProbed), filtered);
                     continue;
                 }
 
@@ -251,7 +251,7 @@ namespace Jellyfin.Plugin.VOD.Services
 
                 if (tier is null)
                 {
-                    primaryProbed = StoredStreams.Clone(probed);
+                    primaryProbed = DescribedStreams.Clone(probed);
                     primaryVariant = SelectedVariant(filtered);
                 }
 
@@ -262,27 +262,39 @@ namespace Jellyfin.Plugin.VOD.Services
         }
 
         /// <summary>
-        /// Writes a stored description onto every published member of a video that has no video
-        /// stream yet.
+        /// Writes a description this pass produced onto the video's library items.
         /// </summary>
-        /// <param name="vodUuid">The video's opaque VOD uuid.</param>
-        /// <param name="storedJson">The row's <c>stream_descriptions</c>.</param>
+        /// <param name="vodUuid">The video's uuid.</param>
+        /// <param name="byMember">
+        /// The streams per member, keyed by <see cref="DescribedStreams.KeyFor"/>, as
+        /// <see cref="DescribeVideoAsync"/> returned them earlier in the same pass.
+        /// </param>
         /// <param name="cancellationToken">Cancellation token.</param>
         /// <returns>How many members were written.</returns>
         /// <remarks>
+        /// Separate from describing because the items may not exist yet when the description is
+        /// made: the wave describes, and the checkup a few steps later is what creates the items.
+        /// The description is not persisted in between — the manifest it came from would be stale
+        /// by the next pass anyway — so an item created in a later pass is made eligible for
+        /// describing again instead (see <c>IVodDatabase.ClearDescribedAt</c>).
+        /// <para>
         /// A member that already has a video stream is left alone: Jellyfin or the playback
         /// failsafe described it, and that description is at least as fresh as ours.
+        /// </para>
         /// <para>
         /// Never throws, except on cancellation: a failure is logged and the members it did not
         /// reach are left to the playback failsafe.
         /// </para>
         /// </remarks>
-        public int ApplyStored(string vodUuid, string? storedJson, CancellationToken cancellationToken)
+        public int ApplyDescribed(
+            string vodUuid,
+            IReadOnlyDictionary<string, IReadOnlyList<MediaStream>> byMember,
+            CancellationToken cancellationToken)
         {
             ArgumentException.ThrowIfNullOrEmpty(vodUuid);
+            ArgumentNullException.ThrowIfNull(byMember);
 
-            var stored = StoredStreams.Deserialize(storedJson);
-            if (stored is null)
+            if (byMember.Count == 0)
             {
                 return 0;
             }
@@ -297,7 +309,7 @@ namespace Jellyfin.Plugin.VOD.Services
                         continue;
                     }
 
-                    if (!stored.TryGetValue(StoredStreams.KeyFor(member.Height, member.Codec), out var streams)
+                    if (!byMember.TryGetValue(DescribedStreams.KeyFor(member.Height, member.Codec), out var streams)
                         || streams.Count == 0)
                     {
                         continue;
@@ -318,7 +330,7 @@ namespace Jellyfin.Plugin.VOD.Services
             {
                 // Called right after a reconcile that succeeded: throwing here would abort that
                 // publication, leave its anchor unrecorded and have the wave retried for nothing.
-                LogApplyStoredFailed(ex, vodUuid);
+                LogApplyDescribedFailed(ex, vodUuid);
             }
 
             return applied;
@@ -633,7 +645,7 @@ namespace Jellyfin.Plugin.VOD.Services
 
         [LoggerMessage(EventId = 6, Level = LogLevel.Warning,
             Message = "Writing the stored description of {VodUuid} failed; the playback failsafe will describe it")]
-        private partial void LogApplyStoredFailed(Exception exception, string vodUuid);
+        private partial void LogApplyDescribedFailed(Exception exception, string vodUuid);
 
         [LoggerMessage(EventId = 5, Level = LogLevel.Debug,
             Message = "Copied the description of {PrimaryName} onto {ItemName}: both serve the same variant")]

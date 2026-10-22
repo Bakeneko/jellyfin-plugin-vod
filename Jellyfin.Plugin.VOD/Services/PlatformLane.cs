@@ -22,17 +22,17 @@ namespace Jellyfin.Plugin.VOD.Services
         /// </remarks>
         public const string Playback = "playback";
 
-        /// <summary>The lane an administrator's own action resolves on.</summary>
-        /// <remarks>
-        /// Checking a URL from the configuration page is one call, made by someone watching a
-        /// spinner. Left on its platform's lane it would queue behind a backoff of up to an hour
-        /// and the page would simply hang. Exempted for the same reason as playback: the volume —
-        /// a handful of calls — is not comparable to the thousands a sync makes.
-        /// </remarks>
-        public const string Interactive = "interactive";
-
         /// <summary>The lane that serves everything whose host says nothing.</summary>
         public const string Generic = "generic";
+
+        /// <summary>YouTube's lane. Named because two call sites compare against it.</summary>
+        public const string Youtube = "youtube";
+
+        /// <summary>Arte's lane.</summary>
+        public const string Arte = "arte";
+
+        /// <summary>Twitch's lane.</summary>
+        public const string Twitch = "twitch";
 
         /// <summary>The lane the given URL belongs to.</summary>
         /// <param name="url">A page URL, or null.</param>
@@ -54,9 +54,9 @@ namespace Jellyfin.Plugin.VOD.Services
             // their platform's lane by construction.
             return RegistrableDomain(host) switch
             {
-                "youtube.com" or "youtu.be" => "youtube",
-                "arte.tv" => "arte",
-                "twitch.tv" => "twitch",
+                "youtube.com" or "youtu.be" => Youtube,
+                "arte.tv" => Arte,
+                "twitch.tv" => Twitch,
 
                 // An unknown platform keeps its FULL host, not its domain: two unrelated sites
                 // under one public suffix — anything .co.uk — must not share a budget, and we have
