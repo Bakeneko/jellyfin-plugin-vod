@@ -277,6 +277,146 @@ namespace Jellyfin.Plugin.VOD.Controllers
                 : Content(vtt, "text/vtt");
         }
 
+        // ── TS proxy ──────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Proxies an upstream HLS video variant playlist with segment URLs
+        /// rewritten to go through <see cref="GetProxiedTs"/>.
+        /// </summary>
+        /// <param name="token">URL-safe base-64 encoding of the upstream variant playlist URL.</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        /// <remarks>
+        /// This is the entry point for the SEI-strip chain.  The filtered master
+        /// playlist replaces the direct YouTube CDN variant URL with a pointer to
+        /// this endpoint so that every segment fetch goes through
+        /// <see cref="GetProxiedTs"/>, which removes trailing SEI NAL units that
+        /// cause ExoPlayer (Media3 &lt;1.9.0) to crash.
+        /// </remarks>
+        [HttpGet("proxy/variant/{token}")]
+        public async Task<ActionResult> GetProxiedVariant(
+            [FromRoute] string token,
+            CancellationToken cancellationToken = default)
+        {
+            if (!TryDecodeProxyUrl(token, out var variantUrl))
+            {
+                return BadRequest(new { error = "Invalid or disallowed proxy token" });
+            }
+
+            var playlist = await FetchStringAsync(variantUrl, cancellationToken)
+                .ConfigureAwait(false);
+            if (playlist is null)
+            {
+                return StatusCode(503, new { error = "Could not fetch variant playlist" });
+            }
+
+            var baseUri = new Uri(variantUrl);
+            var serverBase = (Plugin.Instance?.Configuration.LocalBaseUrl ?? "http://localhost:8096")
+                .TrimEnd('/');
+            var sb = new StringBuilder();
+
+            foreach (var rawLine in playlist.Split('\n', StringSplitOptions.TrimEntries))
+            {
+                if (rawLine.Length == 0) continue;
+
+                if (rawLine.StartsWith('#'))
+                {
+                    sb.Append(rawLine).Append('\n');
+                }
+                else
+                {
+                    // Segment URL (relative or absolute): absolutise then proxy
+                    var segUrl = Uri.TryCreate(baseUri, rawLine, out var abs)
+                        ? abs.ToString()
+                        : rawLine;
+                    sb.Append(serverBase)
+                      .Append("/VOD/proxy/ts/")
+                      .Append(EncodeProxyUrl(segUrl))
+                      .Append(".ts\n");
+                }
+            }
+
+            return Content(sb.ToString(), "application/vnd.apple.mpegurl");
+        }
+
+        /// <summary>
+        /// Proxies an upstream MPEG-TS segment with trailing SEI NAL units
+        /// stripped so that non-conformant H.264 streams play without crashing.
+        /// </summary>
+        /// <param name="token">URL-safe base-64 encoding of the upstream segment URL.</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        /// <remarks>
+        /// Temporary workaround for Media3 1.8.0 bug (issue #2764): YouTube H.264 places SEI
+        /// NAL units after VCL NALs (non-conformant); ffmpeg emits them as separate packets
+        /// without PTS, crashing ExoPlayer's ReorderingBufferQueue. Fixed in Media3 1.9.0.
+        /// Remove this endpoint and <see cref="GetProxiedVariant"/> once Jellyfin Android
+        /// ships a build with Media3 ≥ 1.9.0.
+        /// </remarks>
+        [HttpGet("proxy/ts/{token}.ts")]
+        public async Task<ActionResult> GetProxiedTs(
+            [FromRoute] string token,
+            CancellationToken cancellationToken = default)
+        {
+            if (!TryDecodeProxyUrl(token, out var segmentUrl))
+            {
+                return BadRequest(new { error = "Invalid or disallowed proxy token" });
+            }
+
+            using var client = _httpClientFactory.CreateClient();
+            using var response = await client
+                .GetAsync(new Uri(segmentUrl), HttpCompletionOption.ResponseContentRead, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                return StatusCode((int)response.StatusCode,
+                    new { error = "Upstream segment fetch failed", url = segmentUrl });
+            }
+
+            var raw = await response.Content.ReadAsByteArrayAsync(cancellationToken)
+                .ConfigureAwait(false);
+            var fixed_ = TsSegmentFilter.StripTrailingSeis(raw);
+            return File(fixed_, "video/mp2t");
+        }
+
+        // ── Proxy token helpers ───────────────────────────────────────────────
+
+        private static readonly string[] AllowedProxyHosts =
+            [".googlevideo.com", ".youtube.com", ".ytimg.com"];
+
+        private static string EncodeProxyUrl(string url)
+            => Convert.ToBase64String(Encoding.UTF8.GetBytes(url))
+                       .TrimEnd('=')
+                       .Replace('+', '-')
+                       .Replace('/', '_');
+
+        private static bool TryDecodeProxyUrl(string token, out string url)
+        {
+            try
+            {
+                var padded = token.Replace('-', '+').Replace('_', '/');
+                padded = (padded.Length % 4) switch
+                {
+                    2 => padded + "==",
+                    3 => padded + "=",
+                    _ => padded
+                };
+                url = Encoding.UTF8.GetString(Convert.FromBase64String(padded));
+                return IsAllowedProxyHost(url);
+            }
+            catch
+            {
+                url = string.Empty;
+                return false;
+            }
+        }
+
+        private static bool IsAllowedProxyHost(string url)
+            => Uri.TryCreate(url, UriKind.Absolute, out var uri)
+               && AllowedProxyHosts.Any(h =>
+                   uri.Host.EndsWith(h, StringComparison.OrdinalIgnoreCase));
+
+        // ── Libraries / sources ───────────────────────────────────────────────
+
         /// <summary>
         /// Lists the Jellyfin libraries an administrator may publish into.
         /// </summary>
@@ -656,6 +796,8 @@ namespace Jellyfin.Plugin.VOD.Controllers
                 return null;
             }
 
+            var serverBase = (Plugin.Instance?.Configuration.LocalBaseUrl ?? "http://localhost:8096")
+                .TrimEnd('/');
             var filtered = HlsPlaylistFilter.FilterMaster(
                 upstream,
                 baseUri,
@@ -663,7 +805,10 @@ namespace Jellyfin.Plugin.VOD.Controllers
                 codec,
                 audioLangs.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries),
                 subLangs.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries),
-                _subtitles.Rewrite);
+                _subtitles.Rewrite,
+                variantUrl => IsAllowedProxyHost(variantUrl)
+                    ? $"{serverBase}/VOD/proxy/variant/{EncodeProxyUrl(variantUrl)}"
+                    : variantUrl);
 
             return filtered is null ? null : new FetchedMaster(filtered, upstream, baseUri);
         }

@@ -46,6 +46,11 @@ namespace Jellyfin.Plugin.VOD.Services
         /// Maps a subtitle rendition URI to the one to serve, or null to drop. Pass null to keep all.
         /// Used to proxy YouTube's timedtext URIs that ffmpeg cannot parse.
         /// </param>
+        /// <param name="rewriteVariant">
+        /// Maps the selected video variant playlist URI to the one to serve. Pass null to use the
+        /// upstream URI as-is. Used to route segments through a proxy that strips non-conformant
+        /// H.264 NAL ordering (trailing SEIs after VCL) before they reach the client.
+        /// </param>
         public static string? FilterMaster(
             string content,
             Uri baseUri,
@@ -53,7 +58,8 @@ namespace Jellyfin.Plugin.VOD.Services
             string? codec,
             IReadOnlyCollection<string> audioLanguages,
             IReadOnlyCollection<string> subtitleLanguages,
-            Func<string, string?>? rewriteSubtitle = null)
+            Func<string, string?>? rewriteSubtitle = null,
+            Func<string, string>? rewriteVariant = null)
         {
             ArgumentNullException.ThrowIfNull(content);
             ArgumentNullException.ThrowIfNull(baseUri);
@@ -206,7 +212,8 @@ namespace Jellyfin.Plugin.VOD.Services
             }
 
             sb.Append(variantLine).Append('\n');
-            sb.Append(best.Uri).Append('\n');
+            var variantUri = rewriteVariant is not null ? rewriteVariant(best.Uri) : best.Uri;
+            sb.Append(variantUri).Append('\n');
 
             return sb.ToString();
         }
