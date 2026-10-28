@@ -8,6 +8,14 @@
         "category": "General",
         "versions": [
             {
+                "version": "5.0.0.0",
+                "changelog": "- YouTube videos now play on Android and TV without crashing: trailing SEI NAL units are stripped.\n- The database is rebuilt on first start: every video is re-fetched from its platform, so expect a long first run. Your watch history reattaches as each video comes back.\n- A run now finishes one source before moving to the next, instead of leaving every source half-resolved.\n- Failures carry the platform's own explanation instead of the word \"Failed\".\n- A video that keeps failing is retried further and further apart, so one broken video can no longer get you rate-limited.\n- Each source gets a detail panel: its five stages, what happened to each video, and buttons to retry one or all of them.\n- The page warns you when your cookie session has expired, or when a setting would silently stop all listing.",
+                "targetAbi": "12.1.0.0",
+                "sourceUrl": "https://github.com/Bakeneko/jellyfin-plugin-vod/releases/download/v5/vod_5.0.0.0.zip",
+                "checksum": "e05604a5032aa0c871e28f16dacd44ee",
+                "timestamp": "2026-10-28T14:11:36Z"
+            },
+            {
                 "version": "4.0.0.0",
                 "changelog": "- The database is rebuilt on first start: every video is re-fetched from its platform, so expect a long first run. Your watch history reattaches as each video comes back.\n- A run now finishes one source before moving to the next, instead of leaving every source half-resolved.\n- Failures carry the platform's own explanation instead of the word \"Failed\".\n- A video that keeps failing is retried further and further apart, so one broken video can no longer get you rate-limited.\n- Each source gets a detail panel: its five stages, what happened to each video, and buttons to retry one or all of them.\n- The page warns you when your cookie session has expired, or when a setting would silently stop all listing.",
                 "targetAbi": "12.1.0.0",
